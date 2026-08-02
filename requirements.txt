@@ -1,0 +1,21 @@
+# 本项目依赖（在 agent_env 虚拟环境中已预装主要包）
+# 若需重新安装，可使用：
+#   conda activate agent_env
+#   pip install -r requirements.txt
+
+# Web 框架
+fastapi
+uvicorn
+
+# LLM（OpenAI 兼容协议：DeepSeek / Qwen 等）
+openai
+
+# 向量数据库（可选；不可用时自动降级为内存向量库）
+qdrant-client
+
+# 嵌入模型（本地 sentence-transformers）
+sentence-transformers
+
+# 工具 / 其他
+httpx
+numpy
