@@ -12,11 +12,11 @@ agent.py — Agent 定义
 """
 from pathlib import Path
 
-from config import settings, BASE_DIR
-from memory import MemorySystem
-from tools import build_default_tools
+from app.config import settings, PROJECT_ROOT
+from app.memory import MemorySystem
+from app.tools import build_default_tools
 
-MEMORY_DIR = BASE_DIR / "memories"
+MEMORY_DIR = PROJECT_ROOT / "data" / "memories"
 
 
 class Agent:

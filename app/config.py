@@ -1,13 +1,14 @@
 """
-config.py — 统一配置加载 (从 .env 读取)
+config.py — 统一配置加载 (从项目根目录的 .env 读取)
 
 针对本仓库 .env 文件存在个别行首多余空格、值带引号等不规范写法，
 这里实现一个健壮的手写解析器，避免依赖 python-dotenv 的兼容性问题。
 """
 from pathlib import Path
 
-BASE_DIR = Path(__file__).resolve().parent
-ENV_PATH = BASE_DIR / ".env"
+# 项目根目录（本文件位于 app/ 包内，其上一级为项目根目录）
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+ENV_PATH = PROJECT_ROOT / ".env"
 
 
 def _parse_dotenv(path: Path) -> dict:

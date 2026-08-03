@@ -1,8 +1,12 @@
 """
-e2e_test.py — 端到端测试：配置 -> 注入知识 -> 开始 -> WebSocket 收事件 -> 导出 Markdown
+test_e2e.py — 端到端测试：配置 -> 注入知识 -> 开始 -> WebSocket 收事件 -> 导出 Markdown
+
+运行方式（需先启动服务器，在项目根目录执行）：
+    python tests/test_e2e.py
 使用 agent_env 解释器运行。
 """
 import sys, os, json, time, threading, urllib.request, urllib.error
+from pathlib import Path
 
 # 避免 localhost 走代理
 os.environ["NO_PROXY"] = "127.0.0.1,localhost"
@@ -11,6 +15,8 @@ for k in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"):
     os.environ.pop(k, None)
 
 BASE = "http://127.0.0.1:8000"
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+EXPORT_PATH = PROJECT_ROOT / "data" / "discussions" / "e2e_export.md"
 sys.stdout.reconfigure(encoding="utf-8")
 
 import websockets  # 必须在代理清理后导入
@@ -45,6 +51,12 @@ def ws_listener():
                 t = ev.get("type")
                 if t == "speech":
                     print(f"  [{ev.get('round')}] {ev.get('agent')}: {ev.get('text')[:120]}")
+                elif t == "speech_start":
+                    print(f"  [STREAM] {ev.get('speaker')} 开始流式发言")
+                elif t == "speech_delta":
+                    print(f"  [STREAM] {ev.get('speaker')} += {ev.get('delta')[:80]!r}")
+                elif t == "speech_end":
+                    print(f"  [STREAM] {ev.get('speaker')} 收尾 len={len(ev.get('text',''))}")
                 elif t == "task_assigned":
                     print(f"  [TASK] -> {ev.get('to')}: {ev.get('content')[:80]}")
                 elif t == "task_result":
@@ -112,9 +124,28 @@ def main():
     print("has summary event:", any(e.get("type") == "summary" for e in events))
     print("has task_assigned event:", any(e.get("type") == "task_assigned" for e in events))
     print("has task_result event:", any(e.get("type") == "task_result" for e in events))
-    # 落盘
-    open("e2e_export.md", "w", encoding="utf-8").write(md)
-    print("saved e2e_export.md")
+    # ---- 流式输出校验 ----
+    n_start = sum(1 for e in events if e.get("type") == "speech_start")
+    n_delta = sum(1 for e in events if e.get("type") == "speech_delta")
+    n_end = sum(1 for e in events if e.get("type") == "speech_end")
+    print(f"streaming events: speech_start={n_start}, speech_delta={n_delta}, speech_end={n_end}")
+    deltas_by = {}
+    for e in events:
+        if e.get("type") == "speech_delta":
+            deltas_by.setdefault(e.get("speaker"), []).append(e.get("delta", ""))
+    for sp, ds in deltas_by.items():
+        print(f"  stream [{sp}] joined={len(''.join(ds))} chars")
+    # 断言：只要发生过任何内容发言，就应出现流式事件
+    assert n_start == n_end, "speech_start/end 数量应一致"
+    if n_start > 0:
+        assert n_delta > 0, "存在流式发言但无 delta"
+        total = sum(len("".join(ds)) for ds in deltas_by.values())
+        assert total > 0, "流式 delta 内容为空"
+    print("STREAMING CHECKS PASS")
+    # 落盘（写入 data/discussions/）
+    EXPORT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    EXPORT_PATH.write_text(md, encoding="utf-8")
+    print(f"saved {EXPORT_PATH}")
 
 
 if __name__ == "__main__":

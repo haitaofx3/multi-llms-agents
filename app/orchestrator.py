@@ -11,10 +11,11 @@ orchestrator.py — 多 Agent 圆桌协作编排器
   - 通过事件总线把发言/任务/状态实时推送给 UI
 """
 import asyncio
+import threading
 import time
-from agent import Agent
-from llm import chat, resolve_model_config
-from config import settings
+from app.agent import Agent
+from app.llm import chat, chat_stream, resolve_model_config
+from app.config import settings
 
 # ---- 专用工具 schema（任务分派 / 回报） ----
 DELEGATE_SCHEMA = {
@@ -166,7 +167,36 @@ class Orchestrator:
         asyncio.create_task(self.event_bus.publish({"type": "log", "text": text}))
 
     # ---------------- 单次 Agent 回合（含工具调用循环） ----------------
-    async def _agent_turn(self, agent: Agent, user_msg: str, mode: str, allow_delegate: bool = True):
+    async def _consume_stream(self, messages, model_config, tools, on_delta=None):
+        """
+        在后台线程运行流式生成，把增量事件桥接回事件循环。
+
+        返回完整结果 dict（与 chat() 一致：content / tool_calls / assistant_message）。
+        on_delta(delta: str) 为可选回调，每次收到文本增量时调用。
+        """
+        q = asyncio.Queue()
+        loop = asyncio.get_running_loop()
+
+        def _run():
+            try:
+                for ev in chat_stream(messages, model_config, tools):
+                    loop.call_soon_threadsafe(q.put_nowait, ev)
+            except Exception as e:  # noqa
+                loop.call_soon_threadsafe(q.put_nowait, {"type": "error", "error": str(e)})
+
+        threading.Thread(target=_run, daemon=True).start()
+        while True:
+            ev = await q.get()
+            t = ev.get("type")
+            if t == "final":
+                return ev["result"]
+            if t == "error":
+                raise RuntimeError(ev["error"])
+            if t == "content" and on_delta is not None:
+                await on_delta(ev["delta"])
+
+    async def _agent_turn(self, agent: Agent, user_msg: str, mode: str,
+                          allow_delegate: bool = True, stream: bool = False):
         collaborators_meta = [{"name": c.name} for c in self.collaborators]
         sys_prompt = agent.system_prompt(
             collaborators_meta, self.shared_context, self._task_status_text(),
@@ -183,18 +213,44 @@ class Orchestrator:
         content = ""
         delegate = []
         report = None
+        emitting = False  # 是否已开始向 UI 流式推送
+
+        async def _emit_delta(delta: str):
+            nonlocal emitting
+            if not emitting:
+                emitting = True
+                await self.event_bus.publish({
+                    "type": "speech_start",
+                    "speaker": agent.name,
+                    "round": self.round,
+                    "is_main": agent.is_main,
+                })
+            await self.event_bus.publish({
+                "type": "speech_delta",
+                "speaker": agent.name,
+                "delta": delta,
+            })
 
         for _ in range(5):
             try:
-                resp = await asyncio.to_thread(
-                    chat, messages, agent.model_config, tools)
+                if stream:
+                    try:
+                        result = await self._consume_stream(
+                            messages, agent.model_config, tools, _emit_delta)
+                    except Exception as e:  # noqa
+                        self._log(f"[LLM流式失败:{agent.name}] {e}，回退非流式")
+                        result = await asyncio.to_thread(
+                            chat, messages, agent.model_config, tools)
+                else:
+                    result = await asyncio.to_thread(
+                        chat, messages, agent.model_config, tools)
             except Exception as e:  # noqa
                 self._log(f"[LLM错误:{agent.name}] {e}")
                 break
 
-            content = resp["content"] or content
-            raw_msg = resp.get("assistant_message")
-            tcs = resp["tool_calls"]
+            content = result["content"] or content
+            raw_msg = result.get("assistant_message")
+            tcs = result["tool_calls"]
 
             if not tcs:
                 break
@@ -224,10 +280,24 @@ class Orchestrator:
             if not tcs:
                 break
 
+        # 流式收尾：补发 speech_end（前端用完整文本替换），并记录 transcript
+        if emitting and content:
+            await self.event_bus.publish({
+                "type": "speech_end",
+                "speaker": agent.name,
+                "round": self.round,
+                "text": content,
+            })
+            self.transcript.append({
+                "type": "speech", "round": self.round, "speaker": agent.name,
+                "is_main": agent.is_main, "text": content,
+            })
+
         agent.append_history("user", user_msg)
         if content:
             agent.append_history("assistant", content)
-        return {"content": content, "delegate": delegate, "report": report}
+        return {"content": content, "delegate": delegate, "report": report,
+                "streamed": emitting}
 
     # ---------------- 主 Agent 指令 ----------------
     def _main_directive(self, round, is_last, had_any_task, pending_exists):
@@ -283,9 +353,10 @@ class Orchestrator:
 
                 # 1) 主持人回合（第1轮分派任务，之后轮次抛疑追问）
                 directive = self._main_directive(self.round, is_last, had_any_task, pending_exists)
-                main_out = await self._agent_turn(self.main, directive, mode="discussion")
+                main_out = await self._agent_turn(self.main, directive, mode="discussion", stream=True)
                 if main_out["content"]:
-                    await self._emit_speech(self.main, main_out["content"])
+                    if not main_out["streamed"]:
+                        await self._emit_speech(self.main, main_out["content"])
                     self.last_main_message = main_out["content"]
                 for d in main_out["delegate"]:
                     self._create_task(d)
@@ -334,9 +405,10 @@ class Orchestrator:
                         umsg = (f"主持人刚才说：\n「{self.last_main_message}」\n\n"
                                 f"请基于你的角色「{collab.role}」与性格，就此进行回应、辩护或反驳，"
                                 f"推进这场圆桌辩论；可调用 knowledge_search 检索论据支撑论点。")
-                        out = await self._agent_turn(collab, umsg, mode="discussion")
+                        out = await self._agent_turn(collab, umsg, mode="discussion", stream=True)
                         if out["content"]:
-                            await self._emit_speech(collab, out["content"])
+                            if not out["streamed"]:
+                                await self._emit_speech(collab, out["content"])
                             self._record_memory(collab, out["content"])
 
                 # 3) 记忆转化与遗忘

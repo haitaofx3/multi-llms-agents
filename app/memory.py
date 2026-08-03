@@ -19,7 +19,7 @@ import time
 import threading
 from pathlib import Path
 
-from config import settings
+from app.config import settings
 
 DEFAULT_FORGET_CONFIG = {
     "short_capacity": 24,     # 短期记忆最大条数

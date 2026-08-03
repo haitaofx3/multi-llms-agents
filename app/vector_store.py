@@ -9,8 +9,8 @@ vector_store.py — 多 Agent 共享的向量知识库
 """
 import threading
 import numpy as np
-from config import settings
-from embeddings import embed, embed_query, dim
+from app.config import settings
+from app.embeddings import embed, embed_query, dim
 
 
 class _InMemoryStore:

@@ -9,6 +9,7 @@ const state = {
   ctx: {},            // var -> {by,value}
   ws: null,
   seats: {},          // name -> element
+  streamBox: null,    // {speaker, el} 当前流式发言气泡
 };
 
 const STATUS_TEXT = {
@@ -262,6 +263,28 @@ function handleEvent(ev) {
       addMsg(ev.speaker, ev.text, ev.is_main ? "main" : "", ev.round);
       highlightSeat(ev.speaker);
       break;
+    // ---- 流式发言：start 建气泡 → delta 追加文本 → end 用完整文本收尾 ----
+    case "speech_start":
+      state.streamBox = {
+        speaker: ev.speaker,
+        el: addMsgStart(ev.speaker, ev.is_main ? "main" : "", ev.round),
+      };
+      highlightSeat(ev.speaker);
+      break;
+    case "speech_delta":
+      if (state.streamBox && state.streamBox.speaker === ev.speaker) {
+        const body = state.streamBox.el.querySelector(".body");
+        body.textContent += ev.delta;
+        $("transcript").scrollTop = $("transcript").scrollHeight;
+      }
+      break;
+    case "speech_end":
+      if (state.streamBox && state.streamBox.speaker === ev.speaker) {
+        // 以完整文本替换，避免与流式增量存在偏差
+        state.streamBox.el.querySelector(".body").textContent = ev.text;
+        state.streamBox = null;
+      }
+      break;
     case "task_assigned": {
       addMsg(ev.from, `分派任务给 ${ev.to}：\n内容：${ev.content}\n期望：${ev.expected}\n变量：${ev.var}`, "task", null, ev.from);
       state.tasks.push({ id: Date.now() + Math.random(), to: ev.to, content: ev.content, expected: ev.expected, var: ev.var, completed: false, value: "" });
@@ -288,6 +311,18 @@ function handleEvent(ev) {
 }
 
 // ---------------- 渲染 ----------------
+function addMsgStart(who, cls, round) {
+  // 创建发言气泡（不填充文本，供流式增量追加）
+  const box = $("transcript");
+  const el = document.createElement("div");
+  el.className = "msg " + (cls || "");
+  const tag = round ? `<span class="round-tag">第${round}轮</span>` : "";
+  el.innerHTML = `<div class="who">${who}${tag}</div><div class="body"></div>`;
+  box.appendChild(el);
+  box.scrollTop = box.scrollHeight;
+  return el;
+}
+
 function addMsg(who, text, cls, round, label) {
   const box = $("transcript");
   const el = document.createElement("div");

@@ -15,8 +15,8 @@ tools.py — 每个 Agent 的 MCP 工具对象
 import json
 import urllib.request
 import urllib.parse
-from config import settings
-from vector_store import shared_vector_store
+from app.config import settings
+from app.vector_store import shared_vector_store
 
 
 class Tool:

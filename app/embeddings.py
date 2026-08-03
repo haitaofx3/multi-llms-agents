@@ -5,7 +5,7 @@ embeddings.py — 文本向量化
 自动降级为确定性的哈希向量，保证项目在任何环境下都能运行。
 """
 import numpy as np
-from config import settings
+from app.config import settings
 
 _model = None
 _dim = None

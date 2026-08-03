@@ -1,10 +1,12 @@
 """
-backend.py — FastAPI 后端
+main.py — FastAPI 应用入口（后端）
 
 提供：
   - 静态 UI 服务（圆桌界面）
   - REST 接口：配置 Agent / 注入知识 / 开始·暂停·继续·结束讨论 / 导出 Markdown
   - WebSocket(/ws)：把讨论事件实时推送到前端
+
+统一由项目根目录的 start.py 启动（uvicorn）。
 """
 import asyncio
 import json
@@ -14,14 +16,15 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from config import settings, BASE_DIR
-from llm import PROVIDER_PRESETS
-from vector_store import shared_vector_store
-from orchestrator import orchestrator
+from app.config import settings, PROJECT_ROOT
+from app.llm import PROVIDER_PRESETS
+from app.vector_store import shared_vector_store
+from app.orchestrator import orchestrator
 
-STATIC_DIR = BASE_DIR / "static"
-DISCUSSIONS_DIR = BASE_DIR / "discussions"
-DISCUSSIONS_DIR.mkdir(exist_ok=True)
+STATIC_DIR = Path(__file__).resolve().parent / "static"
+DATA_DIR = PROJECT_ROOT / "data"
+DISCUSSIONS_DIR = DATA_DIR / "discussions"
+DISCUSSIONS_DIR.mkdir(parents=True, exist_ok=True)
 
 app = FastAPI(title="多 Agent 圆桌协作系统")
 
@@ -185,8 +188,3 @@ async def ws_endpoint(websocket: WebSocket):
         orchestrator.event_bus.unsubscribe(q)
     except Exception:
         orchestrator.event_bus.unsubscribe(q)
-
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
