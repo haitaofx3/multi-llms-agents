@@ -80,7 +80,10 @@ async def configure(payload: dict):
         return JSONResponse({"ok": False, "error": "Agent 数量需在 1-6 之间"}, status_code=400)
     topic = payload.get("topic", "")
     max_rounds = int(payload.get("max_rounds", 8))
-    orchestrator.configure(agents, topic=topic, max_rounds=max_rounds)
+    try:
+        orchestrator.configure(agents, topic=topic, max_rounds=max_rounds)
+    except ValueError as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
     return {
         "ok": True,
         "agents": [{"name": a.name, "role": a.role, "is_main": a.is_main,

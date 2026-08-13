@@ -23,7 +23,9 @@ PROVIDER_PRESETS = {
     },
     "deepseek": {
         "base_url": settings.DEEPSEEK_BASE_URL,
-        "api_key": settings.DEEPSEEK_API_KEY or settings.LLM_API_KEY,
+        # 注意：不能用 `or settings.LLM_API_KEY` 兜底——LLM_API_KEY 是 DashScope 的 key，
+        # 拿它请求 api.deepseek.com 必然 401，且错误信息极具误导性。
+        "api_key": settings.DEEPSEEK_API_KEY,
         "model_id": settings.DEEPSEEK_MODEL_ID,
     },
     "default": {
@@ -36,13 +38,40 @@ PROVIDER_PRESETS = {
 
 def resolve_model_config(provider: str = "default", base_url: str = "", api_key: str = "",
                          model_id: str = ""):
-    """解析出一个完整的模型配置字典。"""
+    """解析出一个完整的模型配置字典。
+
+    - provider == "custom"：不再静默回退默认预设。base_url / api_key / model_id
+      任一为空都会抛出 ValueError，避免用错误的供应商端点/凭据请求导致 400/404。
+    - 预置提供商（qwen / deepseek / default）：API Key 为空时同样提前报错，
+      提示用户去 .env 补充，而不是等到请求时才暴露难以定位的认证错误。
+    """
+    if provider == "custom":
+        missing = [name for name, val in
+                   (("base_url", base_url), ("api_key", api_key), ("model_id", model_id))
+                   if not val.strip()]
+        if missing:
+            raise ValueError(
+                f"自定义模型缺少必填项: {', '.join(missing)}。"
+                "请在 Agent 配置卡片中填写 Base URL / API Key / Model ID。"
+            )
+        return {
+            "base_url": base_url.strip(),
+            "api_key": api_key.strip(),
+            "model_id": model_id.strip(),
+        }
+
     preset = PROVIDER_PRESETS.get(provider, PROVIDER_PRESETS["default"])
-    return {
+    cfg = {
         "base_url": base_url or preset["base_url"],
         "api_key": api_key or preset["api_key"],
         "model_id": model_id or preset["model_id"],
     }
+    if not cfg["api_key"].strip():
+        raise ValueError(
+            f"模型提供商「{provider}」未配置 API Key。"
+            "请在 .env 中补充对应配置（如 LLM_API_KEY / DEEPSEEK_API_KEY）。"
+        )
+    return cfg
 
 
 def _client(model_config: dict) -> OpenAI:

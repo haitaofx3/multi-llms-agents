@@ -127,6 +127,15 @@ async function ingest() {
 // ---------------- 开始讨论 ----------------
 async function startDiscussion() {
   $("setup-error").textContent = "";
+  // 校验：自定义 provider 的 base_url / api_key / model_id 必须填写
+  const missing = state.agentConfigs.filter(c => c.provider === "custom")
+    .map(c => ({ c, keys: ["base_url", "api_key", "model_id"].filter(k => !(c[k] || "").trim()) }))
+    .filter(x => x.keys.length);
+  if (missing.length) {
+    const parts = missing.map(x => `${x.c.name}（缺少 ${x.keys.join(" / ")}）`);
+    $("setup-error").textContent = "自定义模型配置不完整：" + parts.join("；");
+    return;
+  }
   const payload = {
     agents: state.agentConfigs.map((c, i) => ({
       agent_id: `agent_${i + 1}`,
@@ -306,6 +315,10 @@ function handleEvent(ev) {
       break;
     case "log":
       addMsg("系统", ev.text, "log", null, "");
+      break;
+    case "agent_error":
+      addMsg(ev.agent || "系统", ev.error, "error", null, "模型调用失败");
+      if (ev.agent) highlightSeat(ev.agent);
       break;
   }
 }

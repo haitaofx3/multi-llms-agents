@@ -245,7 +245,14 @@ class Orchestrator:
                     result = await asyncio.to_thread(
                         chat, messages, agent.model_config, tools)
             except Exception as e:  # noqa
-                self._log(f"[LLM错误:{agent.name}] {e}")
+                msg = f"[LLM错误:{agent.name}] {e}"
+                self._log(msg)
+                # 把错误同步推送到前端（醒目的错误气泡），避免只在控制台可见
+                await self.event_bus.publish({
+                    "type": "agent_error",
+                    "agent": agent.name,
+                    "error": str(e),
+                })
                 break
 
             content = result["content"] or content
