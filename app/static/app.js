@@ -9,12 +9,18 @@ const state = {
   ctx: {},            // var -> {by,value}
   ws: null,
   seats: {},          // name -> element
-  streamBox: null,    // {speaker, el} 当前流式发言气泡
+  streamBoxes: {},    // speaker -> el（并行流式：多个 Agent 可同时流式发言）
 };
 
 const STATUS_TEXT = {
   idle: "空闲", running: "讨论中", paused: "已暂停", done: "已完成", stopped: "已结束",
 };
+
+const PHASE_TEXT = {
+  idle: "空闲", preparing: "准备中", debating: "辩论中", judging: "裁决中", finished: "已完成",
+};
+
+const STANCE_TEXT = { HOST: "主持人", PRO: "正方", CON: "反方", NEUTRAL: "中立" };
 
 // ---------------- 初始化 ----------------
 async function init() {
@@ -60,8 +66,14 @@ function generateAgentCards(n) {
       personality: "",
       provider: "default",
       base_url: "", api_key: "", model_id: "",
+      stance: isMain ? "HOST" : (i % 2 === 1 ? "PRO" : "CON"),
     };
     state.agentConfigs.push(cfg);
+
+    // 立场下拉：主 Agent 固定主持人，其余按 PRO/CON 交替
+    const stanceOpts = ["HOST", "PRO", "CON", "NEUTRAL"]
+      .map(s => `<option value="${s}" ${s === cfg.stance ? "selected" : ""}>${STANCE_TEXT[s]}</option>`)
+      .join("");
 
     const card = document.createElement("div");
     card.className = "acard" + (isMain ? " main" : "");
@@ -71,6 +83,9 @@ function generateAgentCards(n) {
       <div class="field"><label>名称</label><input data-k="name" value="${cfg.name}"></div>
       <div class="field"><label>角色（必填，留空则按机器人）</label><input data-k="role" value="${cfg.role}" placeholder="如：产品经理"></div>
       <div class="field"><label>性格特征（必填，留空则按机器人）</label><input data-k="personality" value="${cfg.personality}" placeholder="如：严谨、富有创意"></div>
+      <div class="field"><label>立场（辩论席位）</label>
+        <select data-k="stance">${stanceOpts}</select>
+      </div>
       <div class="field"><label>基础模型</label>
         <select data-k="provider">
           <option value="default">默认（.env）</option>
@@ -146,6 +161,7 @@ async function startDiscussion() {
       base_url: c.base_url,
       api_key: c.api_key,
       model_id: c.model_id,
+      stance: c.stance,
     })),
     topic: $("topic").value.trim(),
     max_rounds: parseInt($("max-rounds").value, 10) || 8,
@@ -172,7 +188,11 @@ async function startDiscussion() {
   // 启动讨论
   const st = await fetch("/api/start", {
     method: "POST", headers: {"Content-Type": "application/json"},
-    body: JSON.stringify({ topic: payload.topic, max_rounds: payload.max_rounds }),
+    body: JSON.stringify({
+      topic: payload.topic,
+      max_rounds: payload.max_rounds,
+      budget: parseInt($("budget").value, 10) || 100000,
+    }),
   }).then(r => r.json());
   if (!st.ok) {
     alert("启动失败：" + (st.error || ""));
@@ -199,6 +219,7 @@ function renderSeats(agents) {
       <div class="avatar">${a.is_main ? "👑" : "🤖"}</div>
       <div class="sname">${a.name}</div>
       <div class="srole">${a.role || "机器人"}</div>
+      <div class="srole stance">${STANCE_TEXT[a.stance] || a.stance || ""}</div>
       ${a.is_main ? '<div class="badge">主</div>' : ''}
     `;
     table.appendChild(seat);
@@ -252,6 +273,13 @@ function handleEvent(ev) {
       }
       if (ev.topic) $("center-topic").textContent = ev.topic;
       if (ev.max_rounds) $("center-round").textContent = `第 ${ev.round || 0} / ${ev.max_rounds} 轮`;
+      renderRunStatus({
+        phase: ev.phase, current_round: ev.round,
+        remaining_budget: ev.remaining_budget != null ? ev.remaining_budget : (ev.budget != null ? ev.budget - (ev.spent || 0) : null),
+        spent_budget: ev.spent,
+        elapsed_time_ms: ev.elapsed_time_ms,
+        trace_id: ev.trace_id,
+      });
       if (ev.status === "done" || ev.status === "stopped") {
         $("done-bar").classList.remove("hidden");
         $("done-msg").textContent = ev.status === "done" ? "讨论完成，可导出结果。" : "讨论已结束。";
@@ -273,27 +301,29 @@ function handleEvent(ev) {
       highlightSeat(ev.speaker);
       break;
     // ---- 流式发言：start 建气泡 → delta 追加文本 → end 用完整文本收尾 ----
+    // 第 1 轮辩手并行立论时多个 Agent 会同时流式发言，因此按 speaker 维护独立气泡，
+    // 避免并发流式时互相覆盖（架构文档 §6.2 并行立论）。
     case "speech_start":
-      state.streamBox = {
-        speaker: ev.speaker,
-        el: addMsgStart(ev.speaker, ev.is_main ? "main" : "", ev.round),
-      };
+      state.streamBoxes[ev.speaker] = addMsgStart(ev.speaker, ev.is_main ? "main" : "", ev.round);
       highlightSeat(ev.speaker);
       break;
-    case "speech_delta":
-      if (state.streamBox && state.streamBox.speaker === ev.speaker) {
-        const body = state.streamBox.el.querySelector(".body");
-        body.textContent += ev.delta;
+    case "speech_delta": {
+      const box = state.streamBoxes[ev.speaker];
+      if (box) {
+        box.querySelector(".body").textContent += ev.delta;
         $("transcript").scrollTop = $("transcript").scrollHeight;
       }
       break;
-    case "speech_end":
-      if (state.streamBox && state.streamBox.speaker === ev.speaker) {
+    }
+    case "speech_end": {
+      const box = state.streamBoxes[ev.speaker];
+      if (box) {
         // 以完整文本替换，避免与流式增量存在偏差
-        state.streamBox.el.querySelector(".body").textContent = ev.text;
-        state.streamBox = null;
+        box.querySelector(".body").textContent = ev.text;
+        delete state.streamBoxes[ev.speaker];
       }
       break;
+    }
     case "task_assigned": {
       addMsg(ev.from, `分派任务给 ${ev.to}：\n内容：${ev.content}\n期望：${ev.expected}\n变量：${ev.var}`, "task", null, ev.from);
       state.tasks.push({ id: Date.now() + Math.random(), to: ev.to, content: ev.content, expected: ev.expected, var: ev.var, completed: false, value: "" });
@@ -313,6 +343,17 @@ function handleEvent(ev) {
     case "summary":
       addMsg(ev.speaker, ev.text, "summary", ev.round, "最终总结");
       break;
+    case "status_sync":
+      renderRunStatus(ev);
+      break;
+    case "judgment": {
+      const scoreTxt = Object.entries(ev.scores || {})
+        .map(([k, v]) => `${k}: ${v}`).join("，") || "（无评分）";
+      const winnerTxt = ev.winner === "DRAW" ? "平局（DRAW）" : `胜方：${STANCE_TEXT[ev.winner] || ev.winner}`;
+      const text = `【裁判裁决】\n- ${winnerTxt}\n- 得分：${scoreTxt}\n- 收敛终止：${ev.convergence_flag ? "是" : "否"}\n- 评语：${ev.critique || ""}`;
+      addMsg("裁判", text, "summary", ev.round, "裁决");
+      break;
+    }
     case "log":
       addMsg("系统", ev.text, "log", null, "");
       break;
@@ -375,6 +416,26 @@ function updateProgress() {
   const total = state.tasks.length;
   const done = state.tasks.filter(t => t.completed).length;
   $("center-progress").textContent = total ? `任务 ${done}/${total} 完成` : "";
+}
+
+// ---------------- 运行状态（阶段 / Token 预算） ----------------
+function renderRunStatus(data) {
+  const box = $("run-status");
+  if (!box) return;
+  const phase = PHASE_TEXT[data.phase] || data.phase || "-";
+  const round = data.current_round != null ? `第 ${data.current_round} 轮` : "-";
+  const budget = data.remaining_budget != null
+    ? `剩余 ${data.remaining_budget.toLocaleString()} / 已用 ${(data.spent_budget || 0).toLocaleString()}`
+    : "-";
+  const elapsed = data.elapsed_time_ms != null
+    ? `用时 ${(data.elapsed_time_ms / 1000).toFixed(1)}s` : "";
+  box.innerHTML = `
+    <div class="kv"><b>阶段</b>：${phase}</div>
+    <div class="kv"><b>轮次</b>：${round}</div>
+    <div class="kv"><b>预算</b>：${budget}</div>
+    ${elapsed ? `<div class="kv"><b>${elapsed}</b></div>` : ""}
+    ${data.trace_id ? `<div class="kv muted" style="font-size:11px">Trace: ${data.trace_id}</div>` : ""}
+  `;
 }
 
 // ---------------- Markdown 导出 ----------------

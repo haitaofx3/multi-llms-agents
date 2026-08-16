@@ -50,6 +50,13 @@ def _int(name: str, default: int) -> int:
         return default
 
 
+def _float(name: str, default: float) -> float:
+    try:
+        return float(_raw.get(name, str(default)))
+    except Exception:
+        return default
+
+
 class Settings:
     # ---- LLM 默认配置 (来自 .env，所有 agent 的兜底模型) ----
     LLM_MODEL_ID = _get("LLM_MODEL_ID", "qwen3-vl-flash")
@@ -72,7 +79,7 @@ class Settings:
     QDRANT_COLLECTION = _get("QDRANT_COLLECTION", "hello_agents_vectors")
     QDRANT_VECTOR_SIZE = _int("QDRANT_VECTOR_SIZE", 384)
     QDRANT_DISTANCE = _get("QDRANT_DISTANCE", "cosine")
-    QDRANT_TIMEOUT = _int("QDRANT_TIMEOUT", 30)
+    QDRANT_TIMEOUT = _int("QDRANT_TIMEOUT", 3)  # 短超时保证启动快速失败降级
 
     # ---- Neo4j (保留，可选) ----
     NEO4J_URI = _get("NEO4J_URI", "bolt://localhost:7687")
@@ -84,6 +91,26 @@ class Settings:
     EMBED_MODEL_NAME = _get("EMBED_MODEL_NAME", "sentence-transformers/all-MiniLM-L6-v2")
     EMBED_API_KEY = _get("EMBED_API_KEY", "")
     EMBED_BASE_URL = _get("EMBED_BASE_URL", "")
+
+    # ---- Token 预算与熔断（架构文档 §6.3） ----
+    TOKEN_BUDGET = _int("TOKEN_BUDGET", 100000)              # 单场辩论全局预算
+    MIN_TOKEN_THRESHOLD = _int("MIN_TOKEN_THRESHOLD", 1000)   # 低于此阈值强制结束
+
+    # ---- 收敛检测（架构文档 §4.3/4.4） ----
+    CONVERGENCE_SIMILARITY = _float("CONVERGENCE_SIMILARITY", 0.85)
+    CONVERGENCE_ROUNDS = _int("CONVERGENCE_ROUNDS", 2)        # 连续 N 轮高度相似即收敛
+
+    # ---- LLM 重试（架构文档 §4.5：最多重试 2 次，间隔 1s、3s） ----
+    LLM_RETRY_ATTEMPTS = _int("LLM_RETRY_ATTEMPTS", 3)
+    LLM_RETRY_DELAYS = (1.0, 3.0)
+
+    # ---- 单步流式超时（秒） ----
+    STREAM_TIMEOUT = _int("STREAM_TIMEOUT", 90)
+
+    # ---- 上下文压缩与长对话管理（优化 A9） ----
+    CONTEXT_MAX_CHARS = _int("CONTEXT_MAX_CHARS", 8000)               # 单 Agent 上下文字符硬上限
+    CONTEXT_COMPRESS_THRESHOLD = _int("CONTEXT_COMPRESS_THRESHOLD", 6000)  # 触发 LLM 摘要的字符阈值
+    CONTEXT_COMPRESS_KEEP_RECENT = _int("CONTEXT_COMPRESS_KEEP_RECENT", 8)  # 摘要后保留的最近条数
 
 
 settings = Settings()

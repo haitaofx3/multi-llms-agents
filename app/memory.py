@@ -15,9 +15,12 @@ memory.py — 每个 Agent 的记忆系统
   - 基于时间衰减 + 访问频次的"有效重要性"，低于阈值或超出容量则遗忘
 """
 import json
+import re
 import time
 import threading
 from pathlib import Path
+
+import numpy as np
 
 from app.config import settings
 
@@ -29,6 +32,20 @@ DEFAULT_FORGET_CONFIG = {
     "min_importance": 0.08,   # 有效重要性低于此值则遗忘
     "promote_importance": 0.75,  # 短期记忆重要性高于此值直接提升为长期
 }
+
+
+def _tokenize(text: str) -> set:
+    """中文友好的轻量分词：ASCII 单词 + CJK 单字。
+
+    原有关键词匹配使用 `query.lower().split()`，对无空格分隔的中文完全失效
+    （整句被当作一个 token）。这里改为抽取 ASCII 单词与 CJK 单字作为 token，
+    使中文关键词检索可用（优化 A3）。
+    """
+    if not text:
+        return set()
+    words = re.findall(r"[A-Za-z0-9_]+", text.lower())
+    cjk = re.findall(r"[\u4e00-\u9fff]", text)
+    return set(words) | set(cjk)
 
 
 class MemorySystem:
@@ -79,6 +96,27 @@ class MemorySystem:
         }
         self.file.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
+    # ---------------- 向量嵌入（优化 A3） ----------------
+    def _try_embed(self, text: str):
+        """计算单条文本嵌入向量；任何失败返回 None（调用方回退关键词检索）。"""
+        if not text:
+            return None
+        try:
+            from app.embeddings import embed_query
+            return embed_query(text)
+        except Exception:  # noqa
+            return None
+
+    def _batch_embed(self, texts):
+        """批量计算嵌入；失败返回 None。"""
+        if not texts:
+            return None
+        try:
+            from app.embeddings import embed
+            return embed(texts)
+        except Exception:  # noqa
+            return None
+
     # ---------------- 写入 ----------------
     def add_short(self, text: str, importance: float = 0.5):
         with self.lock:
@@ -88,6 +126,7 @@ class MemorySystem:
                 "ts": self._now(),
                 "importance": float(importance),
                 "access": 1,
+                "embedding": self._try_embed(text),  # 写入时缓存向量，检索免重复计算
             })
             # 容量溢出 → 最不重要的提升或遗忘
             while len(self.short_term) > self.forget["short_capacity"]:
@@ -102,6 +141,7 @@ class MemorySystem:
                 "ts": self._now(),
                 "importance": float(importance),
                 "access": 1,
+                "embedding": self._try_embed(text),
             })
             self._trim("long_term", self.forget["long_capacity"])
             self._save()
@@ -114,6 +154,7 @@ class MemorySystem:
                 "ts": self._now(),
                 "importance": float(importance),
                 "access": 1,
+                "embedding": self._try_embed(text),
             })
             self._trim("contextual", self.forget["context_capacity"])
             self._save()
@@ -169,6 +210,7 @@ class MemorySystem:
                 "ts": self._now(),
                 "importance": 0.7,
                 "access": 1,
+                "embedding": self._try_embed(summary),
             })
             self._trim("contextual", self.forget["context_capacity"])
             # 短期清空（已沉淀为情境）
@@ -215,29 +257,74 @@ class MemorySystem:
 
     # ---------------- 检索 ----------------
     def query(self, query: str = "", top_k: int = 4):
-        """检索长期 + 情境记忆；query 为空时返回最近重要的记忆。"""
+        """检索长期 + 情境记忆；query 为空时返回最近重要的记忆。
+
+        优化 A3：query 非空时采用「向量语义 + 关键词 + 重要性」混合排序：
+          - 向量语义：embed_query 计算查询向量，与条目缓存的 embedding 做余弦相似度；
+          - 关键词：中文友好的 _tokenize 分词覆盖率（解决原 `lower().split()` 中文失效）；
+          - 重要性：_effective_importance（时间衰减 + 访问频次）。
+        分数 = 0.5*语义 + 0.3*关键词 + 0.2*重要性（RRF 加权思想）。
+        嵌入不可用（模型加载失败 / 旧数据无缓存）时自动回退关键词 + 重要性排序。
+        """
         with self.lock:
             long = sorted(self.long_term, key=self._effective_importance, reverse=True)
             ctx = sorted(self.contextual, key=self._effective_importance, reverse=True)
             recent_short = sorted(self.short_term, key=lambda x: x.get("ts", 0), reverse=True)
-        # 简单关键词匹配（轻量，无需再 embedding）
-        if query:
-            q = set(query.lower().split())
-            def score(items):
-                res = []
-                for it in items:
-                    text = it["text"].lower()
-                    s = sum(1 for w in q if w and w in text)
-                    res.append((s + self._effective_importance(it) * 0.1, it))
-                res.sort(key=lambda x: -x[0])
-                return [it for _, it in res]
-            long = score(long)
-            ctx = score(ctx)
+
+        if not query:
+            result = []
+            result += [f"[情境] {it['text']}" for it in ctx[:top_k]]
+            result += [f"[长期] {it['text']}" for it in long[:top_k]]
+            result += [f"[短期] {it['text']}" for it in recent_short[:3]]
+            return result
+
+        pool = [("long", it) for it in long] + \
+               [("ctx", it) for it in ctx] + \
+               [("short", it) for it in recent_short]
+        scored = self._hybrid_search(query, pool)
+        top_ctx = [it for s, c, it in scored if c == "ctx"][:top_k]
+        top_long = [it for s, c, it in scored if c == "long"][:top_k]
+        top_short = [it for s, c, it in scored if c == "short"][:3]
+
         result = []
-        result += [f"[情境] {it['text']}" for it in ctx[:top_k]]
-        result += [f"[长期] {it['text']}" for it in long[:top_k]]
-        result += [f"[短期] {it['text']}" for it in recent_short[:3]]
+        result += [f"[情境] {it['text']}" for it in top_ctx]
+        result += [f"[长期] {it['text']}" for it in top_long]
+        result += [f"[短期] {it['text']}" for it in top_short]
         return result
+
+    def _hybrid_search(self, query: str, pool):
+        """向量语义 + 关键词 + 重要性的加权混合排序，返回 [(score, cat, item)]。"""
+        q_tokens = _tokenize(query)
+        q_vec = self._try_embed(query)
+        # 为缺失向量缓存的条目批量计算并回填（写入时已缓存，仅旧数据/降级路径需要）
+        missing = [it for _, it in pool if not it.get("embedding")]
+        if q_vec is not None and missing:
+            vecs = self._batch_embed([it["text"] for it in missing])
+            if vecs:
+                with self.lock:
+                    for it, v in zip(missing, vecs):
+                        it["embedding"] = v
+
+        qv = np.array(q_vec, dtype="float32") if q_vec is not None else None
+        scored = []
+        for cat, it in pool:
+            sem = 0.0
+            emb = it.get("embedding")
+            if qv is not None and emb:
+                try:
+                    v = np.array(emb, dtype="float32")
+                    sim = float(np.dot(qv, v) /
+                                (np.linalg.norm(qv) * np.linalg.norm(v) + 1e-9))
+                    sem = max(0.0, sim)  # 余弦可为负，截断避免惩罚
+                except Exception:  # noqa
+                    sem = 0.0
+            t_text = _tokenize(it.get("text", ""))
+            kw = len(q_tokens & t_text) / max(1, len(q_tokens))
+            imp = min(1.0, self._effective_importance(it))
+            score = 0.5 * sem + 0.3 * kw + 0.2 * imp
+            scored.append((score, cat, it))
+        scored.sort(key=lambda x: -x[0])
+        return scored
 
     def context_text(self, query: str = "", top_k: int = 3) -> str:
         items = self.query(query, top_k)

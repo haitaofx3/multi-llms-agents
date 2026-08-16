@@ -82,6 +82,39 @@ def _client(model_config: dict) -> OpenAI:
     )
 
 
+def _estimate_usage(messages, output_text: str = "") -> dict:
+    """粗略估算 token 用量（流式或服务未返回 usage 时的兜底）。
+
+    中文约 2 字符/token，英文约 4 字符/token，这里统一按 2 估算，
+    足够用于预算控制（预算熔断场景无需精确到个位）。
+    """
+    def _tokens(s: str) -> int:
+        return max(1, len(s) // 2)
+
+    prompt = sum(_tokens(str(m.get("content", ""))) for m in messages)
+    completion = _tokens(output_text or "")
+    return {
+        "prompt_tokens": prompt,
+        "completion_tokens": completion,
+        "total_tokens": prompt + completion,
+    }
+
+
+def _usage_from_response(resp) -> dict:
+    """从 OpenAI 兼容响应中提取 usage；缺失则返回 None。"""
+    try:
+        u = resp.usage
+        if u is not None:
+            return {
+                "prompt_tokens": getattr(u, "prompt_tokens", 0) or 0,
+                "completion_tokens": getattr(u, "completion_tokens", 0) or 0,
+                "total_tokens": getattr(u, "total_tokens", 0) or 0,
+            }
+    except Exception:  # noqa
+        pass
+    return None
+
+
 def _strip_think(text: str) -> str:
     """移除 Qwen3 等模型产生的 <think>...</think> 思考片段。"""
     if not text:
@@ -181,8 +214,13 @@ def chat_stream(messages, model_config: dict, tools=None, tool_choice="auto",
     filter_ = ThinkFilter()
     content_parts = []
     tool_acc = {}  # index -> {"id","name","arguments"}
+    usage = None
 
     for chunk in resp:
+        # 捕获流式 usage（部分提供商在最后一个 chunk 附带）
+        u = _usage_from_response(chunk)
+        if u:
+            usage = u
         if not getattr(chunk, "choices", None):
             continue
         delta = chunk.choices[0].delta
@@ -234,10 +272,14 @@ def chat_stream(messages, model_config: dict, tools=None, tool_choice="auto",
     if assistant_tool_calls:
         assistant_message["tool_calls"] = assistant_tool_calls
 
+    if usage is None:
+        usage = _estimate_usage(messages, content)
+
     yield {"type": "final", "result": {
         "content": content,
         "tool_calls": tool_calls,
         "assistant_message": assistant_message,
+        "usage": usage,
     }}
 
 
@@ -290,4 +332,7 @@ def chat(messages, model_config: dict, tools=None, tool_choice="auto", temperatu
     if assistant_tool_calls:
         assistant_message["tool_calls"] = assistant_tool_calls
 
-    return {"content": content, "tool_calls": tool_calls, "assistant_message": assistant_message}
+    usage = _usage_from_response(resp) or _estimate_usage(messages, content)
+
+    return {"content": content, "tool_calls": tool_calls,
+            "assistant_message": assistant_message, "usage": usage}

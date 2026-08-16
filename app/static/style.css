@@ -106,6 +106,7 @@ button.primary { background: linear-gradient(90deg, var(--accent), #7a5bff); bor
 .seat .sname { font-size: 13px; font-weight: 600; margin-top: 4px; }
 .seat .srole { font-size: 11px; color: var(--muted); max-width: 100px; margin: 2px auto 0; line-height: 1.25; }
 .seat .badge { font-size: 10px; color: var(--warn); margin-top: 2px; }
+.seat .srole.stance { color: var(--accent); font-weight: 600; }
 
 .side { display: flex; flex-direction: column; gap: 12px; }
 .controls { display: flex; flex-wrap: wrap; gap: 8px; }

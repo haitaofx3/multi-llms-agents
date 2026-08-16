@@ -33,6 +33,11 @@
       <label>最大讨论轮次：</label>
       <input type="number" id="max-rounds" min="1" max="30" value="8" />
     </div>
+    <div class="row">
+      <label>Token 预算：</label>
+      <input type="number" id="budget" min="1000" step="1000" value="100000" />
+      <span class="hint">预算熔断：剩余不足阈值时强制进入裁决</span>
+    </div>
 
     <h2>③ 共享知识库（可选）</h2>
     <div class="row col">
@@ -67,6 +72,10 @@
           <button id="btn-resume" class="hidden">▶ 继续</button>
           <button id="btn-end">⏹ 结束</button>
           <button id="btn-back">↩ 返回配置</button>
+        </div>
+        <div class="ctx-box">
+          <div class="box-title">运行状态（阶段 / Token 预算）</div>
+          <div id="run-status" class="ctx-list"><div class="muted">未开始</div></div>
         </div>
         <div class="ctx-box">
           <div class="box-title">任务接收方变量（共享上下文）</div>

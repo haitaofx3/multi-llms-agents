@@ -10,6 +10,8 @@ main.py — FastAPI 应用入口（后端）
 """
 import asyncio
 import json
+import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -26,14 +28,14 @@ DATA_DIR = PROJECT_ROOT / "data"
 DISCUSSIONS_DIR = DATA_DIR / "discussions"
 DISCUSSIONS_DIR.mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title="多 Agent 圆桌协作系统")
 
-app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+def _ts():
+    return time.strftime("%Y%m%d_%H%M%S")
 
 
 # ---------------- 启动：监听"完成"事件，自动保存 Markdown ----------------
-@app.on_event("startup")
-async def _startup():
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     q = orchestrator.event_bus.subscribe()
 
     async def _listener():
@@ -47,12 +49,16 @@ async def _startup():
                 except Exception:
                     pass
 
-    asyncio.create_task(_listener())
+    task = asyncio.create_task(_listener())
+    yield
+    # 关闭时：取消监听任务并退订，避免悬挂引用
+    task.cancel()
+    orchestrator.event_bus.unsubscribe(q)
 
 
-def _ts():
-    import time
-    return time.strftime("%Y%m%d_%H%M%S")
+app = FastAPI(title="多 Agent 圆桌协作系统", lifespan=lifespan)
+
+app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 
 # ---------------- 页面 ----------------
@@ -61,11 +67,19 @@ async def index():
     return FileResponse(str(STATIC_DIR / "index.html"))
 
 
+def _redact_presets():
+    """对外暴露 Provider 预设时剥离 api_key，避免密钥泄露。"""
+    return {
+        name: {k: (v if k != "api_key" else "") for k, v in preset.items()}
+        for name, preset in PROVIDER_PRESETS.items()
+    }
+
+
 # ---------------- 默认配置 ----------------
 @app.get("/api/defaults")
 async def defaults():
     return {
-        "providers": PROVIDER_PRESETS,
+        "providers": _redact_presets(),
         "default_provider": "default",
         "vector_backend": shared_vector_store.backend,
         "max_agents": 6,
@@ -75,20 +89,33 @@ async def defaults():
 # ---------------- 配置 Agent ----------------
 @app.post("/api/configure")
 async def configure(payload: dict):
+    if orchestrator.status == "running":
+        return JSONResponse(
+            {"ok": False, "error": "讨论进行中，请先结束或等待后再重新配置"},
+            status_code=409,
+        )
     agents = payload.get("agents", [])
     if not (1 <= len(agents) <= 6):
         return JSONResponse({"ok": False, "error": "Agent 数量需在 1-6 之间"}, status_code=400)
     topic = payload.get("topic", "")
     max_rounds = int(payload.get("max_rounds", 8))
+    budget = payload.get("budget")
     try:
         orchestrator.configure(agents, topic=topic, max_rounds=max_rounds)
+        if budget:
+            orchestrator.budget = max(0, int(budget))
     except ValueError as e:
         return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
     return {
         "ok": True,
         "agents": [{"name": a.name, "role": a.role, "is_main": a.is_main,
+                    "stance": a.stance,
                     "model_id": a.model_config["model_id"]} for a in orchestrator.agents],
         "status": orchestrator.status,
+        "phase": orchestrator.phase,
+        "trace_id": orchestrator.trace_id,
+        "budget": orchestrator.budget,
+        "max_rounds": orchestrator.max_rounds,
     }
 
 
@@ -116,39 +143,54 @@ async def start(payload: dict):
         return JSONResponse({"ok": False, "error": "请先配置 Agent"}, status_code=400)
     topic = payload.get("topic") or orchestrator.topic
     max_rounds = payload.get("max_rounds")
-    asyncio.create_task(orchestrator.run_discussion(topic=topic, max_rounds=max_rounds))
-    return {"ok": True, "status": "running"}
+    budget = payload.get("budget")
+    asyncio.create_task(orchestrator.run_discussion(
+        topic=topic, max_rounds=max_rounds, budget=budget))
+    return {
+        "ok": True,
+        "status": "running",
+        "phase": "preparing",
+        "trace_id": orchestrator.trace_id,
+    }
 
 
 @app.post("/api/pause")
 async def pause():
     orchestrator.pause()
-    return {"ok": True, "status": orchestrator.status}
+    return {"ok": True, "status": orchestrator.status, "phase": orchestrator.phase}
 
 
 @app.post("/api/resume")
 async def resume():
     orchestrator.resume()
-    return {"ok": True, "status": orchestrator.status}
+    return {"ok": True, "status": orchestrator.status, "phase": orchestrator.phase}
 
 
 @app.post("/api/end")
 async def end():
     orchestrator.end()
-    return {"ok": True, "status": orchestrator.status}
+    return {"ok": True, "status": orchestrator.status, "phase": orchestrator.phase}
 
 
 # ---------------- 状态 ----------------
 @app.get("/api/status")
 async def status():
+    remaining = max(0, orchestrator.budget - orchestrator.spent)
     return {
         "status": orchestrator.status,
+        "phase": orchestrator.phase,
+        "trace_id": orchestrator.trace_id,
         "round": orchestrator.round,
         "max_rounds": orchestrator.max_rounds,
         "topic": orchestrator.topic,
-        "agents": [{"name": a.name, "role": a.role, "is_main": a.is_main} for a in orchestrator.agents],
+        "agents": [{"name": a.name, "role": a.role, "is_main": a.is_main,
+                    "stance": a.stance} for a in orchestrator.agents],
         "tasks": orchestrator.tasks,
         "shared_context": orchestrator.shared_context,
+        "budget": orchestrator.budget,
+        "spent": orchestrator.spent,
+        "remaining_budget": remaining,
+        "judgment": orchestrator.judgment,
     }
 
 
@@ -180,14 +222,21 @@ async def ws_endpoint(websocket: WebSocket):
     try:
         # 连接时立即推送当前状态
         await websocket.send_json({
-            "type": "status", "status": orchestrator.status,
-            "topic": orchestrator.topic, "max_rounds": orchestrator.max_rounds,
-            "agents": [{"name": a.name, "role": a.role, "is_main": a.is_main} for a in orchestrator.agents],
+            "type": "status",
+            "status": orchestrator.status,
+            "phase": orchestrator.phase,
+            "trace_id": orchestrator.trace_id,
+            "topic": orchestrator.topic,
+            "max_rounds": orchestrator.max_rounds,
+            "budget": orchestrator.budget,
+            "spent": orchestrator.spent,
+            "agents": [{"name": a.name, "role": a.role, "is_main": a.is_main,
+                        "stance": a.stance} for a in orchestrator.agents],
         })
         while True:
             event = await q.get()
             await websocket.send_json(event)
-    except WebSocketDisconnect:
-        orchestrator.event_bus.unsubscribe(q)
-    except Exception:
+    except (WebSocketDisconnect, Exception):  # noqa
+        pass
+    finally:
         orchestrator.event_bus.unsubscribe(q)

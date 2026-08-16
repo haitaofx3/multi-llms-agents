@@ -50,7 +50,7 @@ def ws_listener():
                 events.append(ev)
                 t = ev.get("type")
                 if t == "speech":
-                    print(f"  [{ev.get('round')}] {ev.get('agent')}: {ev.get('text')[:120]}")
+                    print(f"  [{ev.get('round')}] {ev.get('speaker')}: {ev.get('text')[:120]}")
                 elif t == "speech_start":
                     print(f"  [STREAM] {ev.get('speaker')} 开始流式发言")
                 elif t == "speech_delta":
@@ -62,7 +62,13 @@ def ws_listener():
                 elif t == "task_result":
                     print(f"  [REPORT] {ev.get('from')} done={ev.get('completed')}: {ev.get('message')[:80]}")
                 elif t == "status":
-                    print(f"  [STATUS] {ev.get('status')} round={ev.get('round')}")
+                    print(f"  [STATUS] {ev.get('status')} round={ev.get('round')} phase={ev.get('phase')}")
+                elif t == "status_sync":
+                    print(f"  [SYNC] phase={ev.get('phase')} round={ev.get('current_round')} "
+                          f"remaining={ev.get('remaining_budget')} spent={ev.get('spent_budget')}")
+                elif t == "judgment":
+                    print(f"  [JUDGE] winner={ev.get('winner')} scores={ev.get('scores')} "
+                          f"converged={ev.get('convergence_flag')}")
                 elif t == "summary":
                     print(f"  [SUMMARY] {ev.get('text')[:200]}")
                 if ev.get("type") == "status" and ev.get("status") == "done":
@@ -77,21 +83,23 @@ def main():
     st, d = rest("GET", "/api/defaults")
     print("defaults:", st, "providers=", list(d.get("providers", {}).keys()))
 
-    # 2. configure: 1 main + 2 collaborators, max_rounds=3
+    # 2. configure: 1 main + 2 collaborators, max_rounds=3（立场：主持人/正方/反方）
     cfg = {
         "topic": "城市是否应该全面推广自动驾驶出租车？",
         "max_rounds": 3,
         "agents": [
             {"name": "主持人", "role": "辩论主持人", "personality": "理性、善于追问与归纳",
-             "provider": "default"},
+             "provider": "default", "stance": "HOST"},
             {"name": "技术派", "role": "自动驾驶技术专家", "personality": "务实、看重安全与工程可行性",
-             "provider": "default"},
+             "provider": "default", "stance": "PRO"},
             {"name": "人文派", "role": "城市社会学家", "personality": "关注就业、公平与公共治理",
-             "provider": "default"},
+             "provider": "default", "stance": "CON"},
         ],
     }
     st, r = rest("POST", "/api/configure", cfg)
     print("configure:", st, r.get("ok"), "agents=", [a["name"] for a in r.get("agents", [])])
+    print("configure stances:", [a["stance"] for a in r.get("agents", [])],
+          "budget=", r.get("budget"), "trace_id=", r.get("trace_id"))
 
     # 3. ingest knowledge
     st, r = rest("POST", "/api/ingest", {"text": "研究表明：自动驾驶在封闭园区事故率低于人类驾驶员约 40%\n"
@@ -103,8 +111,8 @@ def main():
     t.start()
     time.sleep(1.0)
 
-    # 5. start discussion
-    st, r = rest("POST", "/api/start", {})
+    # 5. start discussion（携带预算）
+    st, r = rest("POST", "/api/start", {"budget": 100000})
     print("start:", st, r)
 
     # 6. wait for done (up to 5 min)
@@ -114,6 +122,9 @@ def main():
     # 7. status + export
     st, s = rest("GET", "/api/status")
     print("status:", s.get("status"), "round=", s.get("round"), "max=", s.get("max_rounds"))
+    print("status detail: phase=", s.get("phase"), "trace_id=", s.get("trace_id"),
+          "spent=", s.get("spent"), "remaining=", s.get("remaining_budget"),
+          "judgment=", bool(s.get("judgment")))
 
     st, ex = rest("GET", "/api/export")
     md = ex.get("markdown", "")
@@ -124,6 +135,23 @@ def main():
     print("has summary event:", any(e.get("type") == "summary" for e in events))
     print("has task_assigned event:", any(e.get("type") == "task_assigned" for e in events))
     print("has task_result event:", any(e.get("type") == "task_result" for e in events))
+    # ---- 新增架构特性校验（状态机 / 预算 / 裁判） ----
+    phases = [e.get("phase") for e in events
+              if e.get("type") == "status_sync" and e.get("phase")]
+    print("phases observed:", sorted(set(phases)))
+    has_judgment = any(e.get("type") == "judgment" for e in events)
+    has_status_sync = any(e.get("type") == "status_sync" for e in events)
+    spent = s.get("spent") or 0
+    remaining = s.get("remaining_budget") or 0
+    print(f"budget check: spent={spent}, remaining={remaining}, total={spent + remaining}")
+    print(f"judgment event received: {has_judgment}")
+    assert has_status_sync, "未收到 status_sync 事件（状态机/预算同步缺失）"
+    assert has_judgment, "未收到 judgment 事件（裁判裁决缺失）"
+    assert spent >= 0 and remaining >= 0, "预算统计异常"
+    if s.get("judgment"):
+        assert "winner" in s["judgment"], "judgment 缺少 winner 字段"
+        assert "scores" in s["judgment"], "judgment 缺少 scores 字段"
+    print("ARCHITECTURE CHECKS PASS (state machine / budget / judge)")
     # ---- 流式输出校验 ----
     n_start = sum(1 for e in events if e.get("type") == "speech_start")
     n_delta = sum(1 for e in events if e.get("type") == "speech_delta")

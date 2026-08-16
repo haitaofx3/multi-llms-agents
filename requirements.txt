@@ -6,9 +6,13 @@
 # Web 框架
 fastapi
 uvicorn
+websockets
 
 # LLM（OpenAI 兼容协议：DeepSeek / Qwen 等）
 openai
+
+# 数据校验 / 协议模型（protocol.py）
+pydantic
 
 # 向量数据库（可选；不可用时自动降级为内存向量库）
 qdrant-client
