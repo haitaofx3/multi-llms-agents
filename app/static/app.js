@@ -10,6 +10,7 @@ const state = {
   ws: null,
   seats: {},          // name -> element
   streamBoxes: {},    // speaker -> el（并行流式：多个 Agent 可同时流式发言）
+  liveDiscussion: false,  // 存在可继续（暂停中）的讨论：重新进入时不重配置、不重开
 };
 
 const STATUS_TEXT = {
@@ -30,6 +31,14 @@ async function init() {
   generateAgentCards(parseInt($("agent-count").value, 10));
   bindEvents();
   connectWS();
+  // 检测服务器是否已有可继续的讨论（刷新页面 / 之前暂停未结束），此时"进入圆桌"应回到旧讨论
+  try {
+    const st = await fetch("/api/status").then(r => r.json());
+    if ((st.agents || []).length && (st.status === "paused" || st.status === "running")) {
+      state.liveDiscussion = true;
+      $("btn-start").textContent = "↩ 回到圆桌（继续讨论）";
+    }
+  } catch (e) { /* 状态查询失败时忽略 */ }
 }
 
 function bindEvents() {
@@ -141,6 +150,14 @@ async function ingest() {
 
 // ---------------- 开始讨论 ----------------
 async function startDiscussion() {
+  // 已存在可继续的讨论：直接回到之前的讨论页，不重新配置 / 不重开新讨论
+  if (state.liveDiscussion) {
+    state.liveDiscussion = false;
+    $("btn-start").textContent = "▶ 进入圆桌并开始讨论";
+    $("setup").classList.add("hidden");
+    $("discussion").classList.remove("hidden");
+    return;
+  }
   $("setup-error").textContent = "";
   // 校验：自定义 provider 的 base_url / api_key / model_id 必须填写
   const missing = state.agentConfigs.filter(c => c.provider === "custom")
@@ -236,9 +253,22 @@ function highlightSeat(name) {
 
 // ---------------- 控制 ----------------
 async function ctrl(action) {
-  await fetch("/api/" + action, { method: "POST" }).then(r => r.json());
+  return await fetch("/api/" + action, { method: "POST" }).then(r => r.json());
 }
-function backToSetup() {
+
+async function backToSetup() {
+  // 讨论进行中先暂停，确保返回配置后能继续；并按服务端实际状态决定能否"回到旧讨论"
+  let st = null;
+  if (state.agents.length) {
+    st = await ctrl("pause");
+  }
+  const s = st ? st.status : "idle";
+  state.liveDiscussion = !!(
+    state.agents.length && (s === "paused" || s === "running")
+  );
+  $("btn-start").textContent = state.liveDiscussion
+    ? "↩ 回到圆桌（继续讨论）"
+    : "▶ 进入圆桌并开始讨论";
   $("discussion").classList.add("hidden");
   $("setup").classList.remove("hidden");
 }

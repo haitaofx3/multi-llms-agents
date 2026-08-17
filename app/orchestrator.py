@@ -189,15 +189,19 @@ class Orchestrator:
         if self.status == "running":
             self.status = "paused"
             self._pause_event.clear()
+            asyncio.create_task(self.event_bus.publish(self._status_event()))
 
     def resume(self):
         if self.status == "paused":
             self.status = "running"
             self._pause_event.set()
+            asyncio.create_task(self.event_bus.publish(self._status_event()))
 
     def end(self):
-        self.status = "stopped"
-        self._pause_event.set()
+        if self.status in ("running", "paused"):
+            self.status = "stopped"
+            self._pause_event.set()
+            asyncio.create_task(self.event_bus.publish(self._status_event()))
 
     # ---------------- 任务状态文本 ----------------
     def _task_status_text(self):
@@ -680,42 +684,49 @@ class Orchestrator:
                 await asyncio.sleep(0)
 
             # ---- Judging：终止后单次调用裁判（架构文档 §4.1/§6.2） ----
-            self.phase = "judging"
-            await self.event_bus.publish({"type": "status", "status": "running", "phase": self.phase})
-            remaining = self.budget - self.spent
-            if remaining >= settings.MIN_TOKEN_THRESHOLD:
-                judgment = await self._judge_round()
+            if self.status == "stopped":
+                # 手动结束（end()）：跳过裁判裁决与主持人汇总，直接收尾，
+                # 避免旧 run 任务在重新配置/新讨论启动后继续污染编排器状态
+                self.phase = "idle"
+                await self.event_bus.publish({"type": "status", "status": "stopped", "phase": self.phase})
+                await self.event_bus.publish(self._status_sync())
             else:
-                # 预算硬熔断（架构文档 §6.3）：剩余不足以支撑裁判 LLM 调用，回退确定性裁决
-                self._log(f"预算硬熔断：剩余Token({remaining})低于阈值"
-                          f"({settings.MIN_TOKEN_THRESHOLD})，裁判使用回退裁决",
-                          level="warning", event="budget.hard_break")
-                judgment = Judgment(winner="DRAW", critique="预算耗尽，未执行完整 LLM 裁决",
-                                    convergence_flag=False)
-            self.judgment = judgment
-            await self.event_bus.publish({
-                "type": "judgment",
-                "scores": judgment.scores,
-                "winner": judgment.winner,
-                "critique": judgment.critique,
-                "convergence_flag": judgment.convergence_flag,
-                "round": self.round,
-            })
-            await self.event_bus.publish(self._status_sync())
+                self.phase = "judging"
+                await self.event_bus.publish({"type": "status", "status": "running", "phase": self.phase})
+                remaining = self.budget - self.spent
+                if remaining >= settings.MIN_TOKEN_THRESHOLD:
+                    judgment = await self._judge_round()
+                else:
+                    # 预算硬熔断（架构文档 §6.3）：剩余不足以支撑裁判 LLM 调用，回退确定性裁决
+                    self._log(f"预算硬熔断：剩余Token({remaining})低于阈值"
+                              f"({settings.MIN_TOKEN_THRESHOLD})，裁判使用回退裁决",
+                              level="warning", event="budget.hard_break")
+                    judgment = Judgment(winner="DRAW", critique="预算耗尽，未执行完整 LLM 裁决",
+                                        convergence_flag=False)
+                self.judgment = judgment
+                await self.event_bus.publish({
+                    "type": "judgment",
+                    "scores": judgment.scores,
+                    "winner": judgment.winner,
+                    "critique": judgment.critique,
+                    "convergence_flag": judgment.convergence_flag,
+                    "round": self.round,
+                })
+                await self.event_bus.publish(self._status_sync())
 
-            # ---- Finished：主持人汇总最终报告（同样受预算硬熔断约束） ----
-            self.phase = "finished"
-            remaining = self.budget - self.spent
-            if remaining >= settings.MIN_TOKEN_THRESHOLD:
-                summary = await self._final_summary(judgment)
-            else:
-                self._log(f"预算硬熔断：剩余Token({remaining})低于阈值，主持人汇总使用确定性回退",
-                          level="warning", event="budget.hard_break")
-                summary = self._fallback_summary(judgment)
-            await self._emit_summary(summary)
-            self.status = "done"
-            await self.event_bus.publish({"type": "status", "status": "done", "phase": self.phase})
-            await self.event_bus.publish(self._status_sync())
+                # ---- Finished：主持人汇总最终报告（同样受预算硬熔断约束） ----
+                self.phase = "finished"
+                remaining = self.budget - self.spent
+                if remaining >= settings.MIN_TOKEN_THRESHOLD:
+                    summary = await self._final_summary(judgment)
+                else:
+                    self._log(f"预算硬熔断：剩余Token({remaining})低于阈值，主持人汇总使用确定性回退",
+                              level="warning", event="budget.hard_break")
+                    summary = self._fallback_summary(judgment)
+                await self._emit_summary(summary)
+                self.status = "done"
+                await self.event_bus.publish({"type": "status", "status": "done", "phase": self.phase})
+                await self.event_bus.publish(self._status_sync())
         except Exception as e:  # noqa
             self._log(f"[编排器错误] {e}", level="error", event="orchestrator.error")
             self.status = "stopped"
@@ -849,6 +860,20 @@ class Orchestrator:
                             self.run_stats.get("compressions", 0) + 1
             except Exception:  # noqa
                 pass
+
+    # ---------------- 控制状态事件（暂停/继续/结束 后推送给前端） ----------------
+    def _status_event(self) -> dict:
+        ev = self._status_sync()
+        ev.update({
+            "type": "status",
+            "status": self.status,
+            "topic": self.topic,
+            "round": self.round,
+            "max_rounds": self.max_rounds,
+            "agents": [{"name": a.name, "role": a.role, "is_main": a.is_main,
+                        "stance": a.stance} for a in self.agents],
+        })
+        return ev
 
     # ---------------- 状态同步（架构文档 §3.5） ----------------
     def _status_sync(self) -> dict:
