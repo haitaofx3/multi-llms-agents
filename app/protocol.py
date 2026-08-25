@@ -68,7 +68,8 @@ class Rebuttal(BaseModel):
 
 class Judgment(BaseModel):
     """§3.4 裁决消息。"""
-    scores: Dict[str, float] = {}    # {logic, evidence, rebuttal, clarity}
+    scores: Dict[str, float] = {}    # 全局维度 {logic, evidence, rebuttal, clarity}
+    agent_scores: Dict[str, Dict[str, float]] = {}  # 各辩手评分 {辩手名: {logic, evidence, rebuttal, clarity}}
     winner: str = "DRAW"             # PRO / CON / DRAW
     critique: str = ""
     convergence_flag: bool = False

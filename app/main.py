@@ -118,8 +118,10 @@ async def configure(payload: dict):
     topic = payload.get("topic", "")
     max_rounds = int(payload.get("max_rounds", 8))
     budget = payload.get("budget")
+    judge_config = payload.get("judge") or {}
     try:
-        orchestrator.configure(agents, topic=topic, max_rounds=max_rounds)
+        orchestrator.configure(agents, topic=topic, max_rounds=max_rounds,
+                               judge_config=judge_config)
         if budget:
             orchestrator.budget = max(0, int(budget))
     except ValueError as e:
@@ -129,6 +131,7 @@ async def configure(payload: dict):
         "agents": [{"name": a.name, "role": a.role, "is_main": a.is_main,
                     "stance": a.stance,
                     "model_id": a.model_config["model_id"]} for a in orchestrator.agents],
+        "judge": {"name": orchestrator.judge.name} if orchestrator.judge else None,
         "status": orchestrator.status,
         "phase": orchestrator.phase,
         "trace_id": orchestrator.trace_id,
@@ -236,6 +239,9 @@ async def status():
         "topic": orchestrator.topic,
         "agents": [{"name": a.name, "role": a.role, "is_main": a.is_main,
                     "stance": a.stance} for a in orchestrator.agents],
+        "judge": {"name": orchestrator.judge.name,
+                  "model_id": orchestrator.judge.model_config["model_id"]}
+        if orchestrator.judge else None,
         "tasks": orchestrator.tasks,
         "shared_context": orchestrator.shared_context,
         "budget": orchestrator.budget,

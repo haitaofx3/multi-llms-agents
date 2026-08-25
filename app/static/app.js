@@ -56,6 +56,7 @@ function bindEvents() {
   });
   $("btn-gen-agents").addEventListener("click", () =>
     generateAgentCards(parseInt($("agent-count").value, 10)));
+  $("judge-provider").addEventListener("change", onJudgeProviderChange);
   $("btn-ingest").addEventListener("click", ingest);
   $("btn-upload").addEventListener("click", uploadFile);
   $("btn-start").addEventListener("click", startDiscussion);
@@ -141,6 +142,7 @@ function generateAgentCards(n) {
           <option value="default">默认（.env）</option>
           <option value="qwen">Qwen</option>
           <option value="deepseek">DeepSeek</option>
+          <option value="mimo">MiMo</option>
           <option value="custom">自定义</option>
         </select>
       </div>
@@ -176,6 +178,30 @@ function onProviderChange(card, cfg) {
     card.querySelector('[data-k="api_key"]').value = cfg.api_key;
     card.querySelector('[data-k="model_id"]').value = cfg.model_id;
   }
+}
+
+// ---------------- 独立裁判模型切换（展示/隐藏自定义字段） ----------------
+function onJudgeProviderChange() {
+  const p = $("judge-provider").value;
+  $("judge-custom").classList.toggle("hidden", p !== "custom");
+  if (p !== "custom") {
+    const presets = state.defaults?.providers || {};
+    const conf = presets[p] || presets["default"] || {};
+    $("judge-base-url").value = conf.base_url || "";
+    $("judge-api-key").value = conf.api_key || "";
+    $("judge-model-id").value = conf.model_id || "";
+  }
+}
+
+function collectJudgeConfig() {
+  const provider = $("judge-provider").value;
+  return {
+    name: $("judge-name").value.trim() || "独立裁判",
+    provider,
+    base_url: $("judge-base-url").value,
+    api_key: $("judge-api-key").value,
+    model_id: $("judge-model-id").value,
+  };
 }
 
 // ---------------- 注入知识 ----------------
@@ -230,6 +256,15 @@ async function startDiscussion() {
     $("setup-error").textContent = "自定义模型配置不完整：" + parts.join("；");
     return;
   }
+  // 校验独立裁判：自定义 provider 时必须填齐三要素
+  const judge = collectJudgeConfig();
+  if (judge.provider === "custom") {
+    const miss = ["base_url", "api_key", "model_id"].filter(k => !(judge[k] || "").trim());
+    if (miss.length) {
+      $("setup-error").textContent = "裁判自定义模型配置不完整（缺少 " + miss.join(" / ") + "）";
+      return;
+    }
+  }
   const payload = {
     agents: state.agentConfigs.map((c, i) => ({
       agent_id: `agent_${i + 1}`,
@@ -242,6 +277,7 @@ async function startDiscussion() {
       model_id: c.model_id,
       stance: c.stance,
     })),
+    judge,
     topic: $("topic").value.trim(),
     max_rounds: parseInt($("max-rounds").value, 10) || 8,
   };
@@ -444,9 +480,14 @@ function handleEvent(ev) {
     case "judgment": {
       const scoreTxt = Object.entries(ev.scores || {})
         .map(([k, v]) => `${k}: ${v}`).join("，") || "（无评分）";
+      const agentScoreTxt = (ev.agent_scores && Object.keys(ev.agent_scores).length)
+        ? "\n- 辩手评分：\n  - " + Object.entries(ev.agent_scores)
+            .map(([k, v]) => `${k}：${Object.entries(v).map(([d, s]) => `${d} ${s}`).join(" / ")}`)
+            .join("\n  - ")
+        : "";
       const winnerTxt = ev.winner === "DRAW" ? "平局（DRAW）" : `胜方：${STANCE_TEXT[ev.winner] || ev.winner}`;
-      const text = `【裁判裁决】\n- ${winnerTxt}\n- 得分：${scoreTxt}\n- 收敛终止：${ev.convergence_flag ? "是" : "否"}\n- 评语：${ev.critique || ""}`;
-      addMsg("裁判", text, "judge", ev.round, "裁决");
+      const text = `【裁判裁决】\n- ${winnerTxt}\n- 综合得分：${scoreTxt}${agentScoreTxt}\n- 收敛终止：${ev.convergence_flag ? "是" : "否"}\n- 评语：${ev.critique || ""}`;
+      addMsg(ev.judge || "裁判", text, "judge", ev.round, "裁决");
       break;
     }
     case "log":

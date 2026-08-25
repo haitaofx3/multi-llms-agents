@@ -91,6 +91,7 @@ class Orchestrator:
     def __init__(self):
         self.agents = []
         self.main = None
+        self.judge = None
         self.collaborators = []
         self.shared_context = {}      # var_name -> {"by","value","task_id"}
         self.tasks = []
@@ -122,11 +123,13 @@ class Orchestrator:
         self.run_stats = {"compressions": 0}  # 运行摘要统计（优化 A4）
 
     # ---------------- 配置 ----------------
-    def configure(self, agent_configs: list, topic: str = "", max_rounds: int = 8):
+    def configure(self, agent_configs: list, topic: str = "", max_rounds: int = 8,
+                  judge_config: dict = None):
         if self.status == "running":
             raise ValueError("讨论进行中，请先结束或等待后再重新配置")
         self.agents = []
         self.main = None
+        self.judge = None
         self.collaborators = []
         self.shared_context = {}
         self.tasks = []
@@ -174,9 +177,43 @@ class Orchestrator:
                 self.main = agent
             else:
                 self.collaborators.append(agent)
+        # 独立裁判 Agent（不占席位、不参与辩论，仅裁决阶段调用）
+        self.judge = self._build_judge(judge_config or {})
         self.status = "idle"
-        self._log(f"配置完成，席位 {len(self.agents)} 个",
+        self._log(f"配置完成，席位 {len(self.agents)} 个"
+                  + (f"，独立裁判：{self.judge.name}" if self.judge else "，裁判回退使用主 Agent 模型"),
                   event="configure", level="info")
+
+    # ---------------- 独立裁判（Judge Agent） ----------------
+    def _build_judge(self, judge_config: dict):
+        """根据 judge_config / .env 的 JUDGE_* 构建独立裁判 Agent。
+
+        - judge_config 非空（前端已选择裁判模型）或 .env 配置了 JUDGE_* 时创建独立裁判；
+        - 完全未配置时返回 None，_judge_round 回退使用主 Agent 的模型配置（保持向后兼容）。
+        裁判不进入 self.agents / self.collaborators，因此不占席位、不参与辩论、不接收任务。
+        """
+        from app.llm import resolve_model_config
+        judge_cfg = {k: v for k, v in (judge_config or {}).items() if v}
+        provider = judge_cfg.get("provider") or settings.JUDGE_PROVIDER
+        base_url = judge_cfg.get("base_url") or settings.JUDGE_BASE_URL
+        api_key = judge_cfg.get("api_key") or settings.JUDGE_API_KEY
+        model_id = judge_cfg.get("model_id") or settings.JUDGE_MODEL_ID
+        has_env = any([settings.JUDGE_PROVIDER, settings.JUDGE_BASE_URL,
+                       settings.JUDGE_API_KEY, settings.JUDGE_MODEL_ID])
+        if not (judge_cfg or has_env):
+            return None
+        model_config = resolve_model_config(
+            provider or "default", base_url or "", api_key or "", model_id or "")
+        name = judge_cfg.get("name") or settings.JUDGE_NAME
+        return Agent(
+            agent_id="judge",
+            name=name,
+            role="独立辩论裁判",
+            personality="客观、中立、严谨，不参与辩论",
+            model_config=model_config,
+            is_main=False,
+            stance="NEUTRAL",
+        )
 
     def get_agent(self, name):
         for a in self.agents:
@@ -706,7 +743,9 @@ class Orchestrator:
                 self.judgment = judgment
                 await self.event_bus.publish({
                     "type": "judgment",
+                    "judge": self.judge.name if self.judge else self.main.name,
                     "scores": judgment.scores,
+                    "agent_scores": judgment.agent_scores,
                     "winner": judgment.winner,
                     "critique": judgment.critique,
                     "convergence_flag": judgment.convergence_flag,
@@ -741,6 +780,18 @@ class Orchestrator:
                 lines.append(f"[第{e['round']}轮] {e['speaker']}：{e['text']}")
         return "\n\n".join(lines) if lines else "（无有效发言记录）"
 
+    def _build_judge_debate_text(self) -> str:
+        """构建供独立裁判阅读的辩论记录：仅含辩手（协作 Agent）发言。
+
+        主持人的发言（含任务分派 / 追问等）一律剔除，裁判只依据辩手立论、
+        辩护与交锋内容进行辩论质量评分，不受主持人任务管理内容影响。
+        """
+        lines = []
+        for e in self.transcript:
+            if e["type"] == "speech" and not e.get("is_main"):
+                lines.append(f"[第{e['round']}轮] {e['speaker']}：{e['text']}")
+        return "\n\n".join(lines) if lines else "（无辩手发言记录）"
+
     @staticmethod
     def _extract_json(text: str) -> dict:
         """从 LLM 输出中提取 JSON 对象（容忍代码块与前后缀）。"""
@@ -756,26 +807,40 @@ class Orchestrator:
         return json.loads(t[start:end + 1])
 
     async def _judge_round(self) -> Judgment:
-        history = self._build_debate_history_text()
+        if not self.collaborators:
+            # 无辩手可评（仅主持人）：直接回退确定性裁决
+            return Judgment(winner="DRAW", critique="无可评分的辩手（仅有主持人）",
+                            convergence_flag=False)
+        history = self._build_judge_debate_text()
         stance_lines = "\n".join(
             f"- {a.name}（{a.role}）立场：{STANCE_LABEL.get(a.stance, a.stance)}"
-            for a in self.agents)
-        judge_sys = ("你是辩论裁判。你保持绝对中立，不参与辩论，仅基于辩论记录进行多维度评分。"
+            for a in self.collaborators)
+        names = [a.name for a in self.collaborators]
+        agent_scores_example = "{" + ", ".join(
+            f'"{n}": {{"logic": 8, "evidence": 7, "rebuttal": 9, "clarity": 8}}'
+            for n in names) + "}"
+        judge_sys = ("你是独立辩论裁判，不参与辩论，也不接收主持人的任务分派信息。"
+                     "你保持绝对中立，仅基于各位辩手的辩论发言进行多维度评分。"
                      "评分维度（1-10）：逻辑自洽性(logic)、证据效力(evidence)、"
-                     "反驳有效性(rebuttal)、表达清晰度(clarity)。")
+                     "反驳有效性(rebuttal)、表达清晰度(clarity)。"
+                     "请对【每位辩手】分别打分，再给出全场胜方。")
         prompt = (f"辩论主题：{self.topic}\n\n辩手与立场：\n{stance_lines}\n\n"
-                  f"完整辩论记录：\n{history}\n\n"
+                  f"辩论记录（仅辩手发言，不含主持人的任务分派）：\n{history}\n\n"
                   "请输出 JSON（不要输出其他文字或代码块）：\n"
                   '{"scores": {"logic": 8, "evidence": 7, "rebuttal": 9, "clarity": 8}, '
+                  f'"agent_scores": {agent_scores_example}, '
                   '"winner": "PRO" | "CON" | "DRAW", "critique": "详细评语", '
                   '"convergence_flag": false}\n'
+                  "agent_scores 的键必须与上方辩手名称完全一致，每位辩手都需给出 4 个维度分数；"
                   "winner 取全场综合表现更优的一方；若势均力敌取 DRAW。"
                   "convergence_flag 表示辩论是否因观点收敛而提前终止。")
+        judge_name = self.judge.name if self.judge else self.main.name
+        judge_model = self.judge.model_config if self.judge else self.main.model_config
         try:
             result = await self._run_llm_retry(
                 [{"role": "system", "content": judge_sys},
                  {"role": "user", "content": prompt}],
-                self.main.model_config, tools=None, temperature=0.3)
+                judge_model, tools=None, temperature=0.3)
             self._apply_usage(result)
             data = self._extract_json(result["content"])
             judgment = Judgment(**data)
@@ -783,7 +848,8 @@ class Orchestrator:
             self._log(f"[裁判调用失败] {e}", level="error", event="judge.fail")
             judgment = Judgment(winner="DRAW", critique=f"裁判调用失败：{e}",
                                 convergence_flag=False)
-        self._log(f"[裁判] winner={judgment.winner} scores={judgment.scores}",
+        self._log(f"[裁判:{judge_name}] winner={judgment.winner} "
+                  f"agent_scores={json.dumps(judgment.agent_scores, ensure_ascii=False)}",
                   level="info", event="judge.result")
         return judgment
 
@@ -916,7 +982,8 @@ class Orchestrator:
         if judgment:
             judge_section = (
                 "\n\n【裁判裁决】\n"
-                f"- 得分：{json.dumps(judgment.scores, ensure_ascii=False)}\n"
+                f"- 综合得分：{json.dumps(judgment.scores, ensure_ascii=False)}\n"
+                f"- 辩手评分：{json.dumps(judgment.agent_scores, ensure_ascii=False)}\n"
                 f"- 胜方：{judgment.winner}\n"
                 f"- 评语：{judgment.critique}")
         directive = ("所有 Agent 的任务已结束或已达最大轮次。请作为主持人，"
@@ -943,6 +1010,8 @@ class Orchestrator:
             lines.append("### 裁判裁决\n")
             lines.append(f"- 胜方：{judgment.winner}")
             lines.append(f"- 得分：{json.dumps(judgment.scores, ensure_ascii=False)}")
+            if judgment.agent_scores:
+                lines.append(f"- 辩手评分：{json.dumps(judgment.agent_scores, ensure_ascii=False)}")
             if judgment.critique:
                 lines.append(f"- 评语：{judgment.critique}")
             lines.append("")
@@ -966,6 +1035,10 @@ class Orchestrator:
             lines.append(f"  - {a.name}{tag} | 角色：{a.role} | 立场："
                          f"{STANCE_LABEL.get(a.stance, a.stance)} | "
                          f"模型：{a.model_config['model_id']} @ {a.model_config['base_url']}")
+        if self.judge:
+            lines.append(f"- 独立裁判：{self.judge.name} | "
+                         f"模型：{self.judge.model_config['model_id']} @ "
+                         f"{self.judge.model_config['base_url']}")
         lines.append("")
         lines.append("## 运行摘要\n")
         elapsed = (time.time() - self.run_stats.get("started_at", time.time())) \
@@ -991,6 +1064,10 @@ class Orchestrator:
             lines.append("## 裁判裁决\n")
             j = self.judgment
             lines.append(f"- 得分：{json.dumps(j.scores, ensure_ascii=False)}")
+            if j.agent_scores:
+                lines.append("- 辩手评分：")
+                for name, sc in j.agent_scores.items():
+                    lines.append(f"  - {name}：{json.dumps(sc, ensure_ascii=False)}")
             lines.append(f"- 胜方：{j.winner}")
             lines.append(f"- 收敛终止：{'是' if j.convergence_flag else '否'}")
             lines.append(f"- 评语：{j.critique}")

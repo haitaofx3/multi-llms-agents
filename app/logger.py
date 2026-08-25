@@ -16,8 +16,20 @@ logger.py — 结构化日志治理（优化 A4）
 """
 import json
 import logging
+import sys
 import threading
 import time
+
+# 强制 stdout/stderr 使用 UTF-8。
+# 中文 Windows 上 Python 重定向后的 stdout 默认按 ANSI（GBK/cp936）编码，
+# 导致 JSON 结构化日志中的中文在 UTF-8 终端（如 Git Bash）里显示为乱码（□□□□）。
+# 这里在应用启动早期统一修复，不影响实际内容，仅改变编码方式。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        if hasattr(_stream, "reconfigure"):
+            _stream.reconfigure(encoding="utf-8")
+    except Exception:  # noqa 某些环境（如已关闭的流）可能不支持
+        pass
 
 # 线程级上下文：trace_id 随运行线程传递（FastAPI 单线程处理请求/事件循环场景足够）
 _ctx = threading.local()

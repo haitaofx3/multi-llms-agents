@@ -1,9 +1,10 @@
 """
 llm.py — 大语言模型统一接入层
 
-支持任意 OpenAI 兼容协议的服务（DeepSeek / Qwen / 自定义）。
+支持任意 OpenAI 兼容协议的服务（DeepSeek / Qwen / MiMo / 自定义）。
 - Qwen:   来自 .env 默认 (dashscope compatible-mode)
 - DeepSeek: https://api.deepseek.com
+- MiMo:    https://api.xiaomimimo.com/v1 (mimo-v2.5)
 - 自定义:   用户在前端填写 base_url / api_key / model_id
 
 提供原生 function-calling（tools）。返回结构包含 content 与 tool_calls。
@@ -17,16 +18,21 @@ from openai import OpenAI
 # 模型供应商预设
 PROVIDER_PRESETS = {
     "qwen": {
-        "base_url": settings.LLM_BASE_URL,
-        "api_key": settings.LLM_API_KEY,
-        "model_id": settings.LLM_MODEL_ID,
+        "base_url": settings.QWEN_BASE_URL,
+        "api_key": settings.QWEN_API_KEY,
+        "model_id": settings.QWEN_MODEL_ID,
     },
     "deepseek": {
         "base_url": settings.DEEPSEEK_BASE_URL,
-        # 注意：不能用 `or settings.LLM_API_KEY` 兜底——LLM_API_KEY 是 DashScope 的 key，
+        # 注意：不能用 `or settings.LLM_API_KEY` 兜底——LLM_API_KEY 是默认模型（MiMo）的 key，
         # 拿它请求 api.deepseek.com 必然 401，且错误信息极具误导性。
         "api_key": settings.DEEPSEEK_API_KEY,
         "model_id": settings.DEEPSEEK_MODEL_ID,
+    },
+    "mimo": {
+        "base_url": settings.MIMO_BASE_URL,
+        "api_key": settings.MIMO_API_KEY,
+        "model_id": settings.MIMO_MODEL_ID,
     },
     "default": {
         "base_url": settings.LLM_BASE_URL,
@@ -74,9 +80,21 @@ def resolve_model_config(provider: str = "default", base_url: str = "", api_key:
     return cfg
 
 
+def _normalize_base_url(base_url: str) -> str:
+    """OpenAI SDK 会自动在 base_url 后拼接 /chat/completions。
+
+    若用户填的是完整端点（如 https://api.xiaomimimo.com/v1/chat/completions），
+    直接使用会拼出双重路径。这里剥离尾部 /chat/completions 做兜底。
+    """
+    url = (base_url or "").strip().rstrip("/")
+    if url.endswith("/chat/completions"):
+        return url[: -len("/chat/completions")]
+    return url
+
+
 def _client(model_config: dict) -> OpenAI:
     return OpenAI(
-        base_url=model_config["base_url"],
+        base_url=_normalize_base_url(model_config["base_url"]),
         api_key=model_config["api_key"] or "EMPTY",
         timeout=settings.LLM_TIMEOUT,
     )

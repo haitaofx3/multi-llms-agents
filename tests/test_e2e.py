@@ -67,7 +67,8 @@ def ws_listener():
                     print(f"  [SYNC] phase={ev.get('phase')} round={ev.get('current_round')} "
                           f"remaining={ev.get('remaining_budget')} spent={ev.get('spent_budget')}")
                 elif t == "judgment":
-                    print(f"  [JUDGE] winner={ev.get('winner')} scores={ev.get('scores')} "
+                    print(f"  [JUDGE] judge={ev.get('judge')} winner={ev.get('winner')} "
+                          f"scores={ev.get('scores')} agent_scores={ev.get('agent_scores')} "
                           f"converged={ev.get('convergence_flag')}")
                 elif t == "summary":
                     print(f"  [SUMMARY] {ev.get('text')[:200]}")
@@ -83,23 +84,26 @@ def main():
     st, d = rest("GET", "/api/defaults")
     print("defaults:", st, "providers=", list(d.get("providers", {}).keys()))
 
-    # 2. configure: 1 main + 2 collaborators, max_rounds=3（立场：主持人/正方/反方）
+    # 2. configure: 1 main + 2 collaborators, max_rounds=2（立场：主持人/正方/反方）
+    #    2 轮即可跑完整状态机（preparing→debating→judging→finished）
     cfg = {
         "topic": "城市是否应该全面推广自动驾驶出租车？",
-        "max_rounds": 3,
+        "max_rounds": 2,
+        "judge": {"name": "独立裁判", "provider": "qwen"},
         "agents": [
             {"name": "主持人", "role": "辩论主持人", "personality": "理性、善于追问与归纳",
-             "provider": "default", "stance": "HOST"},
+             "provider": "qwen", "stance": "HOST"},
             {"name": "技术派", "role": "自动驾驶技术专家", "personality": "务实、看重安全与工程可行性",
-             "provider": "default", "stance": "PRO"},
+             "provider": "qwen", "stance": "PRO"},
             {"name": "人文派", "role": "城市社会学家", "personality": "关注就业、公平与公共治理",
-             "provider": "default", "stance": "CON"},
+             "provider": "qwen", "stance": "CON"},
         ],
     }
     st, r = rest("POST", "/api/configure", cfg)
     print("configure:", st, r.get("ok"), "agents=", [a["name"] for a in r.get("agents", [])])
     print("configure stances:", [a["stance"] for a in r.get("agents", [])],
           "budget=", r.get("budget"), "trace_id=", r.get("trace_id"))
+    print("configure judge:", r.get("judge"))
 
     # 3. ingest knowledge
     st, r = rest("POST", "/api/ingest", {"text": "研究表明：自动驾驶在封闭园区事故率低于人类驾驶员约 40%\n"
@@ -111,12 +115,12 @@ def main():
     t.start()
     time.sleep(1.0)
 
-    # 5. start discussion（携带预算）
-    st, r = rest("POST", "/api/start", {"budget": 100000})
+    # 5. start discussion（携带预算；足够覆盖辩论+裁判，避免裁判阶段触发预算熔断回退）
+    st, r = rest("POST", "/api/start", {"budget": 1000000})
     print("start:", st, r)
 
-    # 6. wait for done (up to 5 min)
-    ok = ws_done.wait(timeout=300)
+    # 6. wait for done (up to 30 min；MiMo 单轮辩论需数分钟)
+    ok = ws_done.wait(timeout=1800)
     print("ws_done:", ok, "events:", len(events))
 
     # 7. status + export
@@ -151,6 +155,7 @@ def main():
     if s.get("judgment"):
         assert "winner" in s["judgment"], "judgment 缺少 winner 字段"
         assert "scores" in s["judgment"], "judgment 缺少 scores 字段"
+        assert "agent_scores" in s["judgment"], "judgment 缺少 agent_scores 字段（独立裁判按辩手评分）"
     print("ARCHITECTURE CHECKS PASS (state machine / budget / judge)")
     # ---- 流式输出校验 ----
     n_start = sum(1 for e in events if e.get("type") == "speech_start")

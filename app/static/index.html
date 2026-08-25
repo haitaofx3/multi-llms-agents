@@ -67,6 +67,30 @@
         </div>
       </div>
 
+      <div class="config-sub">
+        <div class="config-sub-title">独立裁判设置（可选）</div>
+        <div class="row">
+          <label>裁判名称</label>
+          <input id="judge-name" value="独立裁判" />
+        </div>
+        <div class="row">
+          <label>裁判模型</label>
+          <select id="judge-provider">
+            <option value="default">默认（.env）</option>
+            <option value="qwen">Qwen</option>
+            <option value="deepseek">DeepSeek</option>
+            <option value="mimo">MiMo</option>
+            <option value="custom">自定义</option>
+          </select>
+        </div>
+        <div id="judge-custom" class="custom-fields hidden">
+          <div class="field"><label>Base URL</label><input id="judge-base-url" placeholder="https://..."></div>
+          <div class="field"><label>API Key</label><input id="judge-api-key" type="password" placeholder="sk-..."></div>
+          <div class="field"><label>Model ID</label><input id="judge-model-id" placeholder="model-name"></div>
+        </div>
+        <span class="hint">裁判为独立 Agent，仅对各辩手的辩论表现按辩手逐一评分，不参与辩论、不看主持人任务分派内容。</span>
+      </div>
+
       <div class="actions">
         <button id="btn-start" class="primary">进入圆桌并开始讨论</button>
       </div>

@@ -58,16 +58,35 @@ def _float(name: str, default: float) -> float:
 
 
 class Settings:
-    # ---- LLM 默认配置 (来自 .env，所有 agent 的兜底模型) ----
-    LLM_MODEL_ID = _get("LLM_MODEL_ID", "qwen3.7-plus")
+    # ---- LLM 默认配置 (来自 .env，所有 agent 的兜底模型；当前默认 MiMo) ----
+    LLM_MODEL_ID = _get("LLM_MODEL_ID", "mimo-v2.5")
     LLM_API_KEY = _get("LLM_API_KEY", "")
-    LLM_BASE_URL = _get("LLM_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
-    LLM_TIMEOUT = _int("LLM_TIMEOUT", 60)
+    LLM_BASE_URL = _get("LLM_BASE_URL", "https://api.xiaomimimo.com/v1")
+    LLM_TIMEOUT = _int("LLM_TIMEOUT", 300)  # 默认模型 MiMo 生成较慢，放宽到 300s
+
+    # ---- Qwen / DashScope (可选，用户可单独配置) ----
+    QWEN_API_KEY = _get("QWEN_API_KEY", "")
+    QWEN_BASE_URL = _get("QWEN_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
+    QWEN_MODEL_ID = _get("QWEN_MODEL_ID", "qwen3.7-plus")
 
     # ---- DeepSeek (可选，用户可单独配置) ----
     DEEPSEEK_API_KEY = _get("DEEPSEEK_API_KEY", "")
     DEEPSEEK_BASE_URL = _get("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
     DEEPSEEK_MODEL_ID = _get("DEEPSEEK_MODEL_ID", "deepseek-chat")
+
+    # ---- MiMo (可选，用户可单独配置) ----
+    # 注意：BASE_URL 只写到 /v1，OpenAI SDK 会自动拼接 /chat/completions
+    MIMO_API_KEY = _get("MIMO_API_KEY", "")
+    MIMO_BASE_URL = _get("MIMO_BASE_URL", "https://api.xiaomimimo.com/v1")
+    MIMO_MODEL_ID = _get("MIMO_MODEL_ID", "mimo-v2.5")
+
+    # ---- 独立裁判（Judge Agent，可选） ----
+    # 裁判只对各位辩手的辩论表现评分，不参与辩论；未配置时回退使用主 Agent 模型
+    JUDGE_NAME = _get("JUDGE_NAME", "独立裁判")
+    JUDGE_PROVIDER = _get("JUDGE_PROVIDER", "")   # 空则取 default 预设
+    JUDGE_BASE_URL = _get("JUDGE_BASE_URL", "")
+    JUDGE_API_KEY = _get("JUDGE_API_KEY", "")
+    JUDGE_MODEL_ID = _get("JUDGE_MODEL_ID", "")
 
     # ---- 搜索工具 ----
     TAVILY_API_KEY = _get("TAVILY_API_KEY", "")
@@ -104,8 +123,8 @@ class Settings:
     LLM_RETRY_ATTEMPTS = _int("LLM_RETRY_ATTEMPTS", 3)
     LLM_RETRY_DELAYS = (1.0, 3.0)
 
-    # ---- 单步流式超时（秒） ----
-    STREAM_TIMEOUT = _int("STREAM_TIMEOUT", 90)
+    # ---- 单步流式超时（秒；默认模型 MiMo 单次完整流式发言可能达 2-5 分钟） ----
+    STREAM_TIMEOUT = _int("STREAM_TIMEOUT", 300)
 
     # ---- 上下文压缩与长对话管理（优化 A9） ----
     CONTEXT_MAX_CHARS = _int("CONTEXT_MAX_CHARS", 8000)               # 单 Agent 上下文字符硬上限
