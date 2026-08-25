@@ -78,19 +78,22 @@
 
 ### 2.4 Judge Agent（裁判Agent）
 
-- **职责**：评估单轮表现及全场胜负，提供多维度评分与改进建议。
+- **职责**：评估单轮表现及全场胜负，提供多维度评分与改进建议。**按每位辩手分别评分**（`agent_scores`，四维：logic / evidence / rebuttal / clarity），并结合**系统实测的模型质量分**（流式发言 TTFT 与生成速率，非 LLM、确定性计算）合成**综合评分**推导胜方。
+- **评分范围**：只接收**辩手发言**（`_build_judge_debate_text` 剔除主持人开场 / 任务分派 / 追问 / 总结，仅保留 `is_main=False` 的 speech）；模型质量分也只对两位辩手（`collaborators`）的流式发言统计。
+- **综合评分公式**：`composite = 内容均分(agent_scores 四维均值) × JUDGE_CONTENT_WEIGHT + 模型质量分 × JUDGE_PERFORMANCE_WEIGHT`（默认 0.8 / 0.2，经 `.env` 可调）；`agent_scores` 缺失（如预算熔断回退）时退化为模型质量分。胜方取综合分最高辩手所在方（PRO/CON），两端并列最高取 DRAW。
 - **能力边界**：不参与辩论，仅做评估；需保持绝对中立。
-- **输入**：完整辩论历史、ArgumentSubmit、Rebuttal。
+- **输入**：完整辩论历史（仅辩手发言）、ArgumentSubmit、Rebuttal。
 - **输出**：Judgment。
 - **System Prompt 示例**：
 
 ```
-你是辩论裁判。请基于以下维度评分（1-10）：
+你是独立辩论裁判，不参与辩论，也不接收主持人的任务分派信息。
+请对【每位辩手】分别按以下维度评分（1-10）：
 1. 逻辑自洽性：是否存在自相矛盾。
 2. 证据效力：RAG引用是否准确、相关。
 3. 反驳有效性：是否击中对方要害。
 4. 表达清晰度：结构是否清晰。
-输出JSON格式，包含scores, winner, critique字段。
+输出JSON格式，包含scores, agent_scores（键=辩手名）, winner, critique, convergence_flag字段。
 ```
 
 ### 2.5 RAG Agent（知识检索Agent）
@@ -151,10 +154,15 @@
 
 | 字段 | 类型 | 必填 | 说明 |
 |------|------|------|------|
-| scores | object | ✅ | {logic: 8, evidence: 7, rebuttal: 9, clarity: 8} |
-| winner | enum | ✅ | PRO / CON / DRAW |
+| scores | object | ✅ | {logic: 8, evidence: 7, rebuttal: 9, clarity: 8}（全场总体分） |
+| agent_scores | object | ❌ | 按辩手分别评分：{辩手名: {logic, evidence, rebuttal, clarity}}，键与辩手名一致 |
+| model_performance | object | ❌ | 系统实测模型质量：{辩手名: {avg_ttft_ms, avg_gen_rate, performance_score}} |
+| composite_scores | object | ❌ | 综合评分：内容分 × 0.8 + 模型质量分 × 0.2，{辩手名: 分值} |
+| winner | enum | ✅ | PRO / CON / DRAW（由综合分最高辩手所在方推导） |
 | critique | string | ✅ | 详细评语 |
 | convergence_flag | bool | ✅ | 是否触发收敛终止 |
+
+> **综合评分权重**：`composite = mean(agent_scores 四维) × JUDGE_CONTENT_WEIGHT(默认0.8) + performance_score × JUDGE_PERFORMANCE_WEIGHT(默认0.2)`。`performance_score` 由流式实测 TTFT（≤1s→10 / ≤5s→8 / ≤15s→6 / ≤30s→4 / 否则2）与生成速率（≥80字/s→10 / ≥40→8 / ≥20→6 / ≥10→4 / 否则2）取均值，无实测数据时取中性 5.0。
 
 ### 3.5 状态同步消息 (StatusSync)
 

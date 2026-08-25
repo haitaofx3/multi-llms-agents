@@ -3,7 +3,7 @@
 一个支持多个 LLM Agent 围绕"圆桌"进行**辩论式多轮协作讨论**的 Web 项目。
 
 - **统一架构**：所有 Agent 共享同一套框架——相同的记忆系统（短期/长期/情境 + 遗忘机制）、共享同一个向量知识库。
-- **独立模型**：每个 Agent 可单独挂载不同的基础模型（DeepSeek / Qwen / 自定义，默认取 `.env`）。除基础模型外架构完全一致，便于观察 Agent 对话逻辑、对比不同基础模型的辩论能力。
+- **独立模型**：每个 Agent 可单独挂载不同的基础模型（DeepSeek / Qwen / MiMo / 自定义，默认取 `.env` 的 `LLM_*` 配置，当前为 MiMo）。除基础模型外架构完全一致，便于观察 Agent 对话逻辑、对比不同基础模型的辩论能力。
 - **主持人机制**：首个 Agent 担任辩论主持人，负责任务分派与多轮追问；其余 Agent 立论、辩护、交锋并回报结果；达到最大轮次后由主持人综合总结。
 - **流式输出**：所有发言以 token 增量实时推送到界面，覆盖普通发言与任务协作模式，显著降低首字等待时间。
 
@@ -27,6 +27,7 @@
 16. **历史讨论记忆检索**：每场讨论的题目 + 元信息自动记忆化保存至 `data/discussions/index.json`（按 filename 去重，保留最近 200 条）；前端提供历史面板，支持关键词搜索题目 / trace_id、查看完整 Markdown 与一键下载。
 17. **默认仅本地访问**：`start.py` 默认绑定 `127.0.0.1`，避免远端暴露 / 长期挂载；需要局域网访问时用 `HOST=0.0.0.0` 显式覆盖。
 18. **文件上传解析**：共享知识库支持直接上传文档（`txt/md/csv/log`、`docx`、`xlsx`、`pdf`、图片 OCR），后端解析文本后按段注入共享向量库，方便把本地资料作为全体 Agent 的知识背景。
+19. **裁判综合评分**：辩论结束后独立裁判对**每位辩手**分别按四维（逻辑 / 证据 / 反驳 / 清晰度）打分；系统同时实测各辩手流式发言的 **TTFT 与生成速率**产出模型质量分，最终按「内容分 × 80% + 模型质量分 × 20%」得到综合评分（权重经 `.env` 可调），并由综合分推导胜方。评分范围仅限两位辩手，主持人发言不参与评分。
 
 ## 目录结构
 
@@ -81,8 +82,12 @@ pip install -r requirements.txt
 
 | 配置 | 说明 |
 | --- | --- |
-| `LLM_MODEL_ID` / `LLM_API_KEY` / `LLM_BASE_URL` | 默认基础模型（OpenAI 兼容协议，如 DeepSeek / Qwen / 自建服务） |
-| `DEEPSEEK_API_KEY` 等 | DeepSeek 独立配置（可选） |
+| `LLM_MODEL_ID` / `LLM_API_KEY` / `LLM_BASE_URL` / `LLM_TIMEOUT` | 默认基础模型（OpenAI 兼容协议，当前默认 MiMo `mimo-v2.5`）；`LLM_TIMEOUT` 为请求超时秒数（默认 300） |
+| `QWEN_API_KEY` / `QWEN_BASE_URL` / `QWEN_MODEL_ID` | Qwen 独立配置（DashScope compatible-mode，默认 `qwen3.7-plus`） |
+| `DEEPSEEK_API_KEY` / `DEEPSEEK_BASE_URL` / `DEEPSEEK_MODEL_ID` | DeepSeek 独立配置（默认 `deepseek-chat`） |
+| `MIMO_API_KEY` / `MIMO_BASE_URL` / `MIMO_MODEL_ID` | MiMo 独立配置（默认 `mimo-v2.5`） |
+| `JUDGE_NAME` / `JUDGE_PROVIDER` / `JUDGE_BASE_URL` / `JUDGE_API_KEY` / `JUDGE_MODEL_ID` | 独立裁判（可选，未配置时回退用主 Agent 模型） |
+| `JUDGE_CONTENT_WEIGHT` / `JUDGE_PERFORMANCE_WEIGHT` | 综合评分权重（内容分 × 前者 + 模型质量分 × 后者，默认 0.8 / 0.2） |
 | `SERPAPI_API_KEY` / `TAVILY_API_KEY` | 联网搜索工具（可选） |
 | `QDRANT_URL` 等 | 向量数据库（可选，未配置时自动降级为内存库） |
 | `EMBED_MODEL_TYPE` / `EMBED_MODEL_NAME` | 嵌入模型（默认本地 sentence-transformers） |
@@ -114,7 +119,7 @@ python start.py
 
 ## 使用流程
 
-1. **设置 Agent**：选择 Agent 数量（2–6），逐个填写名称、角色、性格，并为每个 Agent 选择基础模型（默认 `qwen`，可选 deepseek / qwen / 自定义）。
+1. **设置 Agent**：选择 Agent 数量（2–6），逐个填写名称、角色、性格，并为每个 Agent 选择基础模型（默认取 `.env` 的 `LLM_*`（当前为 MiMo），可选 qwen / deepseek / mimo / 自定义）。
 2. **设置讨论**：填写讨论主题 / 任务，设置最大轮次；可选在"共享知识"中注入文本作为全体 Agent 的知识背景。
 3. **进入圆桌**：点击"进入圆桌并开始讨论"，观察圆桌席位上的 Agent 轮流流式发言（聊天气泡）、任务分派与回报。
 4. **随时控制**：可暂停 / 继续 / 结束讨论。
@@ -129,7 +134,7 @@ python start.py
 python -m unittest tests.test_ci_fast -v
 ```
 
-端到端集成测试会真实调用 LLM 发起一场讨论（3 Agent × 3 轮），并校验流式事件（`speech_start` / `speech_delta` / `speech_end` 配对、`log` 事件、`judgment` 等）与 Markdown 导出：
+端到端集成测试会真实调用 LLM 发起一场讨论（3 Agent × 2 轮，全部使用 qwen，含独立裁判），并校验流式事件（`speech_start` / `speech_delta` / `speech_end` 配对、`log` 事件、`judgment` 等，`judgment` 需包含 `agent_scores` / `model_performance` / `composite_scores`）与 Markdown 导出：
 
 ```bash
 # 终端 1：启动服务器
@@ -152,6 +157,7 @@ P0 / P1 优化项已实施落地：
 - **UI / UX 升级**：简约大气的低饱和深色设计、聊天气泡式发言（并发流式独立气泡）、首字母文字头像（按立场配色）。
 - **历史记忆化**：`app/history.py` 将每场讨论题目与元信息持久化到 `data/discussions/index.json`，提供 `/api/history` 检索与一键查看 / 下载。
 - **安全加固**：`start.py` 默认绑定 `127.0.0.1`，关闭远端暴露；历史读取带路径穿越防护。
+- **裁判综合评分**：`orchestrator._compute_composite` 按「内容分（agent_scores 四维均值）× `JUDGE_CONTENT_WEIGHT` + 模型质量分（TTFT / 生成速率实测，`_score_ttft` / `_score_rate` 分档）× `JUDGE_PERFORMANCE_WEIGHT`」合成综合分并据此推导胜方；裁判只看辩手发言（`_build_judge_debate_text` 剔除主持人），质量分只统计协作 Agent 的流式发言指标。
 
 ## 项目依赖
 

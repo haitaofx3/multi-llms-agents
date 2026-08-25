@@ -9,8 +9,8 @@
 
 一个支持多个 LLM Agent 围绕"圆桌"进行**辩论式多轮协作讨论**的 Web 应用。核心特征：
 
-- 每个 Agent 拥有**独立的基础模型**（DeepSeek / Qwen / 自定义）、**立场**（主持人 HOST / 正方 PRO / 反方 CON / 中立 NEUTRAL）、**记忆系统**（短期 / 长期 / 情境 + 遗忘）、**MCP 工具集**（知识检索 / 联网搜索 / 记忆回忆）。
-- 首个 Agent 为**辩论主持人（Supervisor 视角）**：分派任务、逐轮追问、最终汇总；辩论结束后由**裁判（Judge）**单次裁决。
+- 每个 Agent 拥有**独立的基础模型**（Qwen / DeepSeek / MiMo / 自定义，默认取 `.env` 的 `LLM_*`，当前为 MiMo）、**立场**（主持人 HOST / 正方 PRO / 反方 CON / 中立 NEUTRAL）、**记忆系统**（短期 / 长期 / 情境 + 遗忘）、**MCP 工具集**（知识检索 / 联网搜索 / 记忆回忆）。
+- 首个 Agent 为**辩论主持人（Supervisor 视角）**：分派任务、逐轮追问、最终汇总；辩论结束后由**裁判（Judge）**单次裁决，并按「内容分 × 0.8 + 模型质量分 × 0.2」输出**综合评分**（`composite_scores`）推导胜方。
 - 辩论流程：第 1 轮**并行立论**（`asyncio.gather`），后续轮次**串行反驳/辩护**；达到终止条件（最大轮次 / Token 预算熔断 / 语义收敛 / 手动结束）后进入裁决与汇总。
 - 提供**简约大气**的圆桌 UI（席位按数量等分）、**聊天气泡式发言**（并发流式按 speaker 独立气泡）、**首字母文字头像**（按立场配色）、暂停 / 继续 / 结束、Markdown 结果导出。
 - **历史记忆化检索**：每场讨论完成或保存时，题目 + 元信息自动写入 `data/discussions/index.json`，前端历史面板支持关键词搜索与一键查看 / 下载。
@@ -44,7 +44,8 @@ mini_test/
 │       ├── style.css     设计变量 / 圆桌席位 / 聊天气泡 / 首字母头像 / 历史面板
 │       └── app.js        前端逻辑（配置、席位等分、WebSocket 事件、并发流式气泡、历史检索）
 ├── tests/
-│   └── test_e2e.py       端到端集成测试（需先启动服务器；校验状态机/预算/裁判/流式）
+│   ├── test_e2e.py       端到端集成测试（需先启动服务器；校验状态机/预算/裁判/流式）
+│   └── test_ci_fast.py   快速单元测试（状态机/预算/裁决，无需服务器）
 ├── docs/
 │   └── CODE_LOGIC.md     本文档
 ├── data/                 运行时数据（自动生成，不提交到版本库）
@@ -87,8 +88,11 @@ HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 python start.py
 
 | 类别 | 字段 |
 | --- | --- |
-| LLM 默认 | `LLM_MODEL_ID`、`LLM_API_KEY`、`LLM_BASE_URL`、`LLM_TIMEOUT` |
-| DeepSeek | `DEEPSEEK_API_KEY` / `DEEPSEEK_BASE_URL` / `DEEPSEEK_MODEL_ID` |
+| LLM 默认 | `LLM_MODEL_ID`、`LLM_API_KEY`、`LLM_BASE_URL`、`LLM_TIMEOUT`（默认模型 MiMo 生成较慢，放宽到 300s） |
+| Qwen / DashScope | `QWEN_API_KEY` / `QWEN_BASE_URL`（compatible-mode）/ `QWEN_MODEL_ID`（默认 `qwen3.7-plus`） |
+| DeepSeek | `DEEPSEEK_API_KEY` / `DEEPSEEK_BASE_URL` / `DEEPSEEK_MODEL_ID`（默认 `deepseek-chat`） |
+| MiMo | `MIMO_API_KEY` / `MIMO_BASE_URL`（`/v1` 前缀，SDK 自动拼接 `/chat/completions`）/ `MIMO_MODEL_ID`（默认 `mimo-v2.5`） |
+| **独立裁判** | `JUDGE_NAME` / `JUDGE_PROVIDER` / `JUDGE_BASE_URL` / `JUDGE_API_KEY` / `JUDGE_MODEL_ID`；**综合评分权重** `JUDGE_CONTENT_WEIGHT`（默认 0.8）/ `JUDGE_PERFORMANCE_WEIGHT`（默认 0.2） |
 | 搜索 | `TAVILY_API_KEY`、`SERPAPI_API_KEY` |
 | Qdrant | `QDRANT_URL`、`QDRANT_API_KEY`、`QDRANT_COLLECTION`、`QDRANT_VECTOR_SIZE`、`QDRANT_TIMEOUT`（短超时快速失败）等 |
 | 嵌入 | `EMBED_MODEL_TYPE`、`EMBED_MODEL_NAME`、`EMBED_API_KEY` |
@@ -96,7 +100,7 @@ HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 python start.py
 | **Token 预算** | `TOKEN_BUDGET`（默认 100000）、`MIN_TOKEN_THRESHOLD`（默认 1000） |
 | **收敛检测** | `CONVERGENCE_SIMILARITY`（默认 0.85）、`CONVERGENCE_ROUNDS`（默认 2） |
 | **LLM 重试** | `LLM_RETRY_ATTEMPTS`（默认 3）、`LLM_RETRY_DELAYS`（(1.0, 3.0)） |
-| **流式超时** | `STREAM_TIMEOUT`（默认 90s） |
+| **流式超时** | `STREAM_TIMEOUT`（默认 300s，对齐 `LLM_TIMEOUT`） |
 
 > `PROJECT_ROOT = Path(__file__).resolve().parent.parent`（`app/` 的上一级）供其余模块定位项目根目录与资源目录。
 
@@ -107,8 +111,12 @@ HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 python start.py
 **职责**：屏蔽不同厂商差异，统一为 OpenAI 兼容协议调用，支持 function calling、流式输出、usage 统计与 think 片段剥离。
 
 ### 5.1 供应商预设 `PROVIDER_PRESETS`
-- `qwen` / `default`：使用 `.env` 的 `LLM_*`（dashscope compatible-mode）。
-- `deepseek`：`https://api.deepseek.com`，模型 `deepseek-chat`；**注意不能用 `LLM_API_KEY` 兜底**（那是 DashScope 的 key，请求 DeepSeek 必然 401 且误导性强）。
+每个预设对应 `.env` 中**独立的环境变量块**（模型可热切换，互不干扰）：
+- `qwen`：`QWEN_*`（DashScope compatible-mode，`qwen3.7-plus`）。
+- `deepseek`：`DEEPSEEK_*`（`https://api.deepseek.com`，模型 `deepseek-chat`）；**注意不能用 `LLM_API_KEY` 兜底**（那是默认模型的 key，请求 DeepSeek 必然 401 且误导性强）。
+- `mimo`：`MIMO_*`（`https://api.xiaomimimo.com/v1`，模型 `mimo-v2.5`；BASE_URL 只写到 `/v1`，SDK 自动拼接 `/chat/completions`）。
+- `default`：`LLM_*`（默认 MiMo `mimo-v2.5`；`_normalize_base_url` 兜底剥离尾部 `/chat/completions`）。
+- 未知 provider 回退 `default`。
 
 ### 5.2 `resolve_model_config(provider, base_url, api_key, model_id)`
 - `provider == "custom"`：`base_url` / `api_key` / `model_id` 任一为空抛 `ValueError`，避免用错误端点/凭据请求。
@@ -220,7 +228,7 @@ HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 python start.py
 | `TaskDispatch` | 任务分发（Supervisor → 辩手） | `task_id`(UUID)、`topic`、`stance`、`round`、`budget_token`、`timestamp`(Unix 毫秒) |
 | `ArgumentSubmit` | 论点提交（辩手 → Supervisor） | `arg_id`、`agent_id`、`content`、`evidence_refs`、`confidence`、`round`、`token_cost` |
 | `Rebuttal` | 反驳消息 | `target_arg_id`、`rebuttal_content`、`logic_flaws`、`counter_evidence` |
-| `Judgment` | 裁决消息（Judge → Supervisor） | `scores`(logic/evidence/rebuttal/clarity)、`winner`(PRO/CON/DRAW)、`critique`、`convergence_flag` |
+| `Judgment` | 裁决消息（Judge → Supervisor） | `scores`(logic/evidence/rebuttal/clarity)、`agent_scores`(按辩手)、`model_performance`(TTFT/速率/质量分)、`composite_scores`(综合评分)、`winner`(PRO/CON/DRAW)、`critique`、`convergence_flag` |
 | `StatusSync` | 状态同步（心跳/轮次广播） | `trace_id`、`phase`(idle/preparing/debating/judging/finished)、`current_round`、`agent_states`、`remaining_budget`、`spent_budget`、`elapsed_time_ms` |
 | `EvidenceItem` | RAG 证据片段 | `evidence_id`、`source`、`content`、`confidence`、`url` |
 
@@ -311,14 +319,15 @@ Agent(agent_id, name, role, personality, model_config, is_main, forget_config, s
 1. 构建 `messages = [system] + history + [user]`；
 2. 工具集 = `mcp.schemas()`，主 Agent 追加 `DELEGATE_SCHEMA`（除非 `allow_delegate=False`），协作任务模式追加 `REPORT_SCHEMA`；
 3. **流式**：`_consume_stream()` 在后台线程运行 `chat_stream`，通过 `asyncio.Queue` + `loop.call_soon_threadsafe` 把增量桥接回事件循环；整体受 `settings.STREAM_TIMEOUT` 约束；流式异常时**回退非流式重试调用**；
-4. **非流式**：`_run_llm_retry()` 对 429/5xx/超时做指数退避重试（`LLM_RETRY_DELAYS` = 1s、3s）；
-5. 每次调用 `_apply_usage(result)` 累加 `spent`；
-6. 收到首个文本增量即推送 `speech_start`，随后逐个 `speech_delta`；
-7. 工具调用循环：主 Agent `delegate_task` → 收集 `delegate`；协作 Agent `report_result` → 收集 `report`；普通工具 → `mcp.call` 并把 tool 消息回传，继续循环；
-8. 回合结束若发生过流式发言，补发 `speech_end`（携带完整文本）并写入 transcript；
-9. 把 user/assistant 写入 `history`，返回 `{content, delegate, report, streamed, token_cost}`。
+4. **性能实测**：流式结果携带 `metrics = {ttft_s, gen_s, chars}`（在 `_consume_stream` 的 `_drain` 内实测首 token 延迟与生成耗时），回合末尾按辩手聚合进 `agent_metrics`（calls / ttft_sum / gen_sum / chars），供裁判**模型质量评分**使用；**非流式回退不计入**；
+5. **非流式**：`_run_llm_retry()` 对 429/5xx/超时做指数退避重试（`LLM_RETRY_DELAYS` = 1s、3s）；
+6. 每次调用 `_apply_usage(result)` 累加 `spent`；
+7. 收到首个文本增量即推送 `speech_start`，随后逐个 `speech_delta`；
+8. 工具调用循环：主 Agent `delegate_task` → 收集 `delegate`；协作 Agent `report_result` → 收集 `report`；普通工具 → `mcp.call` 并把 tool 消息回传，继续循环；
+9. 回合结束若发生过流式发言，补发 `speech_end`（携带完整文本）并写入 transcript；
+10. 把 user/assistant 写入 `history`，返回 `{content, delegate, report, streamed, token_cost}`。
 
-**`_consume_stream`**：后台线程 + `asyncio.Queue` 桥接，`wait_for` 整体超时（`STREAM_TIMEOUT`）。
+**`_consume_stream`**：后台线程 + `asyncio.Queue` 桥接，`wait_for` 整体超时（`STREAM_TIMEOUT`）；`_drain` 消费 chunk 时实测 `ttft_s`（首 token 延迟）/ `gen_s` / `chars`，随结果返回 `metrics`。
 **`_run_llm_retry`**：`asyncio.to_thread(chat, ...)` 包装，指数退避重试。
 
 ### 12.5 主持人指令 `_main_directive(round, is_last, had_any_task, pending_exists)`
@@ -367,15 +376,18 @@ while round < max_rounds:
 对本轮发言合并文本 → `asyncio.to_thread(rag_service.check, ...)` → 结果存 `round_evidence[round]`，供下一轮 `_evidence_for_round` 注入。
 
 ### 12.11 Judge 裁决 `_judge_round()`（架构文档 §2.4）
-- 构建完整辩论历史 + 各方立场，调用裁判（温度 0.3），要求输出 JSON；
+- **输入范围**：`_build_judge_debate_text()` 只保留 `type=="speech" and not is_main` 的**辩手发言**（剔除主持人开场 / 任务分派 / 追问 / 总结）。
+- 构建完整辩论历史 + 各方立场，调用裁判（温度 0.3），要求输出 JSON（含 `scores` 与**按辩手**的 `agent_scores`，键必须与辩手名一致）；
 - `_extract_json` 容忍代码块/前后缀，`Judgment(**data)` 校验；
-- 失败降级为 `Judgment(winner="DRAW", critique="裁判调用失败…")`。
+- **模型质量分（系统确定性，非 LLM）**：`_model_performance()` 把 `agent_metrics` 聚合为 `{avg_ttft_ms, avg_gen_rate, performance_score}`；`_score_ttft`（≤1s→10 / ≤5s→8 / ≤15s→6 / ≤30s→4 / 否则 2）与 `_score_rate`（≥80字/s→10 / ≥40→8 / ≥20→6 / ≥10→4 / 否则 2）取均值，无实测取中性 5.0；
+- **综合评分**：`_compute_composite()` 按 `内容均分(agent_scores 四维) × JUDGE_CONTENT_WEIGHT + 模型质量分 × JUDGE_PERFORMANCE_WEIGHT`（默认 0.8/0.2）合成 `composite_scores`，`agent_scores` 缺失时退化为模型质量分；**胜方由综合分最高辩手所在 stance 推导**（PRO/CON），两端并列最高取 DRAW；
+- 失败降级为 `Judgment(winner="DRAW", critique="裁判调用失败…")`，同样走 `_compute_composite`。
 - **预算硬熔断**：`remaining < MIN_TOKEN_THRESHOLD` 时不再调用 LLM，直接确定性裁决。
 
 ### 12.12 汇总与导出
 - `_final_summary(judgment)`：主持人输出结构化最终报告（含裁判裁决段，`allow_delegate=False`）；
-- `_fallback_summary(judgment)`：预算硬熔断时的**确定性汇总**（不调用 LLM，按发言记录 + 裁决拼装）；
-- `export_markdown()`：主题/轮次/时间/Trace ID/Token/Agent → 发言记录 → 裁判裁决 → 任务结果表 → 各 Agent 记忆快照。
+- `_fallback_summary(judgment)`：预算硬熔断时的**确定性汇总**（不调用 LLM，按发言记录 + 裁决拼装；含 `agent_scores` 与 `composite_scores` 综合评分输出行）；
+- `export_markdown()`：主题/轮次/时间/Trace ID/Token/Agent → 发言记录 → 裁判裁决（`scores` + `agent_scores` + 胜方）→ **「模型性能与综合评分」表**（辩手/平均TTFT/平均生成速率/模型质量分/综合评分）→ 任务结果表 → 各 Agent 记忆快照。
 
 ### 12.13 状态同步 `_status_sync()`（架构文档 §3.5）
 发布 `status_sync` 事件：`trace_id / phase / current_round / agent_states / remaining_budget / spent_budget / elapsed_time_ms`。
@@ -477,7 +489,7 @@ FastAPI 应用，挂载 `/static`，提供 REST + WebSocket。
 | `task_assigned` | `from, to, content, expected, var, task_id, timestamp` | 任务分派 |
 | `task_result` | `from, var, value, completed, message, task_id, timestamp, token_cost` | 任务回报/变量回填 |
 | `status_sync` | `trace_id, phase, current_round, agent_states, remaining_budget, spent_budget, elapsed_time_ms` | 状态同步（架构状态机/预算心跳） |
-| `judgment` | `scores, winner, critique, convergence_flag, round` | 裁判裁决 |
+| `judgment` | `judge, scores, agent_scores, model_performance, composite_scores, winner, critique, convergence_flag, round` | 裁判裁决（含按辩手评分、模型质量分与综合评分） |
 | `summary` | `speaker, text, round` | 最终总结 |
 | `agent_error` | `agent, error` | 某 Agent LLM 调用失败（前端展示错误气泡） |
 | `log` | `text` | 系统日志（带 trace_id） |
@@ -507,7 +519,8 @@ FastAPI 应用，挂载 `/static`，提供 REST + WebSocket。
 | --- | --- |
 | Supervisor：总调度、状态机、收敛触发、结果聚合；不亲自生成论点 | `orchestrator.run_discussion`（主持人分派/追问 + Judge 独立裁决 + 汇总） |
 | Pro/Con 立场绑定、禁止倒戈（§2.2/2.3） | `agent._stance_declaration` + `configure` 立场分配 |
-| Judge Agent：多维度评分 + winner + 收敛标记（§2.4） | `orchestrator._judge_round` → `Judgment` |
+| Judge Agent：多维度评分 + winner + 收敛标记（§2.4） | `orchestrator._judge_round` → `Judgment`（仅辩手发言评分） |
+| Judge 按辩手评分 + 模型质量分 + 综合评分推导胜方 | `_build_judge_debate_text` / `agent_metrics` + `_score_ttft` / `_score_rate` / `_compute_composite` |
 | RAG Agent：断言提取 + 检索 + 置信度 + 缓存（§2.5） | `app/rag.py`（`rag_service`，24h 缓存） |
 | 消息协议：TaskDispatch / ArgumentSubmit / Rebuttal / Judgment / StatusSync（§3） | `app/protocol.py`（pydantic + task_id UUID + token_cost + 毫秒时间戳） |
 | 状态机：Idle→Preparing→Debating→Judging→Finished（§4.1） | `PHASES` + `self.phase`（异常熔断回 Idle） |
@@ -555,18 +568,18 @@ FastAPI 应用，挂载 `/static`，提供 REST + WebSocket。
 
 ## 19. 端到端验证记录（E2E）
 
-使用 `tests/test_e2e.py`（配置 → 注入 → 开始 → WebSocket 收事件 → 导出）对真实运行做验证。被测配置：3 个 Agent（主持人=HOST，技术派=PRO，人文派=CON）、`max_rounds=3`、`budget=100000`。观察到的事实：
+使用 `tests/test_e2e.py`（配置 → 注入 → 开始 → WebSocket 收事件 → 导出）对真实运行做验证。被测配置：3 个 Agent（主持人=HOST，技术派=PRO，人文派=CON）、**全部使用 qwen**（`qwen3.7-plus`）、独立裁判同样 qwen、`max_rounds=2`、`budget=1000000`。观察到的事实：
 
 - **配置与注入**：`/api/configure` 成功创建 3 个 Agent（stance=[HOST, PRO, CON]），`/api/ingest` 写入 2 段知识，返回 `backend=in-memory`。
 - **状态机**：`status_sync` 事件中观察到的 `phase` 集合含 `preparing / debating / judging`，最终 `status=done`、`phase=finished`。
-- **多轮辩论**：实际走满 `max_rounds=3`，`round` 事件集合为 `{1,2,3}`；第 1 轮并行立论，第 2–3 轮主持人持续抛疑、辩手反驳。
+- **多轮辩论**：实际走满 `max_rounds=2`，`round` 事件集合为 `{1,2}`；第 1 轮并行立论，第 2 轮主持人抛疑、辩手反驳。
 - **预算统计**：`spent + remaining = budget`，全程 `remaining >= 0`。
-- **裁判裁决**：收到 `judgment` 事件，`winner=PRO`，含 `scores`（logic/evidence/rebuttal/clarity）。
-- **流式输出**：`speech_start == speech_end`（9 条），多个 speaker 的 delta 内容累计 > 0，第 1 轮并发流式正常。
-- **导出**：`/api/export` 返回约 20KB Markdown（含发言记录、裁判裁决、任务结果表、记忆快照），落盘 `data/discussions/e2e_export.md`。
-- **校验输出**：`ARCHITECTURE CHECKS PASS (state machine / budget / judge)`、`STREAMING CHECKS PASS`。
+- **裁判裁决**：收到 `judgment` 事件，`winner=CON`；含 `agent_scores`（按辩手四维评分）、`model_performance` 与 `composite_scores`。实测 `model_performance={'技术派': {'avg_ttft_ms': 35169.3, 'avg_gen_rate': 4.0, 'performance_score': 2.0}, '人文派': {'avg_ttft_ms': None, 'avg_gen_rate': None, 'performance_score': 5.0}}`（人文派流式数据缺失取中性 5.0）、`composite_scores={'技术派': 5.6, '人文派': 8.2}`，胜方与综合分最高辩手（人文派=CON）一致。
+- **流式输出**：`speech_start == speech_end`，多个 speaker 的 delta 内容累计 > 0，第 1 轮并发流式正常。
+- **导出**：`/api/export` 返回约 19KB Markdown（含发言记录、裁判裁决、**「模型性能与综合评分」表**、任务结果表、记忆快照），落盘 `data/discussions/e2e_export.md`。
+- **校验输出**：`ARCHITECTURE CHECKS PASS (state machine / budget / judge)`、`STREAMING CHECKS PASS`，断言覆盖 `agent_scores / model_performance / composite_scores` 非空且 `winner ∈ (PRO, CON, DRAW)`。
 
-> 该验证同时覆盖了降级路径（本机无 Qdrant → `in-memory`；无 HF 网络 → 哈希向量）。
+> 该验证同时覆盖了降级路径（本机无 Qdrant → `in-memory`；无 HF 网络 → 哈希向量）。快速路径验证见 `tests/test_ci_fast.py`（状态机 / 预算 / 裁决分档 / 综合评分逻辑，无需服务器）。
 
 ---
 
