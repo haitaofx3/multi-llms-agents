@@ -1,16 +1,20 @@
-// app.js — 圆桌协作前端逻辑
+// app.js — 圆桌辩论前端逻辑
+// 设计语言：聊天气泡 + 首字母文字头像（按立场配色）+ 流式光标 + 历史记忆检索
 const $ = (id) => document.getElementById(id);
 
 const state = {
   defaults: null,
   agentConfigs: [],   // 配置阶段
-  agents: [],         // 运行阶段（含角色/是否主）
+  agents: [],         // 运行阶段（含角色/是否主/立场）
   tasks: [],          // {id,to,content,expected,var,completed,value}
   ctx: {},            // var -> {by,value}
   ws: null,
-  seats: {},          // name -> element
+  seats: {},          // name -> element（圆桌席位）
   streamBoxes: {},    // speaker -> el（并行流式：多个 Agent 可同时流式发言）
   liveDiscussion: false,  // 存在可继续（暂停中）的讨论：重新进入时不重配置、不重开
+  historyItems: [],   // 历史讨论索引（检索结果）
+  currentHistory: null,   // 正在查看的历史记录 {filename, topic, ...}
+  historyActiveFilename: null,
 };
 
 const STATUS_TEXT = {
@@ -22,6 +26,9 @@ const PHASE_TEXT = {
 };
 
 const STANCE_TEXT = { HOST: "主持人", PRO: "正方", CON: "反方", NEUTRAL: "中立" };
+
+// 立场 → 头像配色类（CSS 定义于 style.css .av-*）
+const STANCE_AV = { HOST: "av-host", PRO: "av-pro", CON: "av-con", NEUTRAL: "av-neutral" };
 
 // ---------------- 初始化 ----------------
 async function init() {
@@ -50,6 +57,7 @@ function bindEvents() {
   $("btn-gen-agents").addEventListener("click", () =>
     generateAgentCards(parseInt($("agent-count").value, 10)));
   $("btn-ingest").addEventListener("click", ingest);
+  $("btn-upload").addEventListener("click", uploadFile);
   $("btn-start").addEventListener("click", startDiscussion);
   $("btn-pause").addEventListener("click", () => ctrl("pause"));
   $("btn-resume").addEventListener("click", () => ctrl("resume"));
@@ -58,9 +66,42 @@ function bindEvents() {
   $("btn-export").addEventListener("click", exportMarkdown);
   $("btn-download").addEventListener("click", downloadMarkdown);
   $("btn-md-close").addEventListener("click", () => $("md-modal").classList.add("hidden"));
+
+  // ---- 历史讨论记忆检索 ----
+  $("btn-history").addEventListener("click", openHistory);
+  $("btn-history-close").addEventListener("click", () => $("history-modal").classList.add("hidden"));
+  $("history-search").addEventListener("input", debounce(() => loadHistory($("history-search").value.trim()), 300));
+  $("history-list").addEventListener("click", (e) => {
+    const item = e.target.closest(".h-item");
+    if (item && item.dataset.filename) viewHistory(item.dataset.filename);
+  });
+  $("btn-history-download").addEventListener("click", downloadHistoryMarkdown);
 }
 
 function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+
+function debounce(fn, ms) {
+  let t;
+  return (...args) => { clearTimeout(t); t = setTimeout(() => fn(...args), ms); };
+}
+
+// ---------------- 头像（首字母文字头像，按立场配色） ----------------
+function initialOf(name) {
+  const s = (name || "?").trim();
+  return s ? s[0].toUpperCase() : "?";
+}
+
+function stanceOf(name) {
+  const a = (state.agents || []).find(x => x.name === name);
+  return a ? a.stance : "";
+}
+
+// 立场 → 头像配色类；找不到立场时按席位序号兜底（av-seat0..5）
+function avatarClass(stance, idx) {
+  const s = (stance || "").toUpperCase();
+  if (STANCE_AV[s]) return STANCE_AV[s];
+  return "av-seat" + ((idx == null ? 0 : idx) % 6);
+}
 
 // ---------------- Agent 配置卡片 ----------------
 function generateAgentCards(n) {
@@ -148,6 +189,27 @@ async function ingest() {
   $("ingest-hint").textContent = r.ok ? `已注入 ${r.added} 段（${r.backend}）` : ("失败：" + (r.error || ""));
 }
 
+// ---------------- 上传文件解析并注入 ----------------
+async function uploadFile() {
+  const input = $("kb-file");
+  const file = input.files && input.files[0];
+  if (!file) { $("upload-hint").textContent = "请先选择文件"; return; }
+  $("upload-hint").textContent = `解析中：${file.name}…`;
+  $("btn-upload").disabled = true;
+  try {
+    const fd = new FormData();
+    fd.append("file", file);
+    const r = await fetch("/api/upload", { method: "POST", body: fd }).then(r => r.json());
+    $("upload-hint").textContent = r.ok
+      ? `已注入 ${r.added} 段（${r.chars} 字，${r.backend}）`
+      : ("失败：" + (r.error || ""));
+  } catch (e) {
+    $("upload-hint").textContent = "上传失败：" + e;
+  } finally {
+    $("btn-upload").disabled = false;
+  }
+}
+
 // ---------------- 开始讨论 ----------------
 async function startDiscussion() {
   // 已存在可继续的讨论：直接回到之前的讨论页，不重新配置 / 不重开新讨论
@@ -216,7 +278,7 @@ async function startDiscussion() {
   }
 }
 
-// ---------------- 圆桌席位渲染（等分） ----------------
+// ---------------- 圆桌席位渲染（等分，首字母头像） ----------------
 function renderSeats(agents) {
   const table = $("round-table");
   // 清除旧席位（保留 center）
@@ -233,7 +295,7 @@ function renderSeats(agents) {
     seat.style.left = x + "%";
     seat.style.top = y + "%";
     seat.innerHTML = `
-      <div class="avatar">${a.is_main ? "👑" : "🤖"}</div>
+      <div class="avatar ${avatarClass(a.stance, i)}">${initialOf(a.name)}</div>
       <div class="sname">${a.name}</div>
       <div class="srole">${a.role || "机器人"}</div>
       <div class="srole stance">${STANCE_TEXT[a.stance] || a.stance || ""}</div>
@@ -332,7 +394,7 @@ function handleEvent(ev) {
       break;
     // ---- 流式发言：start 建气泡 → delta 追加文本 → end 用完整文本收尾 ----
     // 第 1 轮辩手并行立论时多个 Agent 会同时流式发言，因此按 speaker 维护独立气泡，
-    // 避免并发流式时互相覆盖（架构文档 §6.2 并行立论）。
+    // 避免并发流式时互相覆盖（架构文档 §6.2 并行立论）。每次气泡只显示当前发言内容。
     case "speech_start":
       state.streamBoxes[ev.speaker] = addMsgStart(ev.speaker, ev.is_main ? "main" : "", ev.round);
       highlightSeat(ev.speaker);
@@ -340,7 +402,10 @@ function handleEvent(ev) {
     case "speech_delta": {
       const box = state.streamBoxes[ev.speaker];
       if (box) {
-        box.querySelector(".body").textContent += ev.delta;
+        const body = box.querySelector(".body");
+        const caret = body.querySelector(".caret");
+        // 追加到流式光标之前，保持光标在文本末尾
+        body.insertBefore(document.createTextNode(ev.delta), caret || null);
         $("transcript").scrollTop = $("transcript").scrollHeight;
       }
       break;
@@ -348,7 +413,7 @@ function handleEvent(ev) {
     case "speech_end": {
       const box = state.streamBoxes[ev.speaker];
       if (box) {
-        // 以完整文本替换，避免与流式增量存在偏差
+        // 以完整文本替换，避免与流式增量存在偏差（同时移除流式光标）
         box.querySelector(".body").textContent = ev.text;
         delete state.streamBoxes[ev.speaker];
       }
@@ -381,7 +446,7 @@ function handleEvent(ev) {
         .map(([k, v]) => `${k}: ${v}`).join("，") || "（无评分）";
       const winnerTxt = ev.winner === "DRAW" ? "平局（DRAW）" : `胜方：${STANCE_TEXT[ev.winner] || ev.winner}`;
       const text = `【裁判裁决】\n- ${winnerTxt}\n- 得分：${scoreTxt}\n- 收敛终止：${ev.convergence_flag ? "是" : "否"}\n- 评语：${ev.critique || ""}`;
-      addMsg("裁判", text, "summary", ev.round, "裁决");
+      addMsg("裁判", text, "judge", ev.round, "裁决");
       break;
     }
     case "log":
@@ -394,14 +459,21 @@ function handleEvent(ev) {
   }
 }
 
-// ---------------- 渲染 ----------------
+// ---------------- 渲染（聊天气泡） ----------------
+// 每个发言独立一个气泡（.bubble-row），只承载当前对话内容，不拼接历史。
 function addMsgStart(who, cls, round) {
-  // 创建发言气泡（不填充文本，供流式增量追加）
+  // 创建发言气泡（不填充文本，供流式增量追加），并带一个流式光标
   const box = $("transcript");
   const el = document.createElement("div");
-  el.className = "msg " + (cls || "");
-  const tag = round ? `<span class="round-tag">第${round}轮</span>` : "";
-  el.innerHTML = `<div class="who">${who}${tag}</div><div class="body"></div>`;
+  el.className = "bubble-row " + (cls || "");
+  const tag = round ? `<span class="bubble-tag">第${round}轮</span>` : "";
+  el.innerHTML = `
+    <div class="bubble-avatar ${avatarClass(stanceOf(who), (state.agents || []).findIndex(a => a.name === who))}">${initialOf(who)}</div>
+    <div class="bubble-main">
+      <div class="bubble-meta"><span class="bubble-name">${who}</span>${tag}</div>
+      <div class="bubble"><span class="body"><span class="caret"></span></span></div>
+    </div>
+  `;
   box.appendChild(el);
   box.scrollTop = box.scrollHeight;
   return el;
@@ -410,11 +482,28 @@ function addMsgStart(who, cls, round) {
 function addMsg(who, text, cls, round, label) {
   const box = $("transcript");
   const el = document.createElement("div");
-  el.className = "msg " + (cls || "");
-  const tag = round ? `<span class="round-tag">第${round}轮</span>` : "";
-  const lab = label ? `<span class="round-tag">${label}</span>` : "";
-  el.innerHTML = `<div class="who">${who}${tag}${lab}</div><div class="body"></div>`;
-  el.querySelector(".body").textContent = text;
+  el.className = "bubble-row " + (cls || "");
+  const tag = round ? `<span class="bubble-tag">第${round}轮</span>` : "";
+  const lab = label ? `<span class="bubble-tag">${label}</span>` : "";
+  // log / summary / judge 居中整行展示，不带头像
+  const center = (cls === "log" || cls === "summary" || cls === "judge");
+  if (center) {
+    el.innerHTML = `
+      <div class="bubble-main">
+        <div class="bubble-meta"><span class="bubble-name">${who}</span>${tag}${lab}</div>
+        <div class="bubble"></div>
+      </div>
+    `;
+  } else {
+    el.innerHTML = `
+      <div class="bubble-avatar ${avatarClass(stanceOf(who), (state.agents || []).findIndex(a => a.name === who))}">${initialOf(who)}</div>
+      <div class="bubble-main">
+        <div class="bubble-meta"><span class="bubble-name">${who}</span>${tag}${lab}</div>
+        <div class="bubble"></div>
+      </div>
+    `;
+  }
+  el.querySelector(".bubble").textContent = text;
   box.appendChild(el);
   box.scrollTop = box.scrollHeight;
 }
@@ -468,10 +557,72 @@ function renderRunStatus(data) {
   `;
 }
 
+// ---------------- 历史讨论（记忆检索 / 查看 / 导出） ----------------
+async function openHistory() {
+  $("history-modal").classList.remove("hidden");
+  await loadHistory($("history-search").value.trim());
+}
+
+async function loadHistory(q) {
+  const url = q ? `/api/history?q=${encodeURIComponent(q)}` : "/api/history";
+  try {
+    const res = await fetch(url).then(r => r.json());
+    state.historyItems = res.items || [];
+  } catch (e) {
+    state.historyItems = [];
+  }
+  renderHistoryList();
+}
+
+function renderHistoryList() {
+  const box = $("history-list");
+  if (!state.historyItems.length) {
+    box.innerHTML = '<div class="muted pad">暂无历史记录</div>';
+    return;
+  }
+  box.innerHTML = state.historyItems.map(r => `
+    <div class="h-item${r.filename === state.historyActiveFilename ? " active" : ""}" data-filename="${r.filename}">
+      <div class="h-topic">${escapeHtml(r.topic || "（无题目）")}</div>
+      <div class="h-meta">
+        <span>${escapeHtml(r.timestamp || "")}</span>
+        <span>${STATUS_TEXT[r.status] || r.status || ""}</span>
+        <span>第 ${r.round || 0}/${r.max_rounds || 0} 轮</span>
+        <span>${(r.agents || []).length} 位</span>
+      </div>
+    </div>
+  `).join("");
+}
+
+async function viewHistory(filename) {
+  try {
+    const res = await fetch(`/api/history/${encodeURIComponent(filename)}`).then(r => r.json());
+    if (!res.ok) throw new Error(res.error || "加载失败");
+    const rec = state.historyItems.find(r => r.filename === filename) || {};
+    state.currentHistory = { ...rec, markdown: res.markdown };
+    state.historyActiveFilename = filename;
+    $("history-view-title").textContent = `${rec.topic || filename}（${filename}）`;
+    $("history-md").innerHTML = renderMarkdown(res.markdown);
+    renderHistoryList();
+  } catch (e) {
+    $("history-md").textContent = "加载失败：" + e.message;
+  }
+}
+
+function downloadHistoryMarkdown() {
+  const md = state.currentHistory ? state.currentHistory.markdown : "";
+  if (!md) { alert("请先选择一条历史记录"); return; }
+  const blob = new Blob([md], { type: "text/markdown" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = state.currentHistory.filename || "discussion.md";
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
 // ---------------- Markdown 导出 ----------------
 async function exportMarkdown() {
   const md = await fetch("/api/export").then(r => r.json()).then(r => r.markdown);
-  $("md-text").textContent = md;
+  $("md-text").innerHTML = renderMarkdown(md);
   $("md-modal").classList.remove("hidden");
 }
 async function downloadMarkdown() {
@@ -482,8 +633,37 @@ async function downloadMarkdown() {
   a.download = "discussion.md";
   a.click();
   URL.revokeObjectURL(a.href);
-  // 同时保存到服务器
+  // 同时保存到服务器（服务端会同步写入历史记忆索引）
   fetch("/api/save_markdown", { method: "POST", headers: {"Content-Type": "application/json"} });
 }
 
+// ---------------- Markdown 渲染（marked 预览 + XSS 防护） ----------------
+// 预览为阅读友好的 HTML；原始 markdown 仍由导出/下载功能完整保留。
+let mdReady = false;
+function initMarkdown() {
+  if (mdReady || typeof marked === "undefined") return;
+  const renderer = new marked.Renderer();
+  // 转义 markdown 中的原始 HTML，杜绝注入；链接一律新窗口打开
+  renderer.html = (html) => escapeHtml(html);
+  renderer.link = (href, title, text) =>
+    `<a href="${escapeHtml(href)}" target="_blank" rel="noopener">${text}</a>`;
+  marked.setOptions({ breaks: true, gfm: true });
+  marked.use({ renderer });
+  mdReady = true;
+}
+
+function renderMarkdown(md) {
+  if (typeof marked === "undefined" || !mdReady) {
+    return `<pre class="md-fallback">${escapeHtml(md || "")}</pre>`;
+  }
+  return marked.parse(md || "");
+}
+
+function escapeHtml(s) {
+  return String(s == null ? "" : s)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+}
+
+initMarkdown();
 init();

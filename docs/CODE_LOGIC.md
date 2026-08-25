@@ -12,7 +12,8 @@
 - 每个 Agent 拥有**独立的基础模型**（DeepSeek / Qwen / 自定义）、**立场**（主持人 HOST / 正方 PRO / 反方 CON / 中立 NEUTRAL）、**记忆系统**（短期 / 长期 / 情境 + 遗忘）、**MCP 工具集**（知识检索 / 联网搜索 / 记忆回忆）。
 - 首个 Agent 为**辩论主持人（Supervisor 视角）**：分派任务、逐轮追问、最终汇总；辩论结束后由**裁判（Judge）**单次裁决。
 - 辩论流程：第 1 轮**并行立论**（`asyncio.gather`），后续轮次**串行反驳/辩护**；达到终止条件（最大轮次 / Token 预算熔断 / 语义收敛 / 手动结束）后进入裁决与汇总。
-- 提供游戏化圆桌 UI（席位按数量等分）、**并发流式气泡**（按 speaker 独立，多个 Agent 可同时流式发言）、暂停 / 继续 / 结束、Markdown 结果导出。
+- 提供**简约大气**的圆桌 UI（席位按数量等分）、**聊天气泡式发言**（并发流式按 speaker 独立气泡）、**首字母文字头像**（按立场配色）、暂停 / 继续 / 结束、Markdown 结果导出。
+- **历史记忆化检索**：每场讨论完成或保存时，题目 + 元信息自动写入 `data/discussions/index.json`，前端历史面板支持关键词搜索与一键查看 / 下载。
 - **可观测性**：每次讨论生成 `trace_id`，贯穿事件流、状态同步与导出的 Markdown。
 
 ---
@@ -35,11 +36,13 @@ mini_test/
 │   ├── rag.py            独立 RAG 事实核查服务（断言提取 / 带置信度检索 / 24h 缓存）
 │   ├── agent.py          Agent 定义（角色/性格/立场/模型/记忆/MCP/上下文构建）
 │   ├── orchestrator.py   编排器（Supervisor：状态机、并行立论、收敛/预算终止、Judge、任务分派/回报）
+│   ├── history.py        历史讨论记忆索引（data/discussions/index.json + 检索 + Markdown 读取，防路径穿越）
+│   ├── file_parser.py    上传文件文本提取（txt/md/docx/xlsx/pdf/图片 OCR，懒加载依赖 + 大小/字符上限）
 │   ├── main.py           FastAPI 应用（REST + WebSocket + 静态服务，lifespan 自动落盘）
 │   └── static/           前端 UI
-│       ├── index.html    页面骨架（配置区 + 讨论区）
-│       ├── style.css     圆桌/席位/发言样式
-│       └── app.js        前端逻辑（配置、席位等分、WebSocket 事件、并发流式气泡）
+│       ├── index.html    页面骨架（配置区 + 讨论区 + 历史面板）
+│       ├── style.css     设计变量 / 圆桌席位 / 聊天气泡 / 首字母头像 / 历史面板
+│       └── app.js        前端逻辑（配置、席位等分、WebSocket 事件、并发流式气泡、历史检索）
 ├── tests/
 │   └── test_e2e.py       端到端集成测试（需先启动服务器；校验状态机/预算/裁判/流式）
 ├── docs/
@@ -67,7 +70,7 @@ NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost \
 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 python start.py
 ```
 
-启动后 `start.py` 通过 uvicorn 加载 `app.main` 的 FastAPI 应用，监听 `0.0.0.0:8000`，自动挂载 `/static`、REST 接口与 WebSocket `/ws`。
+启动后 `start.py` 通过 uvicorn 加载 `app.main` 的 FastAPI 应用，**默认监听 `127.0.0.1:8000`**（仅本地访问，避免远端暴露 / 长期挂载；需要开放局域网时以 `HOST=0.0.0.0` 环境变量显式覆盖），自动挂载 `/static`、REST 接口与 WebSocket `/ws`。
 
 ---
 
@@ -384,7 +387,7 @@ while round < max_rounds:
 FastAPI 应用，挂载 `/static`，提供 REST + WebSocket。
 
 ### 13.1 启动 `lifespan`
-用 `@asynccontextmanager` 注册（**替代已弃用的 `@app.on_event("startup")`**）：订阅 `event_bus`，监听 `status=done` → 自动 `export_markdown()` 落盘 `data/discussions/`；关闭时取消监听任务并退订。
+用 `@asynccontextmanager` 注册（**替代已弃用的 `@app.on_event("startup")`**）：订阅 `event_bus`，监听 `status=done` → 自动 `export_markdown()` 落盘 `data/discussions/` 并 `record_discussion()` 写入历史记忆索引；关闭时取消监听任务并退订。
 
 ### 13.2 REST 接口
 | 方法 | 路径 | 说明 |
@@ -397,33 +400,67 @@ FastAPI 应用，挂载 `/static`，提供 REST + WebSocket。
 | POST | `/api/pause` `/api/resume` `/api/end` | 暂停/继续/结束 |
 | GET | `/api/status` | 状态、阶段、轮次、Agent、任务、共享上下文、预算、裁判结果 |
 | GET | `/api/export` | 返回 Markdown 文本 |
-| POST | `/api/save_markdown` | 保存 Markdown 到服务器 |
+| POST | `/api/save_markdown` | 保存 Markdown 到服务器（同时写入历史记忆索引） |
+| GET | `/api/history?q=` | 历史讨论列表（`items` 按时间倒序；`q` 非空时按题目 / trace_id 关键词过滤） |
+| GET | `/api/history/{filename}` | 查看某场历史讨论的完整 Markdown（`404` 表示记录不存在，含路径穿越防护） |
 
 ### 13.3 WebSocket `/ws`
 - 连接即推送当前 `status`（含 agents/topic/max_rounds/budget/spent/phase），便于前端初始化席位；
 - 订阅 `event_bus`，把每个事件 `send_json` 给前端；
 - 断开/异常时在 `finally` 中退订，避免订阅队列泄漏。
 
+### 13.4 历史讨论记忆索引 — `app/history.py`
+把每场讨论的「题目 + 元信息」持久化到 `data/discussions/index.json`（按 filename 去重 upsert，头部插入，保留最近 200 条），作为历史讨论的记忆化保存，支撑后续检索：
+
+- `record_discussion(topic, trace_id, filename, status, phase, round_no, max_rounds, token_spent, token_budget, agents)`：写入 / 更新一条索引（内部 `threading.Lock` 保证并发安全）。
+- `list_discussions(q)`：按题目 / trace_id 做不区分大小写关键词过滤，按时间倒序返回。
+- `get_markdown(filename)`：读取 `data/discussions/` 下的 Markdown 内容；`resolve()` + `relative_to()` 做**路径穿越防护**，仅允许该目录内 `.md` 文件。
+
+**写入时机**（两处）：
+1. `lifespan` 监听器收到 `status=done` 自动落盘 Markdown 后；
+2. `POST /api/save_markdown` 保存 Markdown 后。
+
+**读取入口**：`GET /api/history`（列表 / 搜索）与 `GET /api/history/{filename}`（完整 Markdown），由前端历史面板调用。
+
+---
+
+### 13.5 文件解析与共享知识注入 — `app/file_parser.py`
+为「共享知识库」提供**文件上传 → 文本提取 → 按段注入向量库**的前置处理，支持 `txt/md/csv/log`、`docx`（python-docx）、`xlsx`（openpyxl）、`pdf`（pypdf）、图片 OCR（RapidOCR）：
+
+- `parse_file(filename, data) -> (text, meta)`：按扩展名分派到各格式提取函数；全部第三方依赖**懒加载**，缺失时抛 `ParseError` 给出一行可读提示，不阻塞其它格式。
+- 保护措施：`MAX_UPLOAD_BYTES = 20MB` 超限拒绝；`MAX_TEXT_CHARS = 200_000` 超出截断并在 `meta["truncated"]` 标注；纯文本 utf-8 → gbk 回退。
+- `split_paragraphs(text)`：按行切分为待索引的知识块。
+- 入口：`POST /api/upload`（multipart）解析后调 `shared_vector_store.add()` 注入；前端「共享知识库」区提供文件选择 + 上传解析按钮，`/api/defaults` 暴露 `upload_exts` 支持格式表。
+
 ---
 
 ## 14. 前端 — `static/`
 
 ### 14.1 页面结构 `index.html`
-- **配置区 `#setup`**：Agent 数量（2–6）、每个 Agent 卡片（名称/角色/性格/**立场**/模型供应商 + 自定义字段）、主题、最大轮次、Token 预算、知识注入、开始按钮。
-- **讨论区 `#discussion`**：左侧圆桌（`#round-table`）含等分席位与中心信息（主题/轮次/任务进度）；右侧控制（暂停/继续/结束/返回）+ 运行状态（阶段/轮次/预算/Trace ID）+ 任务面板 + 变量面板；下方实时发言流；结束栏（导出/下载）。
+- **顶栏 `.topbar`**：Logo + "历史记录"按钮 + 状态胶囊。
+- **配置区 `#setup`**（双栏：`.setup-col` + `.side-col`）：Agent 数量（2–6）、每个 Agent 卡片（名称/角色/性格/**立场**/模型供应商 + 自定义字段）、主题、最大轮次、Token 预算、知识注入、开始按钮。
+- **讨论区 `#discussion`**：左侧圆桌（`#round-table`）含等分席位与中心信息（主题/轮次/任务进度）；右侧控制（暂停/继续/结束/返回）+ 运行状态（阶段/轮次/预算/Trace ID）+ 任务面板 + 变量面板；下方**聊天气泡**发言流；结束栏（预览 / 一键导出 Markdown）。
+- **历史弹窗 `#history-modal`**：左侧搜索框 + 记录列表（题目 / 时间 / 状态 / 轮次 / 人数），右侧 Markdown 预览 + 一键导出。
 
 ### 14.2 样式 `style.css`
-深色游戏化主题：圆桌为径向渐变圆形，席位按绝对定位分布，发言时 `.speaking` 高亮放大；主 Agent 用皇冠头像与粉色描边区分。
+**设计语言：简约大气（低饱和深色 + 暖金点缀）**，明确避免霓虹 / emoji 的"AI 味"：
+- 设计变量：`--bg: #0f1115`、`--surface: #161920`、`--gold: #d9a441`、`--pro: #7aa784`、`--con: #c08a8a`、`--neutral: #7c93b8` 等。
+- **首字母文字头像**：`.bubble-avatar` / `.seat .avatar` 用 Agent 名称首字母 + 立场配色（`.av-host` / `.av-pro` / `.av-con` / `.av-neutral`，未知立场按席位序号 `.av-seat0..5` 兜底）；主 Agent 加金色光环（`.seat.main .avatar`）。
+- **聊天气泡**：`.bubble-row`（flex 行 + `bubbleIn` 弹出动画）内含 `.bubble-avatar` + `.bubble-main`（`.bubble-meta` 名字/轮次标签 + `.bubble` 气泡）；任务/总结/裁决/日志/错误各有专属气泡风格；`.bubble-row.speaking` 高亮金边。
+- **流式光标**：`.caret`（金色竖线 + `blink` 闪烁动画），流式增量时保持在文本末尾。
+- 历史面板 `.history-modal` / `.history-layout` / `.h-item`。
 
 ### 14.3 逻辑 `app.js`
-- `init()`：拉取 `/api/defaults`、生成卡片、绑定事件、连接 WS。
+- `init()`：拉取 `/api/defaults`、生成卡片、绑定事件、连接 WS；探测服务器是否存在可继续的讨论（`/api/status`）。
 - `generateAgentCards(n)`：按数量生成配置卡片，首个标记"主 Agent"且立场固定 HOST，其余按 PRO/CON 交替；立场下拉可选 HOST/PRO/CON/NEUTRAL。
 - `startDiscussion()`：组装 `agents`（含 `stance`）→ `/api/configure` → 渲染席位 → `/api/start`。
-- `renderSeats(agents)`：**席位等分算法**——`angle = (-90 + i*360/n)`，以圆心 50% 为圆心、半径 38% 用百分比定位。
+- `renderSeats(agents)`：**席位等分算法**——`angle = (-90 + i*360/n)`，以圆心 50% 为圆心、半径 38% 用百分比定位；头像为首字母 + 立场配色。
+- `avatarClass(stance, idx)`：立场 → 头像配色类映射（含 `av-seatN` 兜底）；`stanceOf(name)` 从 `state.agents` 反查立场。
 - `connectWS()` / `handleEvent(ev)`：按事件类型更新 UI（见 §15 事件协议）。
-- **并发流式气泡**：`state.streamBoxes = {}`（speaker → el），`speech_start` 按 speaker 建独立气泡，`speech_delta` 追加到对应气泡，`speech_end` 用完整文本替换并删除该 key——第 1 轮并行立论时多个 Agent 可同时流式发言而不互相覆盖。
+- **并发流式气泡**：`state.streamBoxes = {}`（speaker → el），`speech_start` 按 speaker 建独立气泡（`.bubble-row` + 空 `.body` + `.caret`），`speech_delta` 把增量插入到光标前，`speech_end` 用完整文本替换（移除光标）并删除该 key——第 1 轮并行立论时多个 Agent 可同时流式发言而不互相覆盖；**每次气泡只承载当前发言内容，不拼接历史**。
 - `renderRunStatus(data)`：展示阶段/轮次/预算（剩余+已用）/用时/Trace ID。
-- `exportMarkdown()` / `downloadMarkdown()`：拉取 `/api/export` 弹出/下载 Markdown（下载同时调用 `/api/save_markdown` 落盘）。
+- `exportMarkdown()` / `downloadMarkdown()`：拉取 `/api/export` 弹出/下载 Markdown（下载同时调用 `/api/save_markdown` 落盘并写入历史索引）。
+- **历史面板**：`openHistory()` 打开弹窗并 `loadHistory()` 拉取 `/api/history`；搜索框 300ms 防抖后带 `?q=` 重新检索；点击列表项 `viewHistory(filename)` 拉取 `/api/history/{filename}` 预览；`downloadHistoryMarkdown()` 把当前查看内容下载为 Markdown 文件。
 
 ---
 
@@ -533,4 +570,4 @@ FastAPI 应用，挂载 `/static`，提供 REST + WebSocket。
 
 ---
 
-*文档覆盖 `app/config / app/protocol / app/llm / app/embeddings / app/vector_store / app/memory / app/tools / app/rag / app/agent / app/orchestrator / app/main / app/static` 全部模块，可作为二次开发与维护的权威参考。*
+*文档覆盖 `app/config / app/protocol / app/llm / app/embeddings / app/vector_store / app/memory / app/tools / app/rag / app/agent / app/orchestrator / app/history / app/file_parser / app/main / app/static` 全部模块，可作为二次开发与维护的权威参考。*

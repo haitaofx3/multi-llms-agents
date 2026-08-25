@@ -14,11 +14,13 @@ import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.config import settings, PROJECT_ROOT
+from app.file_parser import ParseError, parse_file, split_paragraphs, SUPPORTED_EXTS
+from app.history import record_discussion, list_discussions, get_markdown
 from app.llm import PROVIDER_PRESETS
 from app.vector_store import shared_vector_store
 from app.orchestrator import orchestrator
@@ -46,6 +48,21 @@ async def lifespan(app: FastAPI):
                     md = orchestrator.export_markdown()
                     fname = f"discussion_{_ts()}.md"
                     (DISCUSSIONS_DIR / fname).write_text(md, encoding="utf-8")
+                    # 历史讨论题目记忆化保存（供后续检索）
+                    record_discussion(
+                        topic=orchestrator.topic,
+                        trace_id=orchestrator.trace_id,
+                        filename=fname,
+                        status=orchestrator.status,
+                        phase=orchestrator.phase,
+                        round_no=orchestrator.round,
+                        max_rounds=orchestrator.max_rounds,
+                        token_spent=orchestrator.spent,
+                        token_budget=orchestrator.budget,
+                        agents=[{"name": a.name, "role": a.role,
+                                 "stance": a.stance, "is_main": a.is_main}
+                                for a in orchestrator.agents],
+                    )
                 except Exception:
                     pass
 
@@ -83,6 +100,7 @@ async def defaults():
         "default_provider": "default",
         "vector_backend": shared_vector_store.backend,
         "max_agents": 6,
+        "upload_exts": SUPPORTED_EXTS,
     }
 
 
@@ -132,6 +150,39 @@ async def ingest(payload: dict):
         chunks = [text]
     shared_vector_store.add(chunks, [{"source": source} for _ in chunks])
     return {"ok": True, "added": len(chunks), "backend": shared_vector_store.backend}
+
+
+# ---------------- 上传文件解析并注入共享知识 ----------------
+@app.post("/api/upload")
+async def upload_file(file: UploadFile = File(...)):
+    """上传文档 / 表格 / PDF / 图片，解析为文本后注入共享向量库。"""
+    try:
+        data = await file.read()
+    except Exception:
+        return JSONResponse({"ok": False, "error": "读取上传文件失败"}, status_code=400)
+
+    if not file.filename:
+        return JSONResponse({"ok": False, "error": "缺少文件名"}, status_code=400)
+
+    try:
+        text, meta = parse_file(file.filename, data)
+    except ParseError as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+
+    if not text.strip():
+        return JSONResponse({"ok": False, "error": "未能从文件中提取到文本内容（可能是扫描件/图片型 PDF）"}, status_code=400)
+
+    source = f"{meta['source']}（文件上传）"
+    chunks = split_paragraphs(text, source)
+    shared_vector_store.add(chunks, [{"source": source} for _ in chunks])
+    return {
+        "ok": True,
+        "added": len(chunks),
+        "chars": meta["chars"],
+        "truncated": meta["truncated"],
+        "backend": shared_vector_store.backend,
+        "source": source,
+    }
 
 
 # ---------------- 开始讨论 ----------------
@@ -211,7 +262,37 @@ async def save_markdown(payload: dict = None):
         fname += ".md"
     path = DISCUSSIONS_DIR / fname
     path.write_text(md, encoding="utf-8")
+    # 历史讨论题目记忆化保存（供后续检索）
+    record_discussion(
+        topic=orchestrator.topic,
+        trace_id=orchestrator.trace_id,
+        filename=fname,
+        status=orchestrator.status,
+        phase=orchestrator.phase,
+        round_no=orchestrator.round,
+        max_rounds=orchestrator.max_rounds,
+        token_spent=orchestrator.spent,
+        token_budget=orchestrator.budget,
+        agents=[{"name": a.name, "role": a.role, "stance": a.stance,
+                 "is_main": a.is_main} for a in orchestrator.agents],
+    )
     return {"ok": True, "path": str(path), "filename": fname}
+
+
+# ---------------- 历史讨论查询 / 检索 ----------------
+@app.get("/api/history")
+async def history(q: str = ""):
+    """历史讨论列表；q 为可选关键词（按题目 / trace_id 过滤）。"""
+    return {"ok": True, "items": list_discussions(q)}
+
+
+@app.get("/api/history/{filename}")
+async def history_view(filename: str):
+    """查看某场历史讨论的完整 Markdown 内容。"""
+    md = get_markdown(filename)
+    if md is None:
+        return JSONResponse({"ok": False, "error": "记录不存在"}, status_code=404)
+    return {"ok": True, "markdown": md, "filename": filename}
 
 
 # ---------------- WebSocket 实时事件 ----------------

@@ -23,3 +23,11 @@ sentence-transformers
 # 工具 / 其他
 httpx
 numpy
+
+# 文件解析（共享知识库文件上传）
+python-docx        # .docx
+openpyxl           # .xlsx
+pypdf              # .pdf
+rapidocr-onnxruntime  # 图片 OCR（体积较大，可选；缺失时上传图片会给出提示）
+pillow             # 图片读取（OCR 依赖）
+

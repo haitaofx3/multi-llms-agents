@@ -59,7 +59,7 @@ def _float(name: str, default: float) -> float:
 
 class Settings:
     # ---- LLM 默认配置 (来自 .env，所有 agent 的兜底模型) ----
-    LLM_MODEL_ID = _get("LLM_MODEL_ID", "qwen3-vl-flash")
+    LLM_MODEL_ID = _get("LLM_MODEL_ID", "qwen3.7-plus")
     LLM_API_KEY = _get("LLM_API_KEY", "")
     LLM_BASE_URL = _get("LLM_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
     LLM_TIMEOUT = _int("LLM_TIMEOUT", 60)
