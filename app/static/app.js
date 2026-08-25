@@ -485,8 +485,17 @@ function handleEvent(ev) {
             .map(([k, v]) => `${k}：${Object.entries(v).map(([d, s]) => `${d} ${s}`).join(" / ")}`)
             .join("\n  - ")
         : "";
+      const perfTxt = (ev.model_performance && Object.keys(ev.model_performance).length)
+        ? "\n- 模型质量：\n  - " + Object.entries(ev.model_performance)
+            .map(([k, v]) => `${k}：TTFT ${v.avg_ttft_ms}ms / ${v.avg_gen_rate}字/s / 质量分 ${v.performance_score}`)
+            .join("\n  - ")
+        : "";
+      const compTxt = (ev.composite_scores && Object.keys(ev.composite_scores).length)
+        ? "\n- 综合评分：" + Object.entries(ev.composite_scores)
+            .map(([k, v]) => `${k} ${v}`).join("，")
+        : "";
       const winnerTxt = ev.winner === "DRAW" ? "平局（DRAW）" : `胜方：${STANCE_TEXT[ev.winner] || ev.winner}`;
-      const text = `【裁判裁决】\n- ${winnerTxt}\n- 综合得分：${scoreTxt}${agentScoreTxt}\n- 收敛终止：${ev.convergence_flag ? "是" : "否"}\n- 评语：${ev.critique || ""}`;
+      const text = `【裁判裁决】\n- ${winnerTxt}\n- 综合得分：${scoreTxt}${agentScoreTxt}${perfTxt}${compTxt}\n- 收敛终止：${ev.convergence_flag ? "是" : "否"}\n- 评语：${ev.critique || ""}`;
       addMsg(ev.judge || "裁判", text, "judge", ev.round, "裁决");
       break;
     }

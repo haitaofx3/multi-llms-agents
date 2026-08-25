@@ -70,6 +70,12 @@ class Judgment(BaseModel):
     """§3.4 裁决消息。"""
     scores: Dict[str, float] = {}    # 全局维度 {logic, evidence, rebuttal, clarity}
     agent_scores: Dict[str, Dict[str, float]] = {}  # 各辩手评分 {辩手名: {logic, evidence, rebuttal, clarity}}
+    # 模型质量实测（系统确定性计算，非 LLM 输出）：
+    #   {辩手名: {avg_ttft_ms, avg_gen_rate, performance_score}}
+    model_performance: Dict[str, Dict[str, float]] = {}
+    # 最终综合评分（内容分 × 内容权重 + 模型质量分 × 性能权重）：
+    #   {辩手名: composite}
+    composite_scores: Dict[str, float] = {}
     winner: str = "DRAW"             # PRO / CON / DRAW
     critique: str = ""
     convergence_flag: bool = False

@@ -87,6 +87,10 @@ class Settings:
     JUDGE_BASE_URL = _get("JUDGE_BASE_URL", "")
     JUDGE_API_KEY = _get("JUDGE_API_KEY", "")
     JUDGE_MODEL_ID = _get("JUDGE_MODEL_ID", "")
+    # 综合评分权重：最终综合分 = 内容分(agent_scores 均值) × 内容权重
+    #              + 模型质量分(TTFT/生成速率) × 性能权重
+    JUDGE_CONTENT_WEIGHT = _float("JUDGE_CONTENT_WEIGHT", 0.8)
+    JUDGE_PERFORMANCE_WEIGHT = _float("JUDGE_PERFORMANCE_WEIGHT", 0.2)
 
     # ---- 搜索工具 ----
     TAVILY_API_KEY = _get("TAVILY_API_KEY", "")

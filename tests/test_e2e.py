@@ -69,6 +69,8 @@ def ws_listener():
                 elif t == "judgment":
                     print(f"  [JUDGE] judge={ev.get('judge')} winner={ev.get('winner')} "
                           f"scores={ev.get('scores')} agent_scores={ev.get('agent_scores')} "
+                          f"model_performance={ev.get('model_performance')} "
+                          f"composite_scores={ev.get('composite_scores')} "
                           f"converged={ev.get('convergence_flag')}")
                 elif t == "summary":
                     print(f"  [SUMMARY] {ev.get('text')[:200]}")
@@ -156,6 +158,12 @@ def main():
         assert "winner" in s["judgment"], "judgment 缺少 winner 字段"
         assert "scores" in s["judgment"], "judgment 缺少 scores 字段"
         assert "agent_scores" in s["judgment"], "judgment 缺少 agent_scores 字段（独立裁判按辩手评分）"
+        assert "model_performance" in s["judgment"], "judgment 缺少 model_performance 字段（模型质量评分）"
+        assert "composite_scores" in s["judgment"], "judgment 缺少 composite_scores 字段（综合评分）"
+        # 综合评分非空：至少一名辩手有复合分，且胜方合法
+        assert s["judgment"]["composite_scores"], "composite_scores 为空"
+        assert s["judgment"]["winner"] in ("PRO", "CON", "DRAW"), \
+            f"胜方非法：{s['judgment']['winner']}"
     print("ARCHITECTURE CHECKS PASS (state machine / budget / judge)")
     # ---- 流式输出校验 ----
     n_start = sum(1 for e in events if e.get("type") == "speech_start")

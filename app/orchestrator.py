@@ -121,6 +121,7 @@ class Orchestrator:
         self.judgment = None
         self.last_main_message = ""
         self.run_stats = {"compressions": 0}  # 运行摘要统计（优化 A4）
+        self.agent_metrics = {}  # 模型质量指标（流式发言实测）：{name: {calls, ttft_sum, gen_sum, chars}}
 
     # ---------------- 配置 ----------------
     def configure(self, agent_configs: list, topic: str = "", max_rounds: int = 8,
@@ -149,6 +150,7 @@ class Orchestrator:
         self.round_evidence = {}
         self.judgment = None
         self.run_stats = {"compressions": 0}
+        self.agent_metrics = {}
 
         for i, cfg in enumerate(agent_configs):
             from app.llm import resolve_model_config
@@ -272,6 +274,8 @@ class Orchestrator:
         """
         q = asyncio.Queue()
         loop = asyncio.get_running_loop()
+        t_start = time.time()
+        metrics = {"ttft_s": None, "gen_s": 0.0, "chars": 0}
 
         def _run():
             try:
@@ -283,15 +287,25 @@ class Orchestrator:
         threading.Thread(target=_run, daemon=True).start()
 
         async def _drain():
+            first = True
             while True:
                 ev = await q.get()
                 t = ev.get("type")
                 if t == "final":
+                    # 附加流式性能实测：TTFT / 生成耗时 / 输出字符数（供模型质量评分）
+                    if metrics["ttft_s"] is not None:
+                        metrics["gen_s"] = max(0.0, time.time() - t_start - metrics["ttft_s"])
+                        ev["result"]["metrics"] = dict(metrics)
                     return ev["result"]
                 if t == "error":
                     raise RuntimeError(ev["error"])
-                if t == "content" and on_delta is not None:
-                    await on_delta(ev["delta"])
+                if t == "content":
+                    if first and metrics["ttft_s"] is None:
+                        metrics["ttft_s"] = time.time() - t_start
+                        first = False
+                    metrics["chars"] += len(ev["delta"])
+                    if on_delta is not None:
+                        await on_delta(ev["delta"])
 
         try:
             return await asyncio.wait_for(_drain(), timeout=settings.STREAM_TIMEOUT)
@@ -387,6 +401,16 @@ class Orchestrator:
                     "error": str(e),
                 })
                 break
+
+            # 聚合流式性能实测（TTFT / 生成速率），供裁判模型质量评分使用
+            _m = result.pop("metrics", None)
+            if _m and _m.get("ttft_s") is not None:
+                acc = self.agent_metrics.setdefault(
+                    agent.name, {"calls": 0, "ttft_sum": 0.0, "gen_sum": 0.0, "chars": 0})
+                acc["calls"] += 1
+                acc["ttft_sum"] += _m["ttft_s"]
+                acc["gen_sum"] += _m["gen_s"]
+                acc["chars"] += _m["chars"]
 
             token_cost += self._apply_usage(result)
             content = result["content"] or content
@@ -624,6 +648,7 @@ class Orchestrator:
         self.round_evidence = {}
         self.judgment = None
         self.run_stats = {"compressions": 0, "started_at": time.time()}
+        self.agent_metrics = {}
         self.status = "running"
         self._pause_event.set()
         await self.event_bus.publish({
@@ -738,14 +763,17 @@ class Orchestrator:
                     self._log(f"预算硬熔断：剩余Token({remaining})低于阈值"
                               f"({settings.MIN_TOKEN_THRESHOLD})，裁判使用回退裁决",
                               level="warning", event="budget.hard_break")
-                    judgment = Judgment(winner="DRAW", critique="预算耗尽，未执行完整 LLM 裁决",
-                                        convergence_flag=False)
+                    judgment = self._compute_composite(Judgment(
+                        winner="DRAW", critique="预算耗尽，未执行完整 LLM 裁决",
+                        convergence_flag=False))
                 self.judgment = judgment
                 await self.event_bus.publish({
                     "type": "judgment",
                     "judge": self.judge.name if self.judge else self.main.name,
                     "scores": judgment.scores,
                     "agent_scores": judgment.agent_scores,
+                    "model_performance": judgment.model_performance,
+                    "composite_scores": judgment.composite_scores,
                     "winner": judgment.winner,
                     "critique": judgment.critique,
                     "convergence_flag": judgment.convergence_flag,
@@ -806,6 +834,102 @@ class Orchestrator:
             raise ValueError("裁判输出中未找到 JSON 对象")
         return json.loads(t[start:end + 1])
 
+    # ---------------- 模型质量评分（系统确定性，非 LLM） ----------------
+    @staticmethod
+    def _score_ttft(ttft_s: float) -> float:
+        """TTFT（首 token 延迟，秒）→ 1-10 分。"""
+        if ttft_s is None:
+            return 5.0
+        if ttft_s <= 1:
+            return 10
+        if ttft_s <= 5:
+            return 8
+        if ttft_s <= 15:
+            return 6
+        if ttft_s <= 30:
+            return 4
+        return 2
+
+    @staticmethod
+    def _score_rate(rate: float) -> float:
+        """生成速率（字符/秒）→ 1-10 分。"""
+        if rate is None:
+            return 5.0
+        if rate >= 80:
+            return 10
+        if rate >= 40:
+            return 8
+        if rate >= 20:
+            return 6
+        if rate >= 10:
+            return 4
+        return 2
+
+    def _model_performance(self) -> dict:
+        """聚合各辩手流式实测指标，产出 {辩手: {avg_ttft_ms, avg_gen_rate, performance_score}}。"""
+        perf = {}
+        for name, m in self.agent_metrics.items():
+            if m["calls"] <= 0:
+                continue
+            avg_ttft = m["ttft_sum"] / m["calls"]
+            avg_rate = m["chars"] / m["gen_sum"] if m["gen_sum"] > 0 else 0.0
+            perf[name] = {
+                "avg_ttft_ms": round(avg_ttft * 1000, 1),
+                "avg_gen_rate": round(avg_rate, 1),
+                "performance_score": round(
+                    (self._score_ttft(avg_ttft) + self._score_rate(avg_rate)) / 2, 1),
+            }
+        return perf
+
+    def _performance_text(self) -> str:
+        """供裁判提示词/评语参考的模型性能指标文本。"""
+        perf = self._model_performance()
+        if not perf:
+            return ""
+        lines = [f"- {n}：平均TTFT={v['avg_ttft_ms']}ms，平均生成速率={v['avg_gen_rate']}字/s"
+                 for n, v in perf.items() if n != self.main.name]
+        return "\n".join(lines) if lines else ""
+
+    def _compute_composite(self, judgment: Judgment) -> Judgment:
+        """计算模型质量分与最终综合分，并依据综合分推导胜方。
+
+        composite = 内容均分(agent_scores 四维均值) × 内容权重
+                  + 模型质量分 × 性能权重
+        agent_scores 缺失（如预算熔断回退）时 composite 退化为模型质量分。
+        """
+        names = [a.name for a in self.collaborators]
+        perf = self._model_performance()
+        judgment.model_performance = {
+            n: perf.get(n, {"avg_ttft_ms": None, "avg_gen_rate": None,
+                            "performance_score": 5.0})
+            for n in names
+        }
+        composite = {}
+        for n in names:
+            content = judgment.agent_scores.get(n)
+            content_avg = (sum(content.values()) / len(content)) if content else None
+            pscore = judgment.model_performance[n]["performance_score"]
+            if content_avg is not None:
+                comp = (settings.JUDGE_CONTENT_WEIGHT * content_avg
+                        + settings.JUDGE_PERFORMANCE_WEIGHT * pscore)
+            else:
+                comp = pscore
+            composite[n] = round(comp, 2)
+        judgment.composite_scores = composite
+
+        # 胜方：综合分最高辩手所在方（PRO/CON）；两端并列最高取 DRAW
+        if composite:
+            top = max(composite.values())
+            top_names = [n for n, v in composite.items() if v == top]
+            top_stances = {self.get_agent(n).stance for n in top_names}
+            if len(top_stances) == 1 and top_stances <= {"PRO", "CON"}:
+                judgment.winner = top_stances.pop()
+            else:
+                judgment.winner = "DRAW"
+        else:
+            judgment.winner = "DRAW"
+        return judgment
+
     async def _judge_round(self) -> Judgment:
         if not self.collaborators:
             # 无辩手可评（仅主持人）：直接回退确定性裁决
@@ -825,7 +949,12 @@ class Orchestrator:
                      "反驳有效性(rebuttal)、表达清晰度(clarity)。"
                      "请对【每位辩手】分别打分，再给出全场胜方。")
         prompt = (f"辩论主题：{self.topic}\n\n辩手与立场：\n{stance_lines}\n\n"
-                  f"辩论记录（仅辩手发言，不含主持人的任务分派）：\n{history}\n\n"
+                  f"辩论记录（仅辩手发言，不含主持人的任务分派）：\n{history}\n\n")
+        perf_text = self._performance_text()
+        if perf_text:
+            prompt += ("模型性能实测（系统测量，仅供你评语时参考，不参与你的内容评分）：\n"
+                       f"{perf_text}\n\n")
+        prompt += (
                   "请输出 JSON（不要输出其他文字或代码块）：\n"
                   '{"scores": {"logic": 8, "evidence": 7, "rebuttal": 9, "clarity": 8}, '
                   f'"agent_scores": {agent_scores_example}, '
@@ -844,12 +973,16 @@ class Orchestrator:
             self._apply_usage(result)
             data = self._extract_json(result["content"])
             judgment = Judgment(**data)
+            # 系统确定性模型质量分 + 综合评分，并据此推导胜方
+            judgment = self._compute_composite(judgment)
         except Exception as e:  # noqa
             self._log(f"[裁判调用失败] {e}", level="error", event="judge.fail")
-            judgment = Judgment(winner="DRAW", critique=f"裁判调用失败：{e}",
-                                convergence_flag=False)
+            judgment = self._compute_composite(Judgment(
+                winner="DRAW", critique=f"裁判调用失败：{e}",
+                convergence_flag=False))
         self._log(f"[裁判:{judge_name}] winner={judgment.winner} "
-                  f"agent_scores={json.dumps(judgment.agent_scores, ensure_ascii=False)}",
+                  f"agent_scores={json.dumps(judgment.agent_scores, ensure_ascii=False)} "
+                  f"composite={json.dumps(judgment.composite_scores, ensure_ascii=False)}",
                   level="info", event="judge.result")
         return judgment
 
@@ -983,7 +1116,13 @@ class Orchestrator:
             judge_section = (
                 "\n\n【裁判裁决】\n"
                 f"- 综合得分：{json.dumps(judgment.scores, ensure_ascii=False)}\n"
-                f"- 辩手评分：{json.dumps(judgment.agent_scores, ensure_ascii=False)}\n"
+                f"- 辩手评分：{json.dumps(judgment.agent_scores, ensure_ascii=False)}\n")
+            if judgment.composite_scores:
+                judge_section += (
+                    f"- 综合评分（内容×{settings.JUDGE_CONTENT_WEIGHT} + "
+                    f"模型质量×{settings.JUDGE_PERFORMANCE_WEIGHT}）："
+                    f"{json.dumps(judgment.composite_scores, ensure_ascii=False)}\n")
+            judge_section += (
                 f"- 胜方：{judgment.winner}\n"
                 f"- 评语：{judgment.critique}")
         directive = ("所有 Agent 的任务已结束或已达最大轮次。请作为主持人，"
@@ -1012,6 +1151,10 @@ class Orchestrator:
             lines.append(f"- 得分：{json.dumps(judgment.scores, ensure_ascii=False)}")
             if judgment.agent_scores:
                 lines.append(f"- 辩手评分：{json.dumps(judgment.agent_scores, ensure_ascii=False)}")
+            if judgment.composite_scores:
+                lines.append(f"- 综合评分（内容×{settings.JUDGE_CONTENT_WEIGHT} + "
+                             f"模型质量×{settings.JUDGE_PERFORMANCE_WEIGHT}）："
+                             f"{json.dumps(judgment.composite_scores, ensure_ascii=False)}")
             if judgment.critique:
                 lines.append(f"- 评语：{judgment.critique}")
             lines.append("")
@@ -1071,6 +1214,16 @@ class Orchestrator:
             lines.append(f"- 胜方：{j.winner}")
             lines.append(f"- 收敛终止：{'是' if j.convergence_flag else '否'}")
             lines.append(f"- 评语：{j.critique}")
+            lines.append("")
+        if self.judgment and self.judgment.model_performance:
+            lines.append("## 模型性能与综合评分\n")
+            lines.append("| 辩手 | 平均TTFT | 平均生成速率 | 模型质量分 | 综合评分 |")
+            lines.append("| --- | --- | --- | --- | --- |")
+            for name, p in self.judgment.model_performance.items():
+                ttft = f"{p['avg_ttft_ms']}ms" if p.get("avg_ttft_ms") is not None else "N/A"
+                rate = f"{p['avg_gen_rate']}字/s" if p.get("avg_gen_rate") is not None else "N/A"
+                comp = self.judgment.composite_scores.get(name, "N/A")
+                lines.append(f"| {name} | {ttft} | {rate} | {p['performance_score']} | {comp} |")
             lines.append("")
         lines.append("## 任务结果\n")
         if self.tasks:
