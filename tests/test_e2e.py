@@ -5,7 +5,13 @@ test_e2e.py — 端到端测试：配置 -> 注入知识 -> 开始 -> WebSocket 
     python tests/test_e2e.py
 使用 agent_env 解释器运行。
 """
-import sys, os, json, time, threading, urllib.request, urllib.error
+import json
+import os
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 # 避免 localhost 走代理
@@ -19,7 +25,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 EXPORT_PATH = PROJECT_ROOT / "data" / "discussions" / "e2e_export.md"
 sys.stdout.reconfigure(encoding="utf-8")
 
-import websockets  # 必须在代理清理后导入
+import websockets  # noqa: E402 必须在代理清理后导入
 
 events = []
 ws_done = threading.Event()

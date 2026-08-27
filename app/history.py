@@ -32,7 +32,6 @@ from __future__ import annotations
 
 import json
 import time
-from pathlib import Path
 
 from app.config import PROJECT_ROOT
 
@@ -49,7 +48,7 @@ def _load() -> list:
     try:
         data = json.loads(INDEX_PATH.read_text(encoding="utf-8"))
         return data if isinstance(data, list) else []
-    except Exception:  # noqa
+    except Exception:
         return []
 
 
@@ -62,7 +61,7 @@ def _save(records: list):
 def record_discussion(topic: str = "", trace_id: str = "", filename: str = "",
                       status: str = "", phase: str = "", round_no: int = 0,
                       max_rounds: int = 0, token_spent: int = 0,
-                      token_budget: int = 0, agents: list = None) -> dict:
+                      token_budget: int = 0, agents: list | None = None) -> dict:
     """记录 / 更新一场讨论的记忆索引（按 filename 去重，新记录插入头部）。"""
     if not filename:
         return {}
@@ -124,5 +123,5 @@ def get_markdown(filename: str):
         return None
     try:
         return p.read_text(encoding="utf-8")
-    except Exception:  # noqa
+    except Exception:
         return None

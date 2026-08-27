@@ -1,0 +1,42 @@
+# 项目元信息与工程化配置
+# - requires-python：明确最低解释器版本（CI 使用 3.11，本地 agent_env 为 3.10）
+# - ruff：静态检查（Python lint / import 排序）
+# - mypy：类型检查（当前仅覆盖协议模型 app/protocol.py，全量开启为后续工作）
+# - coverage：测试覆盖率
+[project]
+name = "multi-agent-debate"
+version = "0.1.0"
+description = "多 Agent 圆桌辩论系统（Supervisor / Debater / Judge 状态机）"
+requires-python = ">=3.10"
+
+# 开发依赖见 requirements-dev.txt（ruff / mypy / coverage）
+
+[tool.ruff]
+target-version = "py310"
+line-length = 110
+
+[tool.ruff.lint]
+# E4/E7/E9/F：语法与真错误；I：import 排序；UP：现代语法（自动修复后全绿）
+select = ["E4", "E7", "E9", "F", "I", "UP", "RUF", "B", "S"]
+# BLE001：本项目刻意使用宽泛异常捕获做鲁棒降级（多处已带 # noqa 标注），
+#         在配置层统一放行，避免为历史代码逐处打标；
+# S110：  与 BLE001 同源（best-effort 读文件失败静默降级）；
+# RUF001/002/003：全角中文标点（：，。等）在源码/文档/注释中是刻意用法，
+#         属中文代码库误报，统一忽略。
+ignore = ["BLE001", "S110", "RUF001", "RUF002", "RUF003"]
+
+[tool.ruff.lint.per-file-ignores]
+# 测试文件允许 assert（S101）与本地 HTTP 测试端点（S310）
+"tests/*" = ["S101", "S310"]
+
+[tool.mypy]
+python_version = "3.10"
+files = ["app/protocol.py"]
+strict = true
+
+[tool.coverage.run]
+source = ["app"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true

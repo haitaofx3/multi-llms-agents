@@ -11,9 +11,10 @@ llm.py — 大语言模型统一接入层
 """
 import json
 import re
-from app.config import settings
 
 from openai import OpenAI
+
+from app.config import settings
 
 # 模型供应商预设
 PROVIDER_PRESETS = {
@@ -128,7 +129,7 @@ def _usage_from_response(resp) -> dict:
                 "completion_tokens": getattr(u, "completion_tokens", 0) or 0,
                 "total_tokens": getattr(u, "total_tokens", 0) or 0,
             }
-    except Exception:  # noqa
+    except Exception:
         pass
     return None
 

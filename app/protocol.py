@@ -17,7 +17,6 @@ protocol.py — 多 Agent 辩论系统消息协议（对齐《多Agent辩论系�
 from __future__ import annotations
 
 import time
-from typing import Dict, List
 from uuid import uuid4
 
 from pydantic import BaseModel, Field
@@ -52,7 +51,7 @@ class ArgumentSubmit(BaseModel):
     arg_id: str = Field(default_factory=new_uuid)
     agent_id: str = ""
     content: str = ""                # 论点正文（Markdown）
-    evidence_refs: List[str] = []    # RAG 证据 ID 列表（可选）
+    evidence_refs: list[str] = []    # RAG 证据 ID 列表（可选）
     confidence: float = 0.5          # 0.0-1.0 自我评估置信度
     round: int = 0
     token_cost: int = 0
@@ -62,20 +61,20 @@ class Rebuttal(BaseModel):
     """§3.3 反驳消息。"""
     target_arg_id: str = ""
     rebuttal_content: str = ""
-    logic_flaws: List[str] = []      # 逻辑谬误类型，如 ["StrawMan", "AdHominem"]
-    counter_evidence: List[str] = [] # 反证证据 ID
+    logic_flaws: list[str] = []      # 逻辑谬误类型，如 ["StrawMan", "AdHominem"]
+    counter_evidence: list[str] = [] # 反证证据 ID
 
 
 class Judgment(BaseModel):
     """§3.4 裁决消息。"""
-    scores: Dict[str, float] = {}    # 全局维度 {logic, evidence, rebuttal, clarity}
-    agent_scores: Dict[str, Dict[str, float]] = {}  # 各辩手评分 {辩手名: {logic, evidence, rebuttal, clarity}}
+    scores: dict[str, float] = {}    # 全局维度 {logic, evidence, rebuttal, clarity}
+    agent_scores: dict[str, dict[str, float]] = {}  # 各辩手评分 {辩手名: {logic, evidence, rebuttal, clarity}}
     # 模型质量实测（系统确定性计算，非 LLM 输出）：
     #   {辩手名: {avg_ttft_ms, avg_gen_rate, performance_score}}
-    model_performance: Dict[str, Dict[str, float]] = {}
+    model_performance: dict[str, dict[str, float]] = {}
     # 最终综合评分（内容分 × 内容权重 + 模型质量分 × 性能权重）：
     #   {辩手名: composite}
-    composite_scores: Dict[str, float] = {}
+    composite_scores: dict[str, float] = {}
     winner: str = "DRAW"             # PRO / CON / DRAW
     critique: str = ""
     convergence_flag: bool = False
@@ -86,7 +85,7 @@ class StatusSync(BaseModel):
     trace_id: str = ""
     phase: str = "idle"              # idle/preparing/debating/judging/finished
     current_round: int = 0
-    agent_states: Dict[str, str] = {}  # {name: IDLE/THINKING/WAITING}
+    agent_states: dict[str, str] = {}  # {name: IDLE/THINKING/WAITING}
     remaining_budget: int = 0
     spent_budget: int = 0
     elapsed_time_ms: int = 0

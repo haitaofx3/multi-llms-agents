@@ -13,6 +13,7 @@ import os
 import threading
 
 import numpy as np
+
 from app.config import settings
 from app.logger import log
 
@@ -33,7 +34,7 @@ def _model_cached(name: str) -> bool:
     try:
         from huggingface_hub.constants import HF_HUB_CACHE
         cache_root = HF_HUB_CACHE
-    except Exception:  # noqa
+    except Exception:
         cache_root = os.path.join(
             os.path.expanduser("~"), ".cache", "huggingface", "hub")
     repo = "models--" + name.replace("/", "--")
@@ -67,7 +68,7 @@ def _load_model():
             _model = SentenceTransformer(name, local_files_only=True)
             _dim = _model.get_sentence_embedding_dimension()
             log("info", "embeddings.load", "模型加载完成(本地缓存)", dim=_dim)
-        except Exception as e:  # noqa
+        except Exception as e:
             log("warning", "embeddings.fallback",
                 "本地模型不可用，启用哈希降级向量",
                 error=str(e), dim=settings.QDRANT_VECTOR_SIZE)

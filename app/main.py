@@ -9,7 +9,6 @@ main.py — FastAPI 应用入口（后端）
 统一由项目根目录的 start.py 启动（uvicorn）。
 """
 import asyncio
-import json
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -18,12 +17,19 @@ from fastapi import FastAPI, File, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from app.config import settings, PROJECT_ROOT
-from app.file_parser import ParseError, parse_file, split_paragraphs, SUPPORTED_EXTS
-from app.history import record_discussion, list_discussions, get_markdown
+from app.config import PROJECT_ROOT
+from app.file_parser import SUPPORTED_EXTS, ParseError, parse_file, split_paragraphs
+from app.history import get_markdown, list_discussions, record_discussion
 from app.llm import PROVIDER_PRESETS
-from app.vector_store import shared_vector_store
+from app.logger import log
 from app.orchestrator import orchestrator
+from app.schemas import (
+    ConfigureRequest,
+    IngestRequest,
+    SaveMarkdownRequest,
+    StartRequest,
+)
+from app.vector_store import shared_vector_store
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 DATA_DIR = PROJECT_ROOT / "data"
@@ -35,7 +41,42 @@ def _ts():
     return time.strftime("%Y%m%d_%H%M%S")
 
 
+# 持有所有后台 asyncio 任务的强引用，防止任务被 GC 提前回收（RUF006）
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _spawn_task(coro):
+    """创建并登记一个后台任务，任务结束后自动从集合移除。"""
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return task
+
+
 # ---------------- 启动：监听"完成"事件，自动保存 Markdown ----------------
+def _persist_done_markdown() -> str:
+    """讨论完成时把 Markdown 落盘并记录历史索引；返回文件名。"""
+    md = orchestrator.export_markdown()
+    fname = f"discussion_{_ts()}.md"
+    (DISCUSSIONS_DIR / fname).write_text(md, encoding="utf-8")
+    # 历史讨论题目记忆化保存（供后续检索）
+    record_discussion(
+        topic=orchestrator.topic,
+        trace_id=orchestrator.trace_id,
+        filename=fname,
+        status=orchestrator.status,
+        phase=orchestrator.phase,
+        round_no=orchestrator.round,
+        max_rounds=orchestrator.max_rounds,
+        token_spent=orchestrator.spent,
+        token_budget=orchestrator.budget,
+        agents=[{"name": a.name, "role": a.role,
+                 "stance": a.stance, "is_main": a.is_main}
+                for a in orchestrator.agents],
+    )
+    return fname
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     q = orchestrator.event_bus.subscribe()
@@ -44,27 +85,14 @@ async def lifespan(app: FastAPI):
         while True:
             ev = await q.get()
             if ev.get("type") == "status" and ev.get("status") == "done":
-                try:
-                    md = orchestrator.export_markdown()
-                    fname = f"discussion_{_ts()}.md"
-                    (DISCUSSIONS_DIR / fname).write_text(md, encoding="utf-8")
-                    # 历史讨论题目记忆化保存（供后续检索）
-                    record_discussion(
-                        topic=orchestrator.topic,
-                        trace_id=orchestrator.trace_id,
-                        filename=fname,
-                        status=orchestrator.status,
-                        phase=orchestrator.phase,
-                        round_no=orchestrator.round,
-                        max_rounds=orchestrator.max_rounds,
-                        token_spent=orchestrator.spent,
-                        token_budget=orchestrator.budget,
-                        agents=[{"name": a.name, "role": a.role,
-                                 "stance": a.stance, "is_main": a.is_main}
-                                for a in orchestrator.agents],
-                    )
-                except Exception:
-                    pass
+                # 落盘失败不静默吞掉：记录日志并重试一次（写入/索引均为幂等操作）
+                for attempt in (1, 2):
+                    try:
+                        _persist_done_markdown()
+                        break
+                    except Exception as e:
+                        log("error", "lifespan.save_markdown",
+                            f"讨论落盘失败（第 {attempt} 次）", error=str(e))
 
     task = asyncio.create_task(_listener())
     yield
@@ -106,19 +134,19 @@ async def defaults():
 
 # ---------------- 配置 Agent ----------------
 @app.post("/api/configure")
-async def configure(payload: dict):
+async def configure(payload: ConfigureRequest):
     if orchestrator.status == "running":
         return JSONResponse(
             {"ok": False, "error": "讨论进行中，请先结束或等待后再重新配置"},
             status_code=409,
         )
-    agents = payload.get("agents", [])
+    agents = [a.model_dump() for a in payload.agents]
     if not (1 <= len(agents) <= 6):
         return JSONResponse({"ok": False, "error": "Agent 数量需在 1-6 之间"}, status_code=400)
-    topic = payload.get("topic", "")
-    max_rounds = int(payload.get("max_rounds", 8))
-    budget = payload.get("budget")
-    judge_config = payload.get("judge") or {}
+    topic = payload.topic
+    max_rounds = payload.max_rounds
+    budget = payload.budget
+    judge_config = payload.judge or {}
     try:
         orchestrator.configure(agents, topic=topic, max_rounds=max_rounds,
                                judge_config=judge_config)
@@ -142,9 +170,9 @@ async def configure(payload: dict):
 
 # ---------------- 注入共享知识 ----------------
 @app.post("/api/ingest")
-async def ingest(payload: dict):
-    text = payload.get("text", "").strip()
-    source = payload.get("source", "用户注入")
+async def ingest(payload: IngestRequest):
+    text = payload.text.strip()
+    source = payload.source or "用户注入"
     if not text:
         return JSONResponse({"ok": False, "error": "文本为空"}, status_code=400)
     # 按段落切分
@@ -157,7 +185,7 @@ async def ingest(payload: dict):
 
 # ---------------- 上传文件解析并注入共享知识 ----------------
 @app.post("/api/upload")
-async def upload_file(file: UploadFile = File(...)):
+async def upload_file(file: UploadFile = File(...)):  # noqa: B008  FastAPI 标准注入写法
     """上传文档 / 表格 / PDF / 图片，解析为文本后注入共享向量库。"""
     try:
         data = await file.read()
@@ -190,15 +218,16 @@ async def upload_file(file: UploadFile = File(...)):
 
 # ---------------- 开始讨论 ----------------
 @app.post("/api/start")
-async def start(payload: dict):
+async def start(payload: StartRequest = None):
     if orchestrator.status == "running":
         return JSONResponse({"ok": False, "error": "讨论进行中，请先结束或等待"}, status_code=400)
     if not orchestrator.agents:
         return JSONResponse({"ok": False, "error": "请先配置 Agent"}, status_code=400)
-    topic = payload.get("topic") or orchestrator.topic
-    max_rounds = payload.get("max_rounds")
-    budget = payload.get("budget")
-    asyncio.create_task(orchestrator.run_discussion(
+    payload = payload or StartRequest()
+    topic = payload.topic or orchestrator.topic
+    max_rounds = payload.max_rounds
+    budget = payload.budget
+    _spawn_task(orchestrator.run_discussion(
         topic=topic, max_rounds=max_rounds, budget=budget))
     return {
         "ok": True,
@@ -252,6 +281,21 @@ async def status():
 
 
 # ---------------- 导出 Markdown ----------------
+def _safe_discussion_filename(fname: str) -> str:
+    """清洗讨论导出文件名，防路径穿越。
+
+    只保留 basename（丢弃目录部分 / 绝对路径 / `..`），并强制 `.md` 后缀；
+    清洗后为空则回退为自动生成的默认文件名。
+    """
+    if fname:
+        fname = Path(fname).name
+    if not fname:
+        fname = f"discussion_{_ts()}.md"
+    if not fname.endswith(".md"):
+        fname += ".md"
+    return fname
+
+
 @app.get("/api/export")
 async def export():
     md = orchestrator.export_markdown()
@@ -259,13 +303,10 @@ async def export():
 
 
 @app.post("/api/save_markdown")
-async def save_markdown(payload: dict = None):
+async def save_markdown(payload: SaveMarkdownRequest = None):
     md = orchestrator.export_markdown()
-    fname = payload.get("filename") if payload else None
-    if not fname:
-        fname = f"discussion_{_ts()}.md"
-    if not fname.endswith(".md"):
-        fname += ".md"
+    payload = payload or SaveMarkdownRequest()
+    fname = _safe_discussion_filename(payload.filename)
     path = DISCUSSIONS_DIR / fname
     path.write_text(md, encoding="utf-8")
     # 历史讨论题目记忆化保存（供后续检索）
@@ -323,7 +364,7 @@ async def ws_endpoint(websocket: WebSocket):
         while True:
             event = await q.get()
             await websocket.send_json(event)
-    except (WebSocketDisconnect, Exception):  # noqa
+    except (WebSocketDisconnect, Exception):
         pass
     finally:
         orchestrator.event_bus.unsubscribe(q)

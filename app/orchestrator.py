@@ -21,7 +21,7 @@ import time
 from app.agent import Agent
 from app.config import settings
 from app.llm import chat, chat_stream
-from app.protocol import new_trace_id, new_uuid, now_ms, Judgment
+from app.protocol import Judgment, new_trace_id, new_uuid, now_ms
 from app.rag import rag_service
 
 # ---- 专用工具 schema（任务分派 / 回报） ----
@@ -87,6 +87,18 @@ class EventBus:
             self.subs.remove(q)
 
 
+# 持有事件推送等后台 asyncio 任务的强引用，防止任务被 GC 提前回收（RUF006）
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _spawn_task(coro):
+    """创建并登记一个后台任务，任务结束后自动从集合移除。"""
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return task
+
+
 class Orchestrator:
     def __init__(self):
         self.agents = []
@@ -125,7 +137,7 @@ class Orchestrator:
 
     # ---------------- 配置 ----------------
     def configure(self, agent_configs: list, topic: str = "", max_rounds: int = 8,
-                  judge_config: dict = None):
+                  judge_config: dict | None = None):
         if self.status == "running":
             raise ValueError("讨论进行中，请先结束或等待后再重新配置")
         self.agents = []
@@ -228,19 +240,19 @@ class Orchestrator:
         if self.status == "running":
             self.status = "paused"
             self._pause_event.clear()
-            asyncio.create_task(self.event_bus.publish(self._status_event()))
+            _spawn_task(self.event_bus.publish(self._status_event()))
 
     def resume(self):
         if self.status == "paused":
             self.status = "running"
             self._pause_event.set()
-            asyncio.create_task(self.event_bus.publish(self._status_event()))
+            _spawn_task(self.event_bus.publish(self._status_event()))
 
     def end(self):
         if self.status in ("running", "paused"):
             self.status = "stopped"
             self._pause_event.set()
-            asyncio.create_task(self.event_bus.publish(self._status_event()))
+            _spawn_task(self.event_bus.publish(self._status_event()))
 
     # ---------------- 任务状态文本 ----------------
     def _task_status_text(self):
@@ -258,7 +270,7 @@ class Orchestrator:
         from app.logger import log, set_trace_id
         set_trace_id(self.trace_id)
         log(level, event or "orchestrator.event", text, trace_id=self.trace_id)
-        asyncio.create_task(self.event_bus.publish({
+        _spawn_task(self.event_bus.publish({
             "type": "log", "text": f"[{self.trace_id}] {text}",
             "level": level, "event": event or "orchestrator.event",
         }))
@@ -281,7 +293,7 @@ class Orchestrator:
             try:
                 for ev in chat_stream(messages, model_config, tools):
                     loop.call_soon_threadsafe(q.put_nowait, ev)
-            except Exception as e:  # noqa
+            except Exception as e:
                 loop.call_soon_threadsafe(q.put_nowait, {"type": "error", "error": str(e)})
 
         threading.Thread(target=_run, daemon=True).start()
@@ -310,7 +322,7 @@ class Orchestrator:
         try:
             return await asyncio.wait_for(_drain(), timeout=settings.STREAM_TIMEOUT)
         except asyncio.TimeoutError:
-            raise RuntimeError(f"流式响应超时（>{settings.STREAM_TIMEOUT}s）")
+            raise RuntimeError(f"流式响应超时（>{settings.STREAM_TIMEOUT}s）") from None
 
     async def _run_llm_retry(self, messages, model_config, tools=None, temperature=0.7):
         """带指数退避重试的非流式 LLM 调用（架构文档 §4.5：重试 2 次，间隔 1s/3s）。"""
@@ -320,7 +332,7 @@ class Orchestrator:
             try:
                 return await asyncio.to_thread(
                     chat, messages, model_config, tools, temperature=temperature)
-            except Exception as e:  # noqa
+            except Exception as e:
                 last_exc = e
                 if attempt >= len(delays):
                     break
@@ -346,14 +358,15 @@ class Orchestrator:
         sys_prompt = agent.system_prompt(
             collaborators_meta, self.shared_context, self._task_status_text(),
             mode, self.topic)
-        messages = [{"role": "system", "content": sys_prompt}] + list(agent.history) + \
-                   [{"role": "user", "content": user_msg}]
+        messages = [{"role": "system", "content": sys_prompt},
+                    *list(agent.history),
+                    {"role": "user", "content": user_msg}]
 
         tools = agent.mcp.schemas()
         if agent.is_main and allow_delegate:
-            tools = tools + [DELEGATE_SCHEMA]
+            tools = [*tools, DELEGATE_SCHEMA]
         elif (not agent.is_main) and mode == "task":
-            tools = tools + [REPORT_SCHEMA]
+            tools = [*tools, REPORT_SCHEMA]
 
         content = ""
         delegate = []
@@ -383,7 +396,7 @@ class Orchestrator:
                     try:
                         result = await self._consume_stream(
                             messages, agent.model_config, tools, _emit_delta)
-                    except Exception as e:  # noqa
+                    except Exception as e:
                         self._log(f"[LLM流式失败:{agent.name}] {e}，回退非流式",
                                   level="warning", event="llm.stream_fallback")
                         result = await self._run_llm_retry(
@@ -391,7 +404,7 @@ class Orchestrator:
                 else:
                     result = await self._run_llm_retry(
                         messages, agent.model_config, tools)
-            except Exception as e:  # noqa
+            except Exception as e:
                 msg = f"[LLM错误:{agent.name}] {e}"
                 self._log(msg, level="error", event="llm.error")
                 # 把错误同步推送到前端（醒目的错误气泡），避免只在控制台可见
@@ -472,10 +485,10 @@ class Orchestrator:
                      "明确任务内容与期望效果，并提供接收结果的变量名(var_name)；"
                      "你也可以先陈述你的开场立场（作为主持人保持中立公正）。")
         else:
-            base += ("这是辩论第 %d 轮。请基于各方上一轮发言与已回填的任务结果，"
+            base += (f"这是辩论第 {round} 轮。请基于各方上一轮发言与已回填的任务结果，"
                      "以主持人身份抛出疑问、要求补充论据、指出分歧或让某方进一步论证；"
                      "可通过 delegate_task 追加追问任务，或直接发言引发交锋。"
-                     "请至少提出一个有针对性的质疑，推动多轮辩论。" % round)
+                     "请至少提出一个有针对性的质疑，推动多轮辩论。")
             if pending_exists:
                 base += "\n（提示：仍存在未完成任务，请先审视其进展。）"
         return base
@@ -590,7 +603,7 @@ class Orchestrator:
         combined = "\n".join(texts)
         try:
             evidence = await asyncio.to_thread(rag_service.check, combined, 3)
-        except Exception as e:  # noqa
+        except Exception as e:
             self._log(f"[RAG核查失败] {e}", level="warning", event="rag.fail")
             return
         if evidence:
@@ -608,12 +621,13 @@ class Orchestrator:
             return False
         try:
             import numpy as np
+
             from app.embeddings import embed_query
             v_cur = np.array(embed_query(cur))
             v_prev = np.array(embed_query(prev))
             sim = float(np.dot(v_cur, v_prev) /
                         (np.linalg.norm(v_cur) * np.linalg.norm(v_prev) + 1e-9))
-        except Exception:  # noqa
+        except Exception:
             return False
         # 新证据检测：本轮 RAG 若返回了新证据，则不视为无效循环
         has_new_evidence = bool(self.round_evidence.get(self.round))
@@ -627,7 +641,8 @@ class Orchestrator:
         return self.convergence_streak >= settings.CONVERGENCE_ROUNDS
 
     # ---------------- 讨论主循环 ----------------
-    async def run_discussion(self, topic: str = "", max_rounds: int = None, budget: int = None):
+    async def run_discussion(self, topic: str = "", max_rounds: int | None = None,
+                             budget: int | None = None):
         if self.status == "running":
             return
         if max_rounds is not None:
@@ -794,7 +809,7 @@ class Orchestrator:
                 self.status = "done"
                 await self.event_bus.publish({"type": "status", "status": "done", "phase": self.phase})
                 await self.event_bus.publish(self._status_sync())
-        except Exception as e:  # noqa
+        except Exception as e:
             self._log(f"[编排器错误] {e}", level="error", event="orchestrator.error")
             self.status = "stopped"
             self.phase = "idle"  # 异常熔断回到 Idle（架构文档 §4.1）
@@ -975,7 +990,7 @@ class Orchestrator:
             judgment = Judgment(**data)
             # 系统确定性模型质量分 + 综合评分，并据此推导胜方
             judgment = self._compute_composite(judgment)
-        except Exception as e:  # noqa
+        except Exception as e:
             self._log(f"[裁判调用失败] {e}", level="error", event="judge.fail")
             judgment = self._compute_composite(Judgment(
                 winner="DRAW", critique=f"裁判调用失败：{e}",
@@ -1057,7 +1072,7 @@ class Orchestrator:
                         self.spent += int(total)
                         self.run_stats["compressions"] = \
                             self.run_stats.get("compressions", 0) + 1
-            except Exception:  # noqa
+            except Exception:
                 pass
 
     # ---------------- 控制状态事件（暂停/继续/结束 后推送给前端） ----------------
@@ -1135,7 +1150,7 @@ class Orchestrator:
     def _fallback_summary(self, judgment=None) -> str:
         """预算硬熔断时的确定性汇总：不调用 LLM，直接基于发言记录与裁决拼装报告。"""
         lines = []
-        lines.append(f"## 最终讨论报告（预算耗尽自动汇总）\n")
+        lines.append("## 最终讨论报告（预算耗尽自动汇总）\n")
         lines.append(f"- 主题：{self.topic}")
         lines.append(f"- 实际轮次：{self.round}/{self.max_rounds}")
         lines.append(f"- Token 用量：{self.spent} / 预算：{self.budget}")
@@ -1165,14 +1180,14 @@ class Orchestrator:
     # ---------------- 导出 Markdown ----------------
     def export_markdown(self) -> str:
         lines = []
-        lines.append(f"# 多 Agent 辩论记录\n")
+        lines.append("# 多 Agent 辩论记录\n")
         lines.append(f"- 主题：{self.topic}")
         lines.append(f"- 轮次：{self.round}/{self.max_rounds}")
         lines.append(f"- 状态：{self.status} / 阶段：{self.phase}")
         lines.append(f"- Trace ID：{self.trace_id}")
         lines.append(f"- Token 用量：{self.spent} / 预算：{self.budget}")
         lines.append(f"- 时间：{time.strftime('%Y-%m-%d %H:%M:%S')}")
-        lines.append(f"- 参与 Agent：")
+        lines.append("- 参与 Agent：")
         for a in self.agents:
             tag = "（主）" if a.is_main else ""
             lines.append(f"  - {a.name}{tag} | 角色：{a.role} | 立场："
@@ -1188,9 +1203,10 @@ class Orchestrator:
             if self.run_stats.get("started_at") else 0.0
         conv_flag = self.convergence_streak >= settings.CONVERGENCE_ROUNDS
         done_tasks = sum(1 for t in self.tasks if t["completed"])
+        conv_text = f"是（连续{self.convergence_streak}轮相似）" if conv_flag else "否"
         lines.append(f"- 持续时间：{elapsed:.1f} 秒")
         lines.append(f"- 实际轮次：{self.round}/{self.max_rounds}")
-        lines.append(f"- 收敛触发：{'是（连续%d轮相似）' % self.convergence_streak if conv_flag else '否'}")
+        lines.append(f"- 收敛触发：{conv_text}")
         lines.append(f"- RAG 证据轮数：{len(self.round_evidence)}")
         lines.append(f"- 任务：{len(self.tasks)}（完成 {done_tasks}）")
         lines.append(f"- 历史压缩次数：{self.run_stats.get('compressions', 0)}")

@@ -2,32 +2,34 @@
 # 若需重新安装，可使用：
 #   conda activate agent_env
 #   pip install -r requirements.txt
+#
+# 版本约束为「最低可用版本」（>=），防止新环境装出明显过旧的组合；
+# 完整锁定版本可选 pip-tools / uv：pip install pip-tools && pip-compile requirements.in
 
 # Web 框架
-fastapi
-uvicorn
-websockets
+fastapi>=0.100
+uvicorn>=0.23
+websockets>=12.0
 
-# LLM（OpenAI 兼容协议：DeepSeek / Qwen 等）
-openai
+# LLM（OpenAI 兼容协议：DeepSeek / Qwen / MiMo 等）
+openai>=1.0
 
-# 数据校验 / 协议模型（protocol.py）
-pydantic
+# 数据校验 / 协议模型（protocol.py / schemas.py）
+pydantic>=2.0
 
 # 向量数据库（可选；不可用时自动降级为内存向量库）
-qdrant-client
+qdrant-client>=1.9
 
 # 嵌入模型（本地 sentence-transformers）
-sentence-transformers
+sentence-transformers>=2.6
 
 # 工具 / 其他
-httpx
-numpy
+httpx>=0.27
+numpy>=1.24
 
 # 文件解析（共享知识库文件上传）
-python-docx        # .docx
-openpyxl           # .xlsx
-pypdf              # .pdf
-rapidocr-onnxruntime  # 图片 OCR（体积较大，可选；缺失时上传图片会给出提示）
-pillow             # 图片读取（OCR 依赖）
-
+python-docx>=1.1        # .docx
+openpyxl>=3.1           # .xlsx
+pypdf>=3.17             # .pdf
+rapidocr-onnxruntime>=1.3  # 图片 OCR（体积较大，可选；缺失时上传图片会给出提示）
+pillow>=9.0             # 图片读取（OCR 依赖）

@@ -25,7 +25,13 @@ jobs:
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install numpy pydantic openai
+          pip install numpy pydantic openai fastapi httpx ruff mypy
+
+      - name: Lint (ruff)
+        run: python -m ruff check app tests
+
+      - name: Type check (mypy, app/protocol.py)
+        run: python -m mypy
 
       - name: Build check (Python byte-compile)
         run: python -m compileall -q app
@@ -36,6 +42,10 @@ jobs:
       # 无需真实 LLM API 的确定性单元测试（暂停/继续/结束控制流 + 手动结束收尾）
       - name: Run fast unit tests
         run: python -m unittest tests.test_ci_fast -v
+
+      # 接口级集成测试：走 ASGITransport 驱动完整 HTTP 流程，LLM 调用点已替换为桩
+      - name: Run API flow tests
+        run: python -m unittest tests.test_api_flow -v
 
       # tests/test_e2e.py 需要启动服务器 + 真实 LLM API，且单次调用 >90s，
       # 不适合作为常规 CI 检查；如需可在此处手动触发。

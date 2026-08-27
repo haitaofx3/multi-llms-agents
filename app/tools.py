@@ -13,8 +13,9 @@ tools.py — 每个 Agent 的 MCP 工具对象
 任务分派/回报由 orchestrator 通过专用工具(intercept)处理。
 """
 import json
-import urllib.request
 import urllib.parse
+import urllib.request
+
 from app.config import settings
 from app.vector_store import shared_vector_store
 
@@ -31,7 +32,7 @@ class Tool:
     def run(self, **kwargs) -> str:
         try:
             return str(self.run_fn(**kwargs))
-        except Exception as e:  # noqa
+        except Exception as e:
             return f"[工具执行出错] {e}"
 
     def schema(self) -> dict:
@@ -98,7 +99,7 @@ def _web_search(query: str, top_k: int = 5) -> str:
     url = "https://serpapi.com/search?" + urllib.parse.urlencode(params)
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=15) as resp:
+        with urllib.request.urlopen(req, timeout=15) as resp:  # noqa: S310 固定 https 主机 serpapi.com，非用户输入
             data = json.loads(resp.read().decode("utf-8"))
         results = data.get("organic_results", [])[:top_k]
         if not results:
@@ -107,7 +108,7 @@ def _web_search(query: str, top_k: int = 5) -> str:
         for i, r in enumerate(results, 1):
             lines.append(f"[{i}] {r.get('title','')} | {r.get('snippet','')} | {r.get('link','')}")
         return "联网搜索结果：\n" + "\n".join(lines)
-    except Exception as e:  # noqa
+    except Exception as e:
         return f"（联网搜索失败：{e}）"
 
 

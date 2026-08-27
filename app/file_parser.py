@@ -62,11 +62,11 @@ def _parse_docx(data: bytes) -> str:
     try:
         import docx  # python-docx
     except ImportError:
-        raise ParseError("解析 .docx 需要 python-docx，请执行 pip install python-docx")
+        raise ParseError("解析 .docx 需要 python-docx，请执行 pip install python-docx") from None
     try:
         document = docx.Document(io.BytesIO(data))
-    except Exception:
-        raise ParseError("无法解析该 .docx 文件（可能已损坏或不是 Word 文档）")
+    except Exception as e:
+        raise ParseError("无法解析该 .docx 文件（可能已损坏或不是 Word 文档）") from e
 
     lines = []
     # 正文段落
@@ -87,11 +87,11 @@ def _parse_xlsx(data: bytes) -> str:
     try:
         import openpyxl
     except ImportError:
-        raise ParseError("解析 .xlsx 需要 openpyxl，请执行 pip install openpyxl")
+        raise ParseError("解析 .xlsx 需要 openpyxl，请执行 pip install openpyxl") from None
     try:
         wb = openpyxl.load_workbook(io.BytesIO(data), read_only=True, data_only=True)
-    except Exception:
-        raise ParseError("无法解析该 .xlsx 文件（可能已损坏或不是 Excel 表格）")
+    except Exception as e:
+        raise ParseError("无法解析该 .xlsx 文件（可能已损坏或不是 Excel 表格）") from e
 
     lines = []
     for sheet in wb.worksheets:
@@ -108,11 +108,11 @@ def _parse_pdf(data: bytes) -> str:
     try:
         from pypdf import PdfReader
     except ImportError:
-        raise ParseError("解析 .pdf 需要 pypdf，请执行 pip install pypdf")
+        raise ParseError("解析 .pdf 需要 pypdf，请执行 pip install pypdf") from None
     try:
         reader = PdfReader(io.BytesIO(data))
-    except Exception:
-        raise ParseError("无法解析该 .pdf 文件（可能已损坏、加密或不是 PDF）")
+    except Exception as e:
+        raise ParseError("无法解析该 .pdf 文件（可能已损坏、加密或不是 PDF）") from e
 
     lines = []
     for i, page in enumerate(reader.pages, 1):
@@ -120,7 +120,7 @@ def _parse_pdf(data: bytes) -> str:
             t = page.extract_text() or ""
         except Exception:
             t = ""
-        t = "\n".join(l.strip() for l in t.splitlines() if l.strip())
+        t = "\n".join(line.strip() for line in t.splitlines() if line.strip())
         if t:
             lines.append(f"## 第 {i} 页\n{t}")
     return "\n\n".join(lines)
@@ -136,11 +136,11 @@ def _get_ocr():
     try:
         from rapidocr_onnxruntime import RapidOCR
     except ImportError:
-        raise ParseError("解析图片需要 RapidOCR，请执行 pip install rapidocr_onnxruntime")
+        raise ParseError("解析图片需要 RapidOCR，请执行 pip install rapidocr_onnxruntime") from None
     try:
         _OCR = RapidOCR()
     except Exception as e:
-        raise ParseError(f"RapidOCR 初始化失败：{e}")
+        raise ParseError(f"RapidOCR 初始化失败：{e}") from e
     return _OCR
 
 
@@ -149,17 +149,17 @@ def _parse_image(data: bytes) -> str:
     try:
         from PIL import Image
     except ImportError:
-        raise ParseError("解析图片需要 Pillow，请执行 pip install pillow")
+        raise ParseError("解析图片需要 Pillow，请执行 pip install pillow") from None
 
     try:
         img = Image.open(io.BytesIO(data)).convert("RGB")
-    except Exception:
-        raise ParseError("无法解析该图片文件（格式不受支持或已损坏）")
+    except Exception as e:
+        raise ParseError("无法解析该图片文件（格式不受支持或已损坏）") from e
 
     try:
         result, _ = _get_ocr()(np.array(img))
     except Exception as e:
-        raise ParseError(f"OCR 识别失败：{e}")
+        raise ParseError(f"OCR 识别失败：{e}") from e
     if not result:
         return ""
     return "\n".join(str(item[1]) for item in result)

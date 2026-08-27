@@ -1,0 +1,9 @@
+# 开发 / 质量工具依赖（安装：pip install -r requirements-dev.txt）
+-r requirements.txt
+
+# 静态检查（PyPI 轻量 wheel，无重型依赖）
+ruff>=0.5
+mypy>=1.10
+
+# 测试覆盖率（可与 unittest 搭配：coverage run -m unittest discover tests）
+coverage>=7.0

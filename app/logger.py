@@ -28,7 +28,7 @@ for _stream in (sys.stdout, sys.stderr):
     try:
         if hasattr(_stream, "reconfigure"):
             _stream.reconfigure(encoding="utf-8")
-    except Exception:  # noqa 某些环境（如已关闭的流）可能不支持
+    except Exception:
         pass
 
 # 线程级上下文：trace_id 随运行线程传递（FastAPI 单线程处理请求/事件循环场景足够）

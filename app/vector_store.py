@@ -13,9 +13,11 @@ vector_store.py — 多 Agent 共享的向量知识库
 提供：add(texts, metas) 与 search(query, top_k)。
 """
 import threading
+
 import numpy as np
+
 from app.config import settings
-from app.embeddings import embed, embed_query, dim, start_background_warmup
+from app.embeddings import dim, embed, embed_query, start_background_warmup
 from app.logger import log
 
 
@@ -29,7 +31,7 @@ class _InMemoryStore:
     def add(self, texts, metas):
         vecs = embed(texts)
         with self.lock:
-            for t, v, m in zip(texts, vecs, metas):
+            for t, v, m in zip(texts, vecs, metas, strict=False):
                 self._id += 1
                 self.items.append((np.array(v, dtype="float32"),
                                    {**m, "text": t, "id": self._id}))
@@ -75,7 +77,7 @@ class _QdrantStore:
         from qdrant_client.models import PointStruct
         vecs = embed(texts)
         points = []
-        for i, (t, v, m) in enumerate(zip(texts, vecs, metas)):
+        for i, (t, v, m) in enumerate(zip(texts, vecs, metas, strict=False)):
             points.append(PointStruct(
                 id=abs(hash(t + str(i))) % (2 ** 63),
                 vector=v,
@@ -134,7 +136,7 @@ class SharedVectorStore:
             return
         try:
             store = _QdrantStore()
-        except Exception as e:  # noqa
+        except Exception as e:
             log("warning", "vector_store.fallback",
                 "Qdrant 初始化失败，使用进程内内存向量库",
                 backend="in-memory", error=str(e))

@@ -10,9 +10,8 @@ agent.py — Agent 定义
 
 第一个被创建的 agent 为主 agent(main)，其余为协作 agent。
 """
-from pathlib import Path
 
-from app.config import settings, PROJECT_ROOT
+from app.config import PROJECT_ROOT, settings
 from app.memory import MemorySystem
 from app.tools import build_default_tools
 
@@ -156,6 +155,7 @@ class Agent:
         """生成摘要文本，返回 (summary, usage|None)。"""
         try:
             import asyncio
+
             from app.llm import chat
             joined = "\n".join(texts)
             messages = [
@@ -169,7 +169,7 @@ class Agent:
             content = (result.get("content") or "").strip()
             if content:
                 return content, result.get("usage") or {}
-        except Exception:  # noqa
+        except Exception:
             pass
         return self._naive_summary(texts), None
 

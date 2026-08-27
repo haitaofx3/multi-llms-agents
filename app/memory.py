@@ -16,13 +16,11 @@ memory.py — 每个 Agent 的记忆系统
 """
 import json
 import re
-import time
 import threading
+import time
 from pathlib import Path
 
 import numpy as np
-
-from app.config import settings
 
 DEFAULT_FORGET_CONFIG = {
     "short_capacity": 24,     # 短期记忆最大条数
@@ -49,7 +47,7 @@ def _tokenize(text: str) -> set:
 
 
 class MemorySystem:
-    def __init__(self, agent_id: str, memory_dir: Path, forget_config: dict = None):
+    def __init__(self, agent_id: str, memory_dir: Path, forget_config: dict | None = None):
         self.agent_id = agent_id
         self.dir = Path(memory_dir) / agent_id
         self.dir.mkdir(parents=True, exist_ok=True)
@@ -104,7 +102,7 @@ class MemorySystem:
         try:
             from app.embeddings import embed_query
             return embed_query(text)
-        except Exception:  # noqa
+        except Exception:
             return None
 
     def _batch_embed(self, texts):
@@ -114,7 +112,7 @@ class MemorySystem:
         try:
             from app.embeddings import embed
             return embed(texts)
-        except Exception:  # noqa
+        except Exception:
             return None
 
     # ---------------- 写入 ----------------
@@ -170,7 +168,7 @@ class MemorySystem:
             self.long_term.append({**item, "ts": self._now(), "access": 1})
             self._trim("long_term", self.forget["long_capacity"])
 
-    def promote_short_to_long(self, min_importance: float = None):
+    def promote_short_to_long(self, min_importance: float | None = None):
         """把重要性达标的短期记忆提升为长期记忆。"""
         thr = min_importance if min_importance is not None else self.forget["promote_importance"]
         promoted = []
@@ -302,7 +300,7 @@ class MemorySystem:
             vecs = self._batch_embed([it["text"] for it in missing])
             if vecs:
                 with self.lock:
-                    for it, v in zip(missing, vecs):
+                    for it, v in zip(missing, vecs, strict=False):
                         it["embedding"] = v
 
         qv = np.array(q_vec, dtype="float32") if q_vec is not None else None
@@ -316,7 +314,7 @@ class MemorySystem:
                     sim = float(np.dot(qv, v) /
                                 (np.linalg.norm(qv) * np.linalg.norm(v) + 1e-9))
                     sem = max(0.0, sim)  # 余弦可为负，截断避免惩罚
-                except Exception:  # noqa
+                except Exception:
                     sem = 0.0
             t_text = _tokenize(it.get("text", ""))
             kw = len(q_tokens & t_text) / max(1, len(q_tokens))

@@ -13,12 +13,11 @@ rag.py — 独立 RAG 核查服务（对齐《多Agent辩论系统架构设计�
 from __future__ import annotations
 
 import re
-import time
 import threading
-from typing import List
+import time
 
-from app.vector_store import shared_vector_store
 from app.protocol import EvidenceItem
+from app.vector_store import shared_vector_store
 
 _CACHE_TTL = 24 * 3600  # 24h
 
@@ -32,7 +31,7 @@ class RAGService:
         self._lock = threading.Lock()
 
     # ---------------- 断言提取 ----------------
-    def extract_claims(self, text: str, max_claims: int = 5) -> List[str]:
+    def extract_claims(self, text: str, max_claims: int = 5) -> list[str]:
         """按标点把文本切分为候选事实断言。"""
         if not text:
             return []
@@ -49,7 +48,7 @@ class RAGService:
         return claims
 
     # ---------------- 核查 ----------------
-    def check(self, text: str, top_k: int = None) -> List[EvidenceItem]:
+    def check(self, text: str, top_k: int | None = None) -> list[EvidenceItem]:
         """对一段辩论文本做事实核查，返回证据列表（已按置信度降序去重）。"""
         top_k = top_k or self.top_k
         claims = self.extract_claims(text)
@@ -69,7 +68,7 @@ class RAGService:
         return results[:top_k]
 
     # ---------------- 带缓存的检索 ----------------
-    def _search_cached(self, query: str, top_k: int) -> List[EvidenceItem]:
+    def _search_cached(self, query: str, top_k: int) -> list[EvidenceItem]:
         key = f"rag:{abs(hash(query))}"
         now = time.time()
         with self._lock:
@@ -98,17 +97,18 @@ class RAGService:
     def _score_of(hit: dict) -> float:
         """无显式分数时的近似置信度：命中文本长度越接近查询意图，置信度越高。"""
         try:
-            from app.embeddings import embed_query
             import numpy as np
+
+            from app.embeddings import embed_query
             q = np.array(embed_query(hit.get("text", "")))
             v = np.array(embed_query(hit.get("text", "")))
             _ = q, v  # placeholder：完整打分由向量库返回，这里统一返回 0.8
-        except Exception:  # noqa
+        except Exception:
             pass
         return 0.8
 
     # ---------------- 上下文注入 ----------------
-    def evidence_text(self, items: List[EvidenceItem]) -> str:
+    def evidence_text(self, items: list[EvidenceItem]) -> str:
         """把证据列表格式化为可注入 prompt 的文本。"""
         if not items:
             return ""
