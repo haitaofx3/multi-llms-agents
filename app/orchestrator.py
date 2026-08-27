@@ -123,6 +123,7 @@ class Orchestrator:
         # ---- 预算（架构文档 §6.3） ----
         self.budget = settings.TOKEN_BUDGET
         self.spent = 0
+        self.max_tokens = settings.MAX_TOKENS  # 单次模型输出上限（全局）
 
         # ---- 辩论状态 ----
         self._started_at = None
@@ -132,12 +133,13 @@ class Orchestrator:
         self.round_evidence = {}      # round -> {speaker: [EvidenceItem]}
         self.judgment = None
         self.last_main_message = ""
+        self.last_debate_speaker = None  # 上一轮/上一位实际发言的辩手（用于针对性反驳）
         self.run_stats = {"compressions": 0}  # 运行摘要统计（优化 A4）
         self.agent_metrics = {}  # 模型质量指标（流式发言实测）：{name: {calls, ttft_sum, gen_sum, chars}}
 
     # ---------------- 配置 ----------------
     def configure(self, agent_configs: list, topic: str = "", max_rounds: int = 8,
-                  judge_config: dict | None = None):
+                  judge_config: dict | None = None, max_tokens: int | None = None):
         if self.status == "running":
             raise ValueError("讨论进行中，请先结束或等待后再重新配置")
         self.agents = []
@@ -149,12 +151,15 @@ class Orchestrator:
         self.task_counter = 0
         self.round = 0
         self.last_main_message = topic
+        self.last_debate_speaker = None
         self.max_rounds = max(1, int(max_rounds))
         self.topic = topic
         self.transcript = []
         self.trace_id = new_trace_id()
         self.budget = settings.TOKEN_BUDGET
         self.spent = 0
+        if max_tokens:
+            self.max_tokens = max(1, int(max_tokens))
         self.phase = "idle"
         self.convergence_streak = 0
         self.round_arguments = {}
@@ -276,7 +281,8 @@ class Orchestrator:
         }))
 
     # ---------------- 单次 Agent 回合（含工具调用循环） ----------------
-    async def _consume_stream(self, messages, model_config, tools, on_delta=None):
+    async def _consume_stream(self, messages, model_config, tools, on_delta=None,
+                              max_tokens=None):
         """
         在后台线程运行流式生成，把增量事件桥接回事件循环。
 
@@ -291,7 +297,7 @@ class Orchestrator:
 
         def _run():
             try:
-                for ev in chat_stream(messages, model_config, tools):
+                for ev in chat_stream(messages, model_config, tools, max_tokens=max_tokens):
                     loop.call_soon_threadsafe(q.put_nowait, ev)
             except Exception as e:
                 loop.call_soon_threadsafe(q.put_nowait, {"type": "error", "error": str(e)})
@@ -324,14 +330,16 @@ class Orchestrator:
         except asyncio.TimeoutError:
             raise RuntimeError(f"流式响应超时（>{settings.STREAM_TIMEOUT}s）") from None
 
-    async def _run_llm_retry(self, messages, model_config, tools=None, temperature=0.7):
+    async def _run_llm_retry(self, messages, model_config, tools=None, temperature=0.7,
+                             max_tokens=None):
         """带指数退避重试的非流式 LLM 调用（架构文档 §4.5：重试 2 次，间隔 1s/3s）。"""
         delays = list(settings.LLM_RETRY_DELAYS)
         last_exc = None
         for attempt in range(max(1, settings.LLM_RETRY_ATTEMPTS)):
             try:
                 return await asyncio.to_thread(
-                    chat, messages, model_config, tools, temperature=temperature)
+                    chat, messages, model_config, tools, temperature=temperature,
+                    max_tokens=max_tokens)
             except Exception as e:
                 last_exc = e
                 if attempt >= len(delays):
@@ -395,15 +403,18 @@ class Orchestrator:
                 if stream:
                     try:
                         result = await self._consume_stream(
-                            messages, agent.model_config, tools, _emit_delta)
+                            messages, agent.model_config, tools, _emit_delta,
+                            max_tokens=self.max_tokens)
                     except Exception as e:
                         self._log(f"[LLM流式失败:{agent.name}] {e}，回退非流式",
                                   level="warning", event="llm.stream_fallback")
                         result = await self._run_llm_retry(
-                            messages, agent.model_config, tools)
+                            messages, agent.model_config, tools,
+                            max_tokens=self.max_tokens)
                 else:
                     result = await self._run_llm_retry(
-                        messages, agent.model_config, tools)
+                        messages, agent.model_config, tools,
+                        max_tokens=self.max_tokens)
             except Exception as e:
                 msg = f"[LLM错误:{agent.name}] {e}"
                 self._log(msg, level="error", event="llm.error")
@@ -511,6 +522,8 @@ class Orchestrator:
 
     def _debate_prompt(self, collab: Agent) -> str:
         stance_label = STANCE_LABEL.get(collab.stance, collab.stance)
+        persona = (f"你的角色「{collab.role}」、性格「{collab.personality}」"
+                   if collab.role or collab.personality else "你的人物设定")
         parts = []
         if self.round == 1:
             # 立论阶段
@@ -524,18 +537,35 @@ class Orchestrator:
                              "必须坚定维护反方立场。")
             else:
                 parts.append(f"这是第 1 轮立论。请基于你的角色「{collab.role}」就主题「{self.topic}」发表开场观点。")
+            parts.append(f"请以{persona}为出发点发表立论，保持人设一致。")
         else:
-            # 反驳 / 辩护阶段
-            others = {k: v for k, v in self.latest_arguments.items() if k != collab.name}
-            if others:
-                brief = "\n".join(
-                    f"【{k}】（第{v['round']}轮）：{v['text'][:500]}" for k, v in others.items())
+            # 反驳 / 辩护阶段：只针对上一位实际发言的辩手（或主持人）进行针对性反驳
+            prev = None
+            prev_stance = ""
+            if (self.last_debate_speaker and self.last_debate_speaker != collab.name
+                    and self.last_debate_speaker in self.latest_arguments):
+                prev = self.latest_arguments[self.last_debate_speaker]
+                prev_agent = self.get_agent(self.last_debate_speaker)
+                if prev_agent:
+                    prev_stance = STANCE_LABEL.get(prev_agent.stance, prev_agent.stance)
+            if prev:
+                brief = (f"【上一位发言人：{self.last_debate_speaker}"
+                         f"（{prev_stance or '未声明立场'}）】（第{prev['round']}轮）：\n"
+                         f"{prev['text'][:500]}")
+                parts.append(f"这是第 {self.round} 轮反驳/辩护阶段。上一发言人「{self.last_debate_speaker}」"
+                             f"的立场为「{prev_stance or '未声明立场'}」，与你作为「{stance_label}」的立场"
+                             "存在分歧。以下是其最新发言：\n" + brief)
+                parts.append(f"请以{persona}为出发点进行反驳：优先逐条回应对方发言中"
+                             "与你立场相悖的核心观点，指出逻辑谬误（如滑坡谬误、稻草人）或提供反证"
+                             "（可调用 knowledge_search 检索）。必须坚定维护你的「"
+                             + stance_label + "」立场，禁止倒戈。")
             else:
                 brief = f"主持人最新发言：{self.last_main_message}"
-            parts.append(f"这是第 {self.round} 轮反驳/辩护阶段。以下是最新交锋内容：\n{brief}")
-            parts.append(f"请作为「{stance_label}」针对上述观点进行反驳或辩护："
-                         "直接回应对方核心论据，指出逻辑谬误（如滑坡谬误、稻草人）或提供反证"
-                         "（可调用 knowledge_search 检索）。必须坚定维护你的立场，禁止倒戈。")
+                parts.append(f"这是第 {self.round} 轮反驳/辩护阶段。以下是最新交锋内容：\n{brief}")
+                parts.append(f"请以{persona}为出发点，针对上述观点进行反驳或辩护："
+                             "直接回应对方核心论据，指出逻辑谬误（如滑坡谬误、稻草人）或提供反证"
+                             "（可调用 knowledge_search 检索）。必须坚定维护你的「"
+                             + stance_label + "」立场，禁止倒戈。")
         # RAG 证据注入（上一轮核查结果）
         ev = self._evidence_for_round(self.round - 1)
         if ev:
@@ -544,6 +574,20 @@ class Orchestrator:
         return "\n\n".join(parts)
 
     # ---------------- 协作 Agent 回合 ----------------
+    def _debate_order(self) -> list[Agent]:
+        """严格交替的辩手发言顺序：正方/反方轮流，NEUTRAL 等非正反方辩手排在末尾。"""
+        pros = [c for c in self.collaborators if c.stance == "PRO"]
+        cons = [c for c in self.collaborators if c.stance == "CON"]
+        others = [c for c in self.collaborators if c.stance not in ("PRO", "CON")]
+        order, n = [], max(len(pros), len(cons))
+        for i in range(n):
+            if i < len(pros):
+                order.append(pros[i])
+            if i < len(cons):
+                order.append(cons[i])
+        order.extend(others)
+        return order
+
     async def _collab_turn(self, collab: Agent):
         pending = [t for t in self.tasks
                    if not t["completed"] and t["recipient"] == collab.name]
@@ -585,15 +629,15 @@ class Orchestrator:
                         task["completed"] = True
                         if task["var_name"] in self.shared_context:
                             self.shared_context[task["var_name"]]["value"] = "（超时未完成）"
-        else:
-            # 辩论环节：立论 / 反驳
-            umsg = self._debate_prompt(collab)
-            out = await self._agent_turn(collab, umsg, mode="discussion", stream=True)
-            if out["content"]:
-                if not out["streamed"]:
-                    await self._emit_speech(collab, out["content"])
-                self._record_memory(collab, out["content"])
-                self._record_argument(collab.name, out["content"], self.round)
+        # 辩论环节（立论 / 反驳）：无论是否处理过任务，辩手每轮都发言，保证严格交替
+        umsg = self._debate_prompt(collab)
+        out = await self._agent_turn(collab, umsg, mode="discussion", stream=True)
+        if out["content"]:
+            if not out["streamed"]:
+                await self._emit_speech(collab, out["content"])
+            self._record_memory(collab, out["content"])
+            self._record_argument(collab.name, out["content"], self.round)
+            self.last_debate_speaker = collab.name
 
     # ---------------- RAG 事实核查（架构文档 §2.5 / §4.2） ----------------
     async def _rag_check_round(self):
@@ -642,7 +686,7 @@ class Orchestrator:
 
     # ---------------- 讨论主循环 ----------------
     async def run_discussion(self, topic: str = "", max_rounds: int | None = None,
-                             budget: int | None = None):
+                             budget: int | None = None, max_tokens: int | None = None):
         if self.status == "running":
             return
         if max_rounds is not None:
@@ -652,6 +696,8 @@ class Orchestrator:
         self.trace_id = new_trace_id()
         self.budget = int(budget or settings.TOKEN_BUDGET)
         self.spent = 0
+        if max_tokens:
+            self.max_tokens = max(1, int(max_tokens))
         from app.logger import set_trace_id
         set_trace_id(self.trace_id)
         self.phase = "preparing"
@@ -662,6 +708,7 @@ class Orchestrator:
         self.latest_arguments = {}
         self.round_evidence = {}
         self.judgment = None
+        self.last_debate_speaker = None
         self.run_stats = {"compressions": 0, "started_at": time.time()}
         self.agent_metrics = {}
         self.status = "running"
@@ -720,16 +767,20 @@ class Orchestrator:
                 self._record_memory(self.main, main_out["content"])
                 self._record_argument(self.main.name, main_out["content"], self.round)
 
-                # 2) 协作 Agent 回合
+                # 2) 协作 Agent 回合（严格交替：正方/反方轮流发言，其余立场排后）
                 if self.round == 1:
-                    # 并行立论（架构文档 §4.2 / §6.2）
+                    # 第 1 轮并行立论（架构文档 §4.2 / §6.2）
                     await asyncio.gather(
                         *[self._collab_turn(c) for c in self.collaborators],
                         return_exceptions=True,
                     )
+                    # 确定第 2 轮首位发言人的"上一发言人"（交替顺序的末位）
+                    order = self._debate_order()
+                    if order:
+                        self.last_debate_speaker = order[-1].name
                 else:
-                    # 串行反驳：依赖对方最新论点，按序发言
-                    for c in self.collaborators:
+                    # 第 2 轮起严格交替串行发言：正/反方轮流，其余立场最后
+                    for c in self._debate_order():
                         await self._collab_turn(c)
 
                 # 3) RAG 事实核查（注入下一轮上下文）
@@ -770,17 +821,8 @@ class Orchestrator:
             else:
                 self.phase = "judging"
                 await self.event_bus.publish({"type": "status", "status": "running", "phase": self.phase})
-                remaining = self.budget - self.spent
-                if remaining >= settings.MIN_TOKEN_THRESHOLD:
-                    judgment = await self._judge_round()
-                else:
-                    # 预算硬熔断（架构文档 §6.3）：剩余不足以支撑裁判 LLM 调用，回退确定性裁决
-                    self._log(f"预算硬熔断：剩余Token({remaining})低于阈值"
-                              f"({settings.MIN_TOKEN_THRESHOLD})，裁判使用回退裁决",
-                              level="warning", event="budget.hard_break")
-                    judgment = self._compute_composite(Judgment(
-                        winner="DRAW", critique="预算耗尽，未执行完整 LLM 裁决",
-                        convergence_flag=False))
+                # 裁判裁决不受预算熔断约束：即使预算耗尽也必须执行 LLM 裁决（优化项）
+                judgment = await self._judge_round()
                 self.judgment = judgment
                 await self.event_bus.publish({
                     "type": "judgment",
@@ -984,7 +1026,7 @@ class Orchestrator:
             result = await self._run_llm_retry(
                 [{"role": "system", "content": judge_sys},
                  {"role": "user", "content": prompt}],
-                judge_model, tools=None, temperature=0.3)
+                judge_model, tools=None, temperature=0.3, max_tokens=self.max_tokens)
             self._apply_usage(result)
             data = self._extract_json(result["content"])
             judgment = Judgment(**data)

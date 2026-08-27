@@ -146,10 +146,11 @@ async def configure(payload: ConfigureRequest):
     topic = payload.topic
     max_rounds = payload.max_rounds
     budget = payload.budget
+    max_tokens = payload.max_tokens
     judge_config = payload.judge or {}
     try:
         orchestrator.configure(agents, topic=topic, max_rounds=max_rounds,
-                               judge_config=judge_config)
+                               judge_config=judge_config, max_tokens=max_tokens)
         if budget:
             orchestrator.budget = max(0, int(budget))
     except ValueError as e:
@@ -165,6 +166,7 @@ async def configure(payload: ConfigureRequest):
         "trace_id": orchestrator.trace_id,
         "budget": orchestrator.budget,
         "max_rounds": orchestrator.max_rounds,
+        "max_tokens": orchestrator.max_tokens,
     }
 
 
@@ -227,8 +229,9 @@ async def start(payload: StartRequest = None):
     topic = payload.topic or orchestrator.topic
     max_rounds = payload.max_rounds
     budget = payload.budget
+    max_tokens = payload.max_tokens
     _spawn_task(orchestrator.run_discussion(
-        topic=topic, max_rounds=max_rounds, budget=budget))
+        topic=topic, max_rounds=max_rounds, budget=budget, max_tokens=max_tokens))
     return {
         "ok": True,
         "status": "running",
@@ -276,6 +279,8 @@ async def status():
         "budget": orchestrator.budget,
         "spent": orchestrator.spent,
         "remaining_budget": remaining,
+        "elapsed_time_ms": int((time.time() - orchestrator._started_at) * 1000)
+        if orchestrator._started_at else 0,
         "judgment": orchestrator.judgment,
     }
 

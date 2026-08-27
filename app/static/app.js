@@ -15,6 +15,7 @@ const state = {
   historyItems: [],   // 历史讨论索引（检索结果）
   currentHistory: null,   // 正在查看的历史记录 {filename, topic, ...}
   historyActiveFilename: null,
+  elapsedTimer: null,   // 实时耗时轮询定时器（讨论中每秒刷新）
 };
 
 const STATUS_TEXT = {
@@ -280,6 +281,7 @@ async function startDiscussion() {
     judge,
     topic: $("topic").value.trim(),
     max_rounds: parseInt($("max-rounds").value, 10) || 8,
+    max_tokens: parseInt($("max-tokens").value, 10) || null,
   };
   const cfg = await fetch("/api/configure", {
     method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(payload),
@@ -307,11 +309,13 @@ async function startDiscussion() {
       topic: payload.topic,
       max_rounds: payload.max_rounds,
       budget: parseInt($("budget").value, 10) || 100000,
+      max_tokens: payload.max_tokens,
     }),
   }).then(r => r.json());
   if (!st.ok) {
     alert("启动失败：" + (st.error || ""));
   }
+  startElapsedTick();
 }
 
 // ---------------- 圆桌席位渲染（等分，首字母头像） ----------------
@@ -356,6 +360,7 @@ async function ctrl(action) {
 
 async function backToSetup() {
   // 讨论进行中先暂停，确保返回配置后能继续；并按服务端实际状态决定能否"回到旧讨论"
+  stopElapsedTick();
   let st = null;
   if (state.agents.length) {
     st = await ctrl("pause");
@@ -409,6 +414,7 @@ function handleEvent(ev) {
         trace_id: ev.trace_id,
       });
       if (ev.status === "done" || ev.status === "stopped") {
+        stopElapsedTick();
         $("done-bar").classList.remove("hidden");
         $("done-msg").textContent = ev.status === "done" ? "讨论完成，可导出结果。" : "讨论已结束。";
         $("btn-pause").classList.add("hidden");
@@ -588,6 +594,31 @@ function updateProgress() {
 }
 
 // ---------------- 运行状态（阶段 / Token 预算） ----------------
+// 实时耗时：讨论运行中每秒轮询 /api/status，刷新耗时（不依赖轮次边界事件）
+function startElapsedTick() {
+  stopElapsedTick();
+  state.elapsedTimer = setInterval(async () => {
+    try {
+      const s = await fetch("/api/status").then(r => r.json());
+      renderRunStatus({
+        phase: s.phase,
+        current_round: s.round,
+        remaining_budget: s.remaining_budget,
+        spent_budget: s.spent,
+        elapsed_time_ms: s.elapsed_time_ms,
+        trace_id: s.trace_id,
+      });
+    } catch (e) { /* 轮询失败时静默忽略，下次再试 */ }
+  }, 1000);
+}
+
+function stopElapsedTick() {
+  if (state.elapsedTimer) {
+    clearInterval(state.elapsedTimer);
+    state.elapsedTimer = null;
+  }
+}
+
 function renderRunStatus(data) {
   const box = $("run-status");
   if (!box) return;

@@ -34,6 +34,7 @@ class ConfigureRequest(BaseModel):
     topic: str = ""
     max_rounds: int = 8
     budget: int | None = None
+    max_tokens: int | None = None
     judge: dict | None = None
 
 
@@ -42,6 +43,7 @@ class StartRequest(BaseModel):
     topic: str = ""
     max_rounds: int | None = None
     budget: int | None = None
+    max_tokens: int | None = None
 
 
 class IngestRequest(BaseModel):

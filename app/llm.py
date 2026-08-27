@@ -206,7 +206,7 @@ class ThinkFilter:
 
 
 def chat_stream(messages, model_config: dict, tools=None, tool_choice="auto",
-                temperature=0.7):
+                temperature=0.7, max_tokens=None):
     """
     流式调用 chat completion（生成器）。
 
@@ -224,6 +224,8 @@ def chat_stream(messages, model_config: dict, tools=None, tool_choice="auto",
         "temperature": temperature,
         "stream": True,
     }
+    if max_tokens:
+        kwargs["max_tokens"] = max_tokens
     if tools:
         kwargs["tools"] = tools
         kwargs["tool_choice"] = tool_choice
@@ -302,7 +304,8 @@ def chat_stream(messages, model_config: dict, tools=None, tool_choice="auto",
     }}
 
 
-def chat(messages, model_config: dict, tools=None, tool_choice="auto", temperature=0.7):
+def chat(messages, model_config: dict, tools=None, tool_choice="auto", temperature=0.7,
+         max_tokens=None):
     """
     调用 chat completion。
 
@@ -322,6 +325,8 @@ def chat(messages, model_config: dict, tools=None, tool_choice="auto", temperatu
         "messages": messages,
         "temperature": temperature,
     }
+    if max_tokens:
+        kwargs["max_tokens"] = max_tokens
     if tools:
         kwargs["tools"] = tools
         kwargs["tool_choice"] = tool_choice

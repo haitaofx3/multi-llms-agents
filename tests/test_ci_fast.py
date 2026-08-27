@@ -79,7 +79,7 @@ class OrchestratorControlTest(unittest.IsolatedAsyncioTestCase):
             called["summary"] += 1
             return "summary"
 
-        async def fake_consume(messages, model_config, tools=None, on_delta=None):
+        async def fake_consume(messages, model_config, tools=None, on_delta=None, **kwargs):
             await asyncio.sleep(0.2)  # 拉长单回合，给 end() 留插入窗口
             if on_delta:
                 await on_delta("发言")
@@ -112,7 +112,7 @@ class OrchestratorControlTest(unittest.IsolatedAsyncioTestCase):
         async def fake_summary(judgment=None):
             return "测试总结"
 
-        async def fake_consume(messages, model_config, tools=None, on_delta=None):
+        async def fake_consume(messages, model_config, tools=None, on_delta=None, **kwargs):
             if on_delta:
                 await on_delta("发言")
             return _fake_llm_result()

@@ -8,7 +8,8 @@ _judge_round / _final_summary）实现确定性输出，覆盖：
   1. configure → start → running → done → export → save_markdown → history 全链路；
   2. /api/save_markdown 路径穿越防护（filename 仅保留 basename）；
   3. /api/save_markdown 空请求体（前端发送无 body 的 POST）可用默认文件名；
-  4. /api/configure 空 Agent 列表返回既有 400 错误契约。
+  4. /api/configure 空 Agent 列表返回既有 400 错误契约；
+  5. /api/configure 的 max_tokens 透传到 orchestrator.max_tokens。
 
 运行方式（无需服务器、无需真实 LLM）：
     python -m unittest tests.test_api_flow -v
@@ -53,7 +54,7 @@ class ApiFlowTest(unittest.IsolatedAsyncioTestCase):
         async def fake_summary(judgment=None):
             return "测试总结"
 
-        async def fake_consume(messages, model_config, tools=None, on_delta=None):
+        async def fake_consume(messages, model_config, tools=None, on_delta=None, **kwargs):
             if on_delta:
                 await on_delta("发言")
             return _fake_llm_result()
@@ -145,6 +146,26 @@ class ApiFlowTest(unittest.IsolatedAsyncioTestCase):
         resp = await self.client.post("/api/configure", json={"agents": []})
         self.assertEqual(resp.status_code, 400)
         self.assertIn("error", resp.json())
+
+    async def test_configure_max_tokens_passthrough(self):
+        """/api/configure 的 max_tokens 应落到 orchestrator.max_tokens。"""
+        cfg = await self.client.post("/api/configure", json={
+            "agents": [HOST_CFG, PRO_CFG, CON_CFG], "topic": "测试主题",
+            "max_rounds": 1, "budget": 100000, "max_tokens": 1234,
+        })
+        self.assertEqual(cfg.status_code, 200, cfg.text)
+        self.assertTrue(cfg.json()["ok"])
+        self.assertEqual(cfg.json().get("max_tokens"), 1234)
+        self.assertEqual(orchestrator.max_tokens, 1234)
+
+        # 再次 configure 不传 max_tokens 时，沿用上一次设置（字段仍应存在）
+        cfg2 = await self.client.post("/api/configure", json={
+            "agents": [HOST_CFG, PRO_CFG, CON_CFG], "topic": "测试主题2",
+            "max_rounds": 1, "budget": 100000,
+        })
+        self.assertEqual(cfg2.status_code, 200, cfg2.text)
+        self.assertIsInstance(cfg2.json().get("max_tokens"), int)
+        self.assertEqual(cfg2.json()["max_tokens"], orchestrator.max_tokens)
 
 
 if __name__ == "__main__":

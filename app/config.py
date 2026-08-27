@@ -118,6 +118,7 @@ class Settings:
     # ---- Token 预算与熔断（架构文档 §6.3） ----
     TOKEN_BUDGET = _int("TOKEN_BUDGET", 100000)              # 单场辩论全局预算
     MIN_TOKEN_THRESHOLD = _int("MIN_TOKEN_THRESHOLD", 1000)   # 低于此阈值强制结束
+    MAX_TOKENS = _int("MAX_TOKENS", 4096)                     # 单次模型输出上限（全局）
 
     # ---- 收敛检测（架构文档 §4.3/4.4） ----
     CONVERGENCE_SIMILARITY = _float("CONVERGENCE_SIMILARITY", 0.85)

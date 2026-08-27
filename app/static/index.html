@@ -49,6 +49,11 @@
         <input type="number" id="budget" min="1000" step="1000" value="100000" />
         <span class="hint">预算熔断：剩余不足阈值时强制进入裁决</span>
       </div>
+      <div class="row">
+        <label>每轮最大输出 Token</label>
+        <input type="number" id="max-tokens" min="1" step="100" value="4096" />
+        <span class="hint">单次模型输出上限（max_tokens），全局作用于各 Agent</span>
+      </div>
 
       <div class="config-sub">
         <div class="config-sub-title">共享知识库</div>
