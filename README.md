@@ -31,6 +31,7 @@
 20. **REST 请求体校验**：所有写接口（`configure` / `start` / `ingest` / `save_markdown`）改用 pydantic 请求体模型（`app/schemas.py`），类型 / 形状非法时 FastAPI 返回 `422`；业务语义校验（Agent 数量、讨论状态冲突等）保留在各端点内，维持前端依赖的既有 `{ok, error}` `400` 契约，并自动生成 OpenAPI 文档。
 21. **导出与落盘安全加固**：`save_markdown` 文件名经 `Path(fname).name` 清洗（只保留 basename、强制 `.md`、空名回退自动时间戳），彻底防路径穿越；讨论完成自动落盘失败不再静默吞掉，改为结构化日志 + 幂等重试（1, 2 次）。
 22. **工程化与质量门禁**：`pyproject.toml` 统一 ruff / mypy / coverage 配置；`requirements-dev.txt` 提供开发依赖；新增 `tests/test_api_flow.py` 接口级测试（`httpx.ASGITransport` 直接驱动应用 + LLM 调用点打桩），无需服务器 / 真实模型即可在 CI 全量覆盖 HTTP 链路，与 `test_ci_fast` 一并构成快速回归门禁。
+23. **Token 预算规划与自适应校准**：每轮开始前用纯数学规划求解本轮生效输出上限 `effective_max_tokens`（`_compute_plan`），让「剩余轮次 + 裁判 + 汇总」落在预算内；预算吃紧时走降级阶梯（降输出上限 → 强制压缩历史 → 允许小幅超支），辩论永不因预算中断。规划用量经两路 EMA 自适应校准（`_est_factor` 提示词尺寸、`_call_factor` 每轮调用次数），真实冒烟 2 轮短辩论超支从 42% 收敛到 4.3%（长辩论输入成本建模见 `docs/CODE_LOGIC.md` §20）。
 
 ## 目录结构
 
