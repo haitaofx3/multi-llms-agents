@@ -182,7 +182,7 @@ class BudgetPlannerTest(unittest.IsolatedAsyncioTestCase):
     async def test_planner_tight_budget_lowers_cap(self):
         """预算吃紧：自动下调生效输出上限（低于 max_tokens，但不低于下限、不超支）。"""
         await self._configure(max_rounds=3)
-        orchestrator.budget = 50000
+        orchestrator.budget = 80000
         orchestrator.spent = 0
         plan = orchestrator._compute_plan("debate", 3)
         self.assertLess(plan["effective_max_tokens"], orchestrator.max_tokens)
@@ -265,11 +265,71 @@ class BudgetPlannerTest(unittest.IsolatedAsyncioTestCase):
         await orchestrator._plan_for_round(3)
         s = orchestrator._status_sync()
         for key in ("effective_max_tokens", "feasible_rounds", "projected_total",
-                    "budget_overshoot", "budget_degraded"):
+                    "budget_overshoot", "budget_degraded", "est_factor"):
             self.assertIn(key, s)
         self.assertIsInstance(s["effective_max_tokens"], int)
         self.assertIsInstance(s["feasible_rounds"], int)
         self.assertIsInstance(s["budget_overshoot"], bool)
+        self.assertIsInstance(s["est_factor"], float)
+
+    async def test_planner_est_factor_ema_calibration(self):
+        """自适应校准：实测/估算比值经 EMA 平滑更新因子，并钳制异常观测。"""
+        await self._configure(max_rounds=3)
+        orchestrator._est_factor = 1.0
+        orchestrator._est_factor_samples = 0
+        # 实测 500 / 估算 100 → 5×，EMA α=0.2：1.0 → 1.8
+        orchestrator._update_est_factor(real_total=500, heuristic_total=100)
+        self.assertAlmostEqual(orchestrator._est_factor, 1.8)
+        self.assertEqual(orchestrator._est_factor_samples, 1)
+        # 实测 60 / 估算 100 → 0.6×，继续平滑：1.8 → 1.56
+        orchestrator._update_est_factor(real_total=60, heuristic_total=100)
+        self.assertAlmostEqual(orchestrator._est_factor, 0.8 * 1.8 + 0.2 * 0.6)
+        # 钳制上限：因子不超 10×
+        orchestrator._est_factor = 10.0
+        orchestrator._update_est_factor(real_total=10000, heuristic_total=1)
+        self.assertLessEqual(orchestrator._est_factor, 10.0)
+        # 钳制下限：因子不低于 0.5×
+        orchestrator._est_factor = 0.5
+        orchestrator._update_est_factor(real_total=1, heuristic_total=10000)
+        self.assertGreaterEqual(orchestrator._est_factor, 0.5)
+        # 非法样本（实测或估算≤0）不污染因子
+        prev = orchestrator._est_factor
+        orchestrator._update_est_factor(real_total=0, heuristic_total=100)
+        orchestrator._update_est_factor(real_total=100, heuristic_total=0)
+        self.assertEqual(orchestrator._est_factor, prev)
+
+    async def test_planner_est_factor_scales_forward_estimates(self):
+        """校准因子会放大前置估算（agent 调用 / 裁判 / 汇总）。"""
+        await self._configure(max_rounds=3)
+        orchestrator._est_factor = 1.0
+        p_base = orchestrator._estimate_call_prompt(orchestrator.main, "测试指令")
+        orchestrator._est_factor = 3.0
+        p_scaled = orchestrator._estimate_call_prompt(orchestrator.main, "测试指令")
+        self.assertAlmostEqual(p_scaled, p_base * 3.0, delta=max(2, p_base))
+        # 裁判与汇总的提示词估算同样被放大（在 1.0 因子下取基准）
+        orchestrator._est_factor = 1.0
+        j_base = orchestrator._judge_prompt_tokens_now()
+        s_base = orchestrator._summary_prompt_tokens()
+        orchestrator._est_factor = 2.0
+        self.assertAlmostEqual(
+            orchestrator._judge_prompt_tokens_now(), j_base * 2.0, delta=1)
+        self.assertAlmostEqual(
+            orchestrator._summary_prompt_tokens(), s_base * 2.0, delta=1)
+
+    async def test_planner_round_prompt_models_n_calls(self):
+        """每轮提示词估算应按 N 次 LLM 调用折算（而非每位辩手一次）。"""
+        await self._configure(max_rounds=3)
+        per_agent = (orchestrator._estimate_call_prompt(
+                         orchestrator.main,
+                         orchestrator._main_directive(orchestrator.round, False, False, False))
+                     + orchestrator._estimate_call_prompt(
+                         orchestrator.collaborators[0],
+                         orchestrator._debate_prompt(orchestrator.collaborators[0])))
+        round_p = orchestrator._estimate_round_prompt_tokens()
+        base = max(1, 1 + len(orchestrator.collaborators))  # 2
+        n = orchestrator._calls_per_round()                  # ceil(2×1.5)=3
+        self.assertEqual(round_p, round(per_agent * n / base))
+        self.assertGreater(round_p, per_agent)
 
 
 if __name__ == "__main__":

@@ -20,7 +20,7 @@ import time
 
 from app.agent import Agent
 from app.config import settings
-from app.llm import chat, chat_stream
+from app.llm import _estimate_usage, chat, chat_stream
 from app.protocol import Judgment, new_trace_id, new_uuid, now_ms
 from app.rag import rag_service
 
@@ -126,6 +126,9 @@ class Orchestrator:
         self.max_tokens = settings.MAX_TOKENS  # 单次模型输出上限（全局）
         self.effective_max_tokens = self.max_tokens  # 预算规划器每轮计算的生效输出上限
         self._budget_plan = None                      # 最近一次预算规划结果 dict
+        # 自适应校准：启发式估算(≈len//2) 与 API 真实 usage 的偏差因子（EMA 平滑）
+        self._est_factor = 1.0
+        self._est_factor_samples = 0
 
         # ---- 辩论状态 ----
         self._started_at = None
@@ -164,6 +167,8 @@ class Orchestrator:
             self.max_tokens = max(1, int(max_tokens))
         self.effective_max_tokens = self.max_tokens
         self._budget_plan = None
+        self._est_factor = 1.0
+        self._est_factor_samples = 0
         self.phase = "idle"
         self.convergence_streak = 0
         self.round_arguments = {}
@@ -364,6 +369,26 @@ class Orchestrator:
             self.spent += int(total)
         return int(total) if total else 0
 
+    def _update_est_factor(self, real_total: int, heuristic_total: int) -> None:
+        """自适应校准：用 实测/估算 比值平滑更新预算规划的启发式估算因子。
+
+        预算规划器的前置估算基于 len(s)//2，而 spent 记账使用 API 真实 usage，
+        两者存在系统性偏差（中文实测约 3~5×）。本方法用每个真实调用的
+        实测 total / 启发式 total 做 EMA 平滑，规划器据此放大后续估算。
+
+        注意：本因子只放大"尚未发生的预测"，已发生的费用永远按真实 usage 记账。
+        """
+        if real_total <= 0 or heuristic_total <= 0:
+            return
+        ratio = real_total / heuristic_total
+        # EMA（α≈0.2），钳制在 [0.5, 10]，防止单次异常观测（网络波动/内容突增）失控
+        self._est_factor = min(10.0, max(0.5, 0.8 * self._est_factor + 0.2 * ratio))
+        self._est_factor_samples += 1
+        self._log(
+            f"[预算校准] 实测/估算={ratio:.2f}× 因子→{self._est_factor:.2f}"
+            f"（样本#{self._est_factor_samples}）",
+            level="info", event="budget.est_factor")
+
     async def _agent_turn(self, agent: Agent, user_msg: str, mode: str,
                           allow_delegate: bool = True, stream: bool = False):
         collaborators_meta = [{"name": c.name} for c in self.collaborators]
@@ -440,7 +465,11 @@ class Orchestrator:
                 acc["gen_sum"] += _m["gen_s"]
                 acc["chars"] += _m["chars"]
 
-            token_cost += self._apply_usage(result)
+            _used = self._apply_usage(result)
+            token_cost += _used
+            # 自适应校准：用本次真实用量与同一批消息的启发式估算更新偏差因子
+            self._update_est_factor(
+                _used, _estimate_usage(messages, result.get("content") or "")["total_tokens"])
             content = result["content"] or content
             raw_msg = result.get("assistant_message")
             tcs = result["tool_calls"]
@@ -694,17 +723,21 @@ class Orchestrator:
 
         用于预算规划的前置估算；仅做保守估计，绝不抛异常。
         """
-        from app.llm import _estimate_usage  # module-level helper, char//2 based
         collaborators_meta = [{"name": c.name} for c in self.collaborators]
         sys_prompt = agent.system_prompt(collaborators_meta, self.shared_context,
                                          self._task_status_text(), "discussion", self.topic)
         messages = [{"role": "system", "content": sys_prompt},
                     *list(agent.history),
                     {"role": "user", "content": user_msg}]
-        return _estimate_usage(messages)["prompt_tokens"]
+        # 用自适应校准因子放大 len//2 启发式，使其接近该模型/供应商的真实用量
+        return max(1, int(_estimate_usage(messages)["prompt_tokens"] * self._est_factor))
 
     def _estimate_round_prompt_tokens(self) -> int:
-        """一个完整辩论轮（主持人 + 各协作辩手）的提示词 token 估算。"""
+        """一个完整辩论轮（主持人 + 各协作辩手）的提示词 token 估算。
+
+        每轮实际 LLM 调用约 N = ceil((1+C)×BUDGET_TOOL_OVERHEAD) 次
+        （同一辩手可能多次工具调用），故按 N 次调用折算，而非每位辩手一次。
+        """
         total = 0
         try:
             if self.main:
@@ -714,7 +747,10 @@ class Orchestrator:
                 total += self._estimate_call_prompt(c, self._debate_prompt(c))
         except Exception:
             pass  # 规划绝不能因估算失败而中断辩论
-        return total
+        if total <= 0:
+            return 0
+        base = max(1, 1 + len(self.collaborators))  # 每位辩手一次调用的基准成本
+        return round(total * self._calls_per_round() / base)
 
     def _calls_per_round(self) -> int:
         """每轮 LLM 调用次数 = (主持人 + 协作辩手) × 工具调用乘数。"""
@@ -725,11 +761,11 @@ class Orchestrator:
     def _judge_prompt_tokens_now(self) -> int:
         """裁判当前轮次的提示词 token 估算（完整未截断的辩论记录）。"""
         judge_text = self._build_judge_debate_text()  # full untruncated transcript
-        return max(1, (len(judge_text) + 400) // 2)   # +400 chars: judge_sys + prompt wrappers
+        return max(1, int(((len(judge_text) + 400) // 2) * self._est_factor))
 
     def _summary_prompt_tokens(self) -> int:
         """主持人最终汇总的提示词 token 估算（bounded history ≤ CONTEXT_MAX_CHARS）。"""
-        return max(1, (settings.CONTEXT_MAX_CHARS + 2000) // 2)
+        return max(1, int(((settings.CONTEXT_MAX_CHARS + 2000) // 2) * self._est_factor))
 
     def _tail_base_tokens(self) -> int:
         """尾段基础成本 J0 + S0：裁判（当前记录）+ 最终汇总的提示词 token（输出为 0 时）。"""
@@ -873,6 +909,8 @@ class Orchestrator:
         # 预算规划器状态：开局即做一次全量可行性预估
         self.effective_max_tokens = self.max_tokens
         self._budget_plan = self._compute_plan("debate", self.max_rounds) if self.agents else None
+        self._est_factor = 1.0
+        self._est_factor_samples = 0
         self.status = "running"
         self._pause_event.set()
         await self.event_bus.publish({
@@ -1192,7 +1230,12 @@ class Orchestrator:
                 [{"role": "system", "content": judge_sys},
                  {"role": "user", "content": prompt}],
                 judge_model, tools=None, temperature=0.3, max_tokens=self.effective_max_tokens)
-            self._apply_usage(result)
+            self._update_est_factor(
+                self._apply_usage(result),
+                _estimate_usage(
+                    [{"role": "system", "content": judge_sys},
+                     {"role": "user", "content": prompt}],
+                    result.get("content") or "")["total_tokens"])
             data = self._extract_json(result["content"])
             judgment = Judgment(**data)
             # 系统确定性模型质量分 + 综合评分，并据此推导胜方
@@ -1312,6 +1355,7 @@ class Orchestrator:
             "projected_total": plan.get("projected_total", self.spent),
             "budget_overshoot": bool(plan.get("overshoot")),
             "budget_degraded": bool(plan.get("degraded")),
+            "est_factor": round(self._est_factor, 2),  # 自适应校准因子（调试/观测用）
             "elapsed_time_ms": int((time.time() - self._started_at) * 1000)
             if self._started_at else 0,
         }
