@@ -837,6 +837,8 @@ class Orchestrator:
 
     async def _force_compress_all(self) -> None:
         """预算吃紧：强制压缩所有 Agent 历史以缩小后续输入。"""
+        compressed = 0
+        skipped = 0
         for a in self.agents:
             try:
                 usage = await a.compress_history(force=True)
@@ -846,10 +848,16 @@ class Orchestrator:
                         self.spent += int(total)
                         self.run_stats["compressions"] = \
                             self.run_stats.get("compressions", 0) + 1
+                    compressed += 1
+                else:
+                    # force=True 下只有「历史过短」会早退（或摘要回退为确定性拼接）
+                    skipped += 1
             except Exception:
-                pass
-        self._log("预算吃紧：已强制压缩所有 Agent 历史以缩小输入",
-                  level="warning", event="budget.force_compress")
+                skipped += 1
+        self._log(
+            f"预算吃紧：强制压缩 Agent 历史（实际压缩 {compressed} 个，"
+            f"历史过短跳过 {skipped} 个）",
+            level="warning", event="budget.force_compress")
 
     async def _plan_for_round(self, remaining_rounds: int) -> dict:
         """为即将到来的辩论轮次计算 effective_max_tokens（降级阶梯）。
