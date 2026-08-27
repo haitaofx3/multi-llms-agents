@@ -23,11 +23,14 @@
 ```
 mini_test/
 ├── start.py              启动入口（uvicorn）
-├── requirements.txt      依赖清单
+├── requirements.txt      依赖清单（含版本下限约束）
+├── requirements-dev.txt  开发 / 质量工具依赖（ruff / mypy / coverage）
+├── pyproject.toml        工程化配置（ruff / mypy / coverage）
 ├── .env                  环境变量配置（不提交到版本库）
 ├── app/                  核心应用包
 │   ├── config.py         环境变量与配置（Settings 单例、Token 预算/收敛/重试参数）
 │   ├── protocol.py       消息协议（TaskDispatch / ArgumentSubmit / Rebuttal / Judgment / StatusSync / EvidenceItem，pydantic 模型 + trace_id/uuid/毫秒时间戳）
+│   ├── schemas.py        REST 请求体 pydantic 模型（ConfigureRequest / StartRequest / IngestRequest / SaveMarkdownRequest）
 │   ├── llm.py            LLM 统一接入（OpenAI 兼容 + function calling + 流式 + usage 统计 + ThinkFilter）
 │   ├── embeddings.py     文本向量化（sentence-transformers 懒加载，失败降级哈希向量，后台预热）
 │   ├── vector_store.py   共享向量知识库（Qdrant 快速失败，降级内存库；懒初始化）
@@ -38,14 +41,15 @@ mini_test/
 │   ├── orchestrator.py   编排器（Supervisor：状态机、并行立论、收敛/预算终止、Judge、任务分派/回报）
 │   ├── history.py        历史讨论记忆索引（data/discussions/index.json + 检索 + Markdown 读取，防路径穿越）
 │   ├── file_parser.py    上传文件文本提取（txt/md/docx/xlsx/pdf/图片 OCR，懒加载依赖 + 大小/字符上限）
-│   ├── main.py           FastAPI 应用（REST + WebSocket + 静态服务，lifespan 自动落盘）
+│   ├── main.py           FastAPI 应用（REST + WebSocket + 静态服务，lifespan 自动落盘 + 重试）
 │   └── static/           前端 UI
 │       ├── index.html    页面骨架（配置区 + 讨论区 + 历史面板）
 │       ├── style.css     设计变量 / 圆桌席位 / 聊天气泡 / 首字母头像 / 历史面板
 │       └── app.js        前端逻辑（配置、席位等分、WebSocket 事件、并发流式气泡、历史检索）
 ├── tests/
 │   ├── test_e2e.py       端到端集成测试（需先启动服务器；校验状态机/预算/裁判/流式）
-│   └── test_ci_fast.py   快速单元测试（状态机/预算/裁决，无需服务器）
+│   ├── test_ci_fast.py   快速单元测试（状态机/预算/裁决，无需服务器）
+│   └── test_api_flow.py  HTTP 接口级测试（ASGITransport + LLM 打桩，无需服务器/真实模型）
 ├── docs/
 │   └── CODE_LOGIC.md     本文档
 ├── data/                 运行时数据（自动生成，不提交到版本库）
@@ -399,22 +403,28 @@ while round < max_rounds:
 FastAPI 应用，挂载 `/static`，提供 REST + WebSocket。
 
 ### 13.1 启动 `lifespan`
-用 `@asynccontextmanager` 注册（**替代已弃用的 `@app.on_event("startup")`**）：订阅 `event_bus`，监听 `status=done` → 自动 `export_markdown()` 落盘 `data/discussions/` 并 `record_discussion()` 写入历史记忆索引；关闭时取消监听任务并退订。
+用 `@asynccontextmanager` 注册（**替代已弃用的 `@app.on_event("startup")`**）：订阅 `event_bus`，监听 `status=done` → 自动 `export_markdown()` 落盘 `data/discussions/` 并 `record_discussion()` 写入历史记忆索引。
+
+落盘逻辑抽为 `_persist_done_markdown()`（导出 → 写入 `discussion_<时间戳>.md` → 记录历史索引，返回文件名），监听器**不静默吞异常**：`except` 后写结构化日志（`lifespan.save_markdown` 事件）并按 `(1, 2)` 幂等重试（写入与索引 upsert 均幂等，重复执行安全）；关闭时取消监听任务并退订。
 
 ### 13.2 REST 接口
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | GET | `/` | 返回 `index.html` |
 | GET | `/api/defaults` | 返回供应商预设（**已剥离 api_key**）、向量库后端、最大 Agent 数 |
-| POST | `/api/configure` | 配置 Agent（1–6）、主题、最大轮次、预算；返回 `agents/stance/phase/trace_id/budget/max_rounds` |
-| POST | `/api/ingest` | 向共享向量库注入知识（按段落切分） |
-| POST | `/api/start` | 启动讨论（`asyncio.create_task(run_discussion)`） |
+| POST | `/api/configure` | 配置 Agent（1–6）、主题、最大轮次、预算；**请求体 `ConfigureRequest`（pydantic 校验，非法 422）**；返回 `agents/stance/phase/trace_id/budget/max_rounds` |
+| POST | `/api/ingest` | 向共享向量库注入知识（**请求体 `IngestRequest` 校验**，按段落切分） |
+| POST | `/api/start` | 启动讨论（**请求体 `StartRequest` 可省略**，`_spawn_task(run_discussion)` 登记后台任务） |
 | POST | `/api/pause` `/api/resume` `/api/end` | 暂停/继续/结束 |
 | GET | `/api/status` | 状态、阶段、轮次、Agent、任务、共享上下文、预算、裁判结果 |
 | GET | `/api/export` | 返回 Markdown 文本 |
-| POST | `/api/save_markdown` | 保存 Markdown 到服务器（同时写入历史记忆索引） |
+| POST | `/api/save_markdown` | 保存 Markdown 到服务器（**请求体 `SaveMarkdownRequest`；`filename` 经 `_safe_discussion_filename` 清洗防路径穿越**，空请求体回退默认名；同时写入历史记忆索引） |
 | GET | `/api/history?q=` | 历史讨论列表（`items` 按时间倒序；`q` 非空时按题目 / trace_id 关键词过滤） |
 | GET | `/api/history/{filename}` | 查看某场历史讨论的完整 Markdown（`404` 表示记录不存在，含路径穿越防护） |
+
+> **请求体验证双轨契约（P0-2）**：`app/schemas.py` 只做**类型 / 形状**校验（`app/schemas.py:11`），非法请求体由 FastAPI 返回 `422` 并自动生成 OpenAPI 文档；业务语义校验（Agent 数量 1–6、讨论状态冲突、空文本等）保留在各端点内，维持前端依赖的既有 `{ok, error}` `400` 契约。
+
+> **`_safe_discussion_filename(fname)`（P0-1，`app/main.py:284`）**：`filename` 只保留 `Path(fname).name`（丢弃目录 / 绝对路径 / `..`），清洗后为空回退 `discussion_{_ts()}.md`，未以 `.md` 结尾则补后缀；与读取侧 `history.get_markdown` 的 `resolve()` + `relative_to()` 防护（§13.4）构成读写两侧的路径穿越防线。
 
 ### 13.3 WebSocket `/ws`
 - 连接即推送当前 `status`（含 agents/topic/max_rounds/budget/spent/phase），便于前端初始化席位；
@@ -443,6 +453,28 @@ FastAPI 应用，挂载 `/static`，提供 REST + WebSocket。
 - 保护措施：`MAX_UPLOAD_BYTES = 20MB` 超限拒绝；`MAX_TEXT_CHARS = 200_000` 超出截断并在 `meta["truncated"]` 标注；纯文本 utf-8 → gbk 回退。
 - `split_paragraphs(text)`：按行切分为待索引的知识块。
 - 入口：`POST /api/upload`（multipart）解析后调 `shared_vector_store.add()` 注入；前端「共享知识库」区提供文件选择 + 上传解析按钮，`/api/defaults` 暴露 `upload_exts` 支持格式表。
+
+### 13.6 REST 请求体模型 — `app/schemas.py`（P0-2）
+
+与 `app/protocol.py`（Agent 间通信协议）分离的 **REST 边界模型**，为四个写接口提供类型校验：
+
+| 模型 | 对应接口 | 关键字段 |
+| --- | --- | --- |
+| `AgentConfig` | `/api/configure` 中单个 Agent | `name / role / personality / provider / base_url / api_key / model_id / stance / agent_id / forget_config` |
+| `ConfigureRequest` | `POST /api/configure` | `agents: list[AgentConfig]`、`topic`、`max_rounds=8`、`budget`、`judge` |
+| `StartRequest` | `POST /api/start` | `topic / max_rounds / budget`（全可省略，省略沿用 configure 值） |
+| `IngestRequest` | `POST /api/ingest` | `text`、`source`（默认"用户注入"） |
+| `SaveMarkdownRequest` | `POST /api/save_markdown` | `filename`（可省略，省略自动生成） |
+
+**设计约定**（`app/schemas.py:8`）：只做类型 / 形状校验，非法请求体由 FastAPI 返回 `422`；业务语义校验仍保留在各端点内，维持既有 `{ok, error}` `400` 契约。`main.py` 侧用 `payload.model_dump()` 转 dict 后交给 `orchestrator`。
+
+### 13.7 工程化配置与测试门禁（P1-4 / P1-5）
+
+- **`pyproject.toml`**：声明 `requires-python = ">=3.10"`；`[tool.ruff]` 启用 `E4/E7/E9/F/I/UP/RUF/B/S` 规则（`line-length=110`，忽略 `BLE001/S110/RUF001/002/003` 中文标点误报；`tests/*` per-file-ignores `S101/S310`）；`[tool.mypy]` strict 模式仅覆盖 `app/protocol.py`（全量开启为后续工作）；`[tool.coverage]` 以 `app/` 为源码、`branch=true`。
+- **`requirements-dev.txt`**：`-r requirements.txt` + `ruff>=0.5` / `mypy>=1.10` / `coverage>=7.0`，与运行依赖分离。
+- **接口级测试 `tests/test_api_flow.py`**：`httpx.AsyncClient(transport=ASGITransport(app))` 直接驱动 FastAPI 应用，monkeypatch `_judge_round / _final_summary / _consume_stream / _run_llm_retry` 四个 LLM 调用点实现确定性输出，**无需启动服务器、无需真实模型**。4 个用例：HTTP 全链路（configure→start→done→export→save_markdown→history）、`../../evil.md` 路径穿越被清洗为 `evil.md`、空请求体 save_markdown 回退默认文件名、空 Agent 列表保持 `400` 契约。运行：`python -m unittest tests.test_api_flow -v`。
+- **CI 门禁**（`.github/workflows/ci.yml`）：安装步骤含 `fastapi httpx ruff mypy`，在 fast 单测之后新增 `Lint (ruff)`、`Type check (mypy)`、`API flow tests` 三步。
+- **RUF006 后台任务强引用**：`main.py` / `orchestrator.py` 均以模块级 `_background_tasks: set[asyncio.Task]` 持有后台任务引用（`_spawn_task` helper 登记 + 完成回调自动 discard），防止任务被 GC 提前回收。
 
 ---
 
@@ -510,6 +542,10 @@ FastAPI 应用，挂载 `/static`，提供 REST + WebSocket。
 | 预算硬熔断（剩余 < 阈值） | 裁判与主持人汇总均用确定性回退（不调用 LLM） |
 | 协作 Agent 未回报 | 发言记录 + `rounds_waiting` 计数，超 3 轮强制标记完成 |
 | `_create_task` 接收方不存在 | 忽略该任务并记日志（P15 修复） |
+| lifespan 自动落盘失败 | 结构化日志（`lifespan.save_markdown`）+ 幂等重试（1, 2 次），不再静默吞掉（P1-3） |
+| 后台任务被 GC 提前回收 | 模块级 `_background_tasks` set 持有强引用，`_spawn_task` 完成回调自动移除（RUF006） |
+| 非法 REST 请求体 | FastAPI 依据 `app/schemas.py` 返回 `422`；业务语义非法返回 `{ok, error}` `400`（P0-2） |
+| `save_markdown` filename 含目录/绝对路径/`..` | `_safe_discussion_filename` 清洗为 basename + 强制 `.md`，无法越出讨论目录（P0-1） |
 
 ---
 
@@ -545,8 +581,8 @@ FastAPI 应用，挂载 `/static`，提供 REST + WebSocket。
 
 ```
 浏览器
-  └─ POST /api/configure   → orchestrator.configure()（生成 trace_id、分配 stance）
-  └─ POST /api/start       → asyncio.create_task(run_discussion())
+  └─ POST /api/configure   → orchestrator.configure()（生成 trace_id、分配 stance；请求体经 schemas 校验）
+  └─ POST /api/start       → _spawn_task(run_discussion())（登记后台任务，防 GC）
                                 ├─ phase=preparing → 发布 status + status_sync
                                 ├─ 每轮:
                                 │    ├─ phase=debating
@@ -579,8 +615,8 @@ FastAPI 应用，挂载 `/static`，提供 REST + WebSocket。
 - **导出**：`/api/export` 返回约 19KB Markdown（含发言记录、裁判裁决、**「模型性能与综合评分」表**、任务结果表、记忆快照），落盘 `data/discussions/e2e_export.md`。
 - **校验输出**：`ARCHITECTURE CHECKS PASS (state machine / budget / judge)`、`STREAMING CHECKS PASS`，断言覆盖 `agent_scores / model_performance / composite_scores` 非空且 `winner ∈ (PRO, CON, DRAW)`。
 
-> 该验证同时覆盖了降级路径（本机无 Qdrant → `in-memory`；无 HF 网络 → 哈希向量）。快速路径验证见 `tests/test_ci_fast.py`（状态机 / 预算 / 裁决分档 / 综合评分逻辑，无需服务器）。
+> 该验证同时覆盖了降级路径（本机无 Qdrant → `in-memory`；无 HF 网络 → 哈希向量）。无需服务器的快速回归见 `tests/test_ci_fast.py`（状态机 / 预算 / 裁决分档 / 综合评分逻辑）与 `tests/test_api_flow.py`（HTTP 接口全链路 + 路径穿越防护，LLM 打桩）。
 
 ---
 
-*文档覆盖 `app/config / app/protocol / app/llm / app/embeddings / app/vector_store / app/memory / app/tools / app/rag / app/agent / app/orchestrator / app/history / app/file_parser / app/main / app/static` 全部模块，可作为二次开发与维护的权威参考。*
+*文档覆盖 `app/config / app/protocol / app/schemas / app/llm / app/embeddings / app/vector_store / app/memory / app/tools / app/rag / app/agent / app/orchestrator / app/history / app/file_parser / app/main / app/static` 全部模块，可作为二次开发与维护的权威参考。*

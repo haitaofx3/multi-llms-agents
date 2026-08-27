@@ -28,17 +28,23 @@
 17. **默认仅本地访问**：`start.py` 默认绑定 `127.0.0.1`，避免远端暴露 / 长期挂载；需要局域网访问时用 `HOST=0.0.0.0` 显式覆盖。
 18. **文件上传解析**：共享知识库支持直接上传文档（`txt/md/csv/log`、`docx`、`xlsx`、`pdf`、图片 OCR），后端解析文本后按段注入共享向量库，方便把本地资料作为全体 Agent 的知识背景。
 19. **裁判综合评分**：辩论结束后独立裁判对**每位辩手**分别按四维（逻辑 / 证据 / 反驳 / 清晰度）打分；系统同时实测各辩手流式发言的 **TTFT 与生成速率**产出模型质量分，最终按「内容分 × 80% + 模型质量分 × 20%」得到综合评分（权重经 `.env` 可调），并由综合分推导胜方。评分范围仅限两位辩手，主持人发言不参与评分。
+20. **REST 请求体校验**：所有写接口（`configure` / `start` / `ingest` / `save_markdown`）改用 pydantic 请求体模型（`app/schemas.py`），类型 / 形状非法时 FastAPI 返回 `422`；业务语义校验（Agent 数量、讨论状态冲突等）保留在各端点内，维持前端依赖的既有 `{ok, error}` `400` 契约，并自动生成 OpenAPI 文档。
+21. **导出与落盘安全加固**：`save_markdown` 文件名经 `Path(fname).name` 清洗（只保留 basename、强制 `.md`、空名回退自动时间戳），彻底防路径穿越；讨论完成自动落盘失败不再静默吞掉，改为结构化日志 + 幂等重试（1, 2 次）。
+22. **工程化与质量门禁**：`pyproject.toml` 统一 ruff / mypy / coverage 配置；`requirements-dev.txt` 提供开发依赖；新增 `tests/test_api_flow.py` 接口级测试（`httpx.ASGITransport` 直接驱动应用 + LLM 调用点打桩），无需服务器 / 真实模型即可在 CI 全量覆盖 HTTP 链路，与 `test_ci_fast` 一并构成快速回归门禁。
 
 ## 目录结构
 
 ```
 mini_test/
 ├── start.py              启动入口（uvicorn）
-├── requirements.txt      依赖清单
+├── requirements.txt      依赖清单（含版本下限约束）
+├── requirements-dev.txt  开发 / 质量工具依赖（ruff / mypy / coverage）
+├── pyproject.toml        工程化配置（ruff / mypy / coverage）
 ├── .env                  环境变量配置（不提交到版本库）
 ├── app/                  核心应用包
 │   ├── __init__.py
 │   ├── config.py         环境变量与配置（Settings 单例、PROJECT_ROOT）
+│   ├── schemas.py        REST 请求体 pydantic 模型（configure/start/ingest/save_markdown）
 │   ├── llm.py            LLM 统一接入（OpenAI 兼容 + function calling + 流式）
 │   ├── embeddings.py     文本向量化（sentence-transformers；本地无缓存模型时秒级降级哈希向量，不卡启动）
 │   ├── vector_store.py   共享向量知识库（Qdrant，TCP 探活失败降级内存库，网络探测不阻塞请求线程）
@@ -56,7 +62,8 @@ mini_test/
 │       └── app.js        前端逻辑（配置、席位等分、WebSocket 事件、并发流式气泡、历史检索）
 ├── tests/
 │   ├── test_e2e.py       端到端集成测试（需先启动服务器）
-│   └── test_ci_fast.py   快速单元测试（状态机 / 预算 / 裁决）
+│   ├── test_ci_fast.py   快速单元测试（状态机 / 预算 / 裁决）
+│   └── test_api_flow.py  HTTP 接口级测试（ASGITransport，无需服务器 / 无需真实 LLM）
 ├── docs/
 │   └── CODE_LOGIC.md     代码逻辑详解（模块职责 → 关键函数 → 数据流）
 ├── data/                 运行时数据（自动生成，不提交到版本库）
@@ -134,6 +141,20 @@ python start.py
 python -m unittest tests.test_ci_fast -v
 ```
 
+HTTP 接口级测试（`httpx.ASGITransport` 直接驱动 FastAPI 应用，LLM 调用点打桩，无需服务器 / 无需真实模型；覆盖 configure → start → done → export → save_markdown → history 全链路与路径穿越防护）：
+
+```bash
+python -m unittest tests.test_api_flow -v
+```
+
+静态检查与类型检查（需先安装 `requirements-dev.txt`）：
+
+```bash
+python -m ruff check app tests
+python -m mypy
+python -m coverage run -m unittest discover tests   # 可选：测试覆盖率
+```
+
 端到端集成测试会真实调用 LLM 发起一场讨论（3 Agent × 2 轮，全部使用 qwen，含独立裁判），并校验流式事件（`speech_start` / `speech_delta` / `speech_end` 配对、`log` 事件、`judgment` 等，`judgment` 需包含 `agent_scores` / `model_performance` / `composite_scores`）与 Markdown 导出：
 
 ```bash
@@ -158,6 +179,11 @@ P0 / P1 优化项已实施落地：
 - **历史记忆化**：`app/history.py` 将每场讨论题目与元信息持久化到 `data/discussions/index.json`，提供 `/api/history` 检索与一键查看 / 下载。
 - **安全加固**：`start.py` 默认绑定 `127.0.0.1`，关闭远端暴露；历史读取带路径穿越防护。
 - **裁判综合评分**：`orchestrator._compute_composite` 按「内容分（agent_scores 四维均值）× `JUDGE_CONTENT_WEIGHT` + 模型质量分（TTFT / 生成速率实测，`_score_ttft` / `_score_rate` 分档）× `JUDGE_PERFORMANCE_WEIGHT`」合成综合分并据此推导胜方；裁判只看辩手发言（`_build_judge_debate_text` 剔除主持人），质量分只统计协作 Agent 的流式发言指标。
+- **P0-1 路径穿越修复**：`save_markdown` 文件名经 `Path(fname).name` 清洗（只保留 basename、强制 `.md`、空名回退时间戳），配合 `history.get_markdown` 的 `resolve()` + `relative_to()`，读写两侧均无法越出 `data/discussions/`。
+- **P0-2 REST 请求体 pydantic 校验**：`app/schemas.py` 为 `configure / start / ingest / save_markdown` 定义请求模型；类型 / 形状非法返回 `422`，业务语义校验保留在各端点内，维持前端依赖的 `{ok, error}` `400` 契约。
+- **P1-3 lifespan 落盘可靠性**：讨论完成自动保存失败不再静默吞掉，改为结构化日志（`lifespan.save_markdown`）+ 幂等重试（1, 2 次）。
+- **P1-4 接口级测试 + CI 静态检查**：`tests/test_api_flow.py`（`httpx.ASGITransport` + LLM 调用点打桩）覆盖 HTTP 全链路与安全用例；ruff / mypy 纳入 CI 质量门禁。
+- **P1-5 依赖与工程化配置**：新增 `pyproject.toml`（ruff / mypy / coverage）与 `requirements-dev.txt`，`requirements.txt` 全部依赖改为 `>=` 版本下限。
 
 ## 项目依赖
 
@@ -166,3 +192,6 @@ P0 / P1 优化项已实施落地：
 - **向量库**：`qdrant-client`（可选，不可用时降级内存库）
 - **嵌入**：`sentence-transformers` + `numpy`（无缓存模型时自动降级哈希向量）
 - **其他**：`httpx`
+- **开发 / 质量工具**（`requirements-dev.txt`）：`ruff`（静态检查）、`mypy`（类型检查，当前覆盖 `app/protocol.py`）、`coverage`（测试覆盖率）
+
+> 生产 / 运行依赖与开发依赖分离：`pip install -r requirements.txt` 即可运行；`pip install -r requirements-dev.txt` 额外安装静态检查与测试工具。`requirements.txt` 中的依赖均带 `>=` 版本下限，`pyproject.toml` 声明 `requires-python = ">=3.10"`。
