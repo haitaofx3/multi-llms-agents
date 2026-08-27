@@ -12,6 +12,7 @@ test_ci_fast.py — 快速确定性单元测试（CI 用，无需真实 LLM API�
     python -m unittest tests.test_ci_fast -v
 """
 import asyncio
+import math
 import unittest
 
 from app.config import settings
@@ -265,12 +266,13 @@ class BudgetPlannerTest(unittest.IsolatedAsyncioTestCase):
         await orchestrator._plan_for_round(3)
         s = orchestrator._status_sync()
         for key in ("effective_max_tokens", "feasible_rounds", "projected_total",
-                    "budget_overshoot", "budget_degraded", "est_factor"):
+                    "budget_overshoot", "budget_degraded", "est_factor", "call_factor"):
             self.assertIn(key, s)
         self.assertIsInstance(s["effective_max_tokens"], int)
         self.assertIsInstance(s["feasible_rounds"], int)
         self.assertIsInstance(s["budget_overshoot"], bool)
         self.assertIsInstance(s["est_factor"], float)
+        self.assertIsInstance(s["call_factor"], float)
 
     async def test_planner_est_factor_ema_calibration(self):
         """自适应校准：实测/估算比值经 EMA 平滑更新因子，并钳制异常观测。"""
@@ -330,6 +332,50 @@ class BudgetPlannerTest(unittest.IsolatedAsyncioTestCase):
         n = orchestrator._calls_per_round()                  # ceil(2×1.5)=3
         self.assertEqual(round_p, round(per_agent * n / base))
         self.assertGreater(round_p, per_agent)
+
+    async def test_planner_call_factor_ema_calibration(self):
+        """自适应 N：本轮实测调用/规划基数的比值经 EMA 平滑更新因子，并钳制异常观测。"""
+        await self._configure(max_rounds=3)
+        orchestrator._call_factor = 1.0
+        orchestrator._call_factor_samples = 0
+        base_n = max(1, math.ceil(
+            (1 + len(orchestrator.collaborators)) * settings.BUDGET_TOOL_OVERHEAD))
+        # 实测 3×基数 → 比值 3.0，EMA α=0.2：1.0 → 1.4
+        orchestrator._update_call_factor(real_calls=3 * base_n)
+        self.assertAlmostEqual(orchestrator._call_factor, 1.4)
+        self.assertEqual(orchestrator._call_factor_samples, 1)
+        # 实测恰为基数 → 比值 1.0，继续平滑：1.4 → 1.32
+        orchestrator._update_call_factor(real_calls=base_n)
+        self.assertAlmostEqual(orchestrator._call_factor, 0.8 * 1.4 + 0.2 * 1.0)
+        # 钳制上限：因子不超 5.0
+        orchestrator._call_factor = 5.0
+        orchestrator._update_call_factor(real_calls=100 * base_n)
+        self.assertLessEqual(orchestrator._call_factor, 5.0)
+        # 钳制下限：因子不低于 0.5
+        orchestrator._call_factor = 0.5
+        orchestrator._update_call_factor(real_calls=1)
+        self.assertGreaterEqual(orchestrator._call_factor, 0.5)
+        # 非法样本（0 次调用）不污染因子
+        prev = orchestrator._call_factor
+        orchestrator._update_call_factor(real_calls=0)
+        self.assertEqual(orchestrator._call_factor, prev)
+
+    async def test_planner_call_factor_scales_calls_per_round(self):
+        """自适应 N 因子会放大 _calls_per_round（进而放大每轮成本与输出量）。"""
+        await self._configure(max_rounds=3)
+        orchestrator._call_factor = 1.0
+        n0 = orchestrator._calls_per_round()
+        self.assertEqual(n0, math.ceil(
+            (1 + len(orchestrator.collaborators)) * settings.BUDGET_TOOL_OVERHEAD))
+        orchestrator._call_factor = 2.5
+        self.assertEqual(
+            orchestrator._calls_per_round(), max(1, round(n0 * 2.5)))
+        # 因子作用于每轮提示词估算（总估算按 N/base 折算，N 变大则总成本变大）
+        orchestrator._call_factor = 1.0
+        p0 = orchestrator._estimate_round_prompt_tokens()
+        orchestrator._call_factor = 2.0
+        p1 = orchestrator._estimate_round_prompt_tokens()
+        self.assertGreater(p1, p0)
 
 
 if __name__ == "__main__":

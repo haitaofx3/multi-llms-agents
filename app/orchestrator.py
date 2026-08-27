@@ -129,6 +129,10 @@ class Orchestrator:
         # 自适应校准：启发式估算(≈len//2) 与 API 真实 usage 的偏差因子（EMA 平滑）
         self._est_factor = 1.0
         self._est_factor_samples = 0
+        # 自适应 N：工具调用循环真实 LLM 调用次数 / 规划 N 的偏差因子（EMA 平滑）
+        self._call_factor = 1.0
+        self._call_factor_samples = 0
+        self._round_real_calls = 0  # 本轮累计真实 LLM 调用次数（_agent_turn 内自增）
 
         # ---- 辩论状态 ----
         self._started_at = None
@@ -169,6 +173,9 @@ class Orchestrator:
         self._budget_plan = None
         self._est_factor = 1.0
         self._est_factor_samples = 0
+        self._call_factor = 1.0
+        self._call_factor_samples = 0
+        self._round_real_calls = 0
         self.phase = "idle"
         self.convergence_streak = 0
         self.round_arguments = {}
@@ -467,6 +474,7 @@ class Orchestrator:
 
             _used = self._apply_usage(result)
             token_cost += _used
+            self._round_real_calls += 1  # 自适应 N：真实 LLM 调用次数计数（含工具循环迭代）
             # 自适应校准：用本次真实用量与同一批消息的启发式估算更新偏差因子
             self._update_est_factor(
                 _used, _estimate_usage(messages, result.get("content") or "")["total_tokens"])
@@ -753,10 +761,31 @@ class Orchestrator:
         return round(total * self._calls_per_round() / base)
 
     def _calls_per_round(self) -> int:
-        """每轮 LLM 调用次数 = (主持人 + 协作辩手) × 工具调用乘数。"""
+        """每轮 LLM 调用次数 = (主持人 + 协作辩手) × 工具调用乘数 × 自适应 N 因子。"""
         import math
         base = 1 + len(self.collaborators)
-        return max(1, math.ceil(base * settings.BUDGET_TOOL_OVERHEAD))
+        return max(1, round(math.ceil(base * settings.BUDGET_TOOL_OVERHEAD) * self._call_factor))
+
+    def _update_call_factor(self, real_calls: int) -> None:
+        """自适应 N：用 本轮真实 LLM 调用次数 / 规划基数 的比值 EMA 平滑工具调用乘数。
+
+        实测值来自 _agent_turn 每完成一次真实 LLM 调用的计数（含工具循环迭代）。
+        基数 = ceil((1+C)×BUDGET_TOOL_OVERHEAD)（不含因子本身，便于日志解读）。
+        钳制在 [0.5, 5.0]，防止单轮异常（任务风暴/输出截断重试）失控。
+        只影响"尚未发生的预测"，已发生的费用永远按真实 usage 记账。
+        """
+        import math
+        base_n = max(1, math.ceil(
+            (1 + len(self.collaborators)) * settings.BUDGET_TOOL_OVERHEAD))
+        if real_calls <= 0 or base_n <= 0:
+            return
+        ratio = real_calls / base_n
+        self._call_factor = min(5.0, max(0.5, 0.8 * self._call_factor + 0.2 * ratio))
+        self._call_factor_samples += 1
+        self._log(
+            f"[预算校准N] 实测调用={real_calls} 基数={base_n} 比值={ratio:.2f}× "
+            f"因子→{self._call_factor:.2f}（样本#{self._call_factor_samples}）",
+            level="info", event="budget.call_factor")
 
     def _judge_prompt_tokens_now(self) -> int:
         """裁判当前轮次的提示词 token 估算（完整未截断的辩论记录）。"""
@@ -919,6 +948,9 @@ class Orchestrator:
         self._budget_plan = self._compute_plan("debate", self.max_rounds) if self.agents else None
         self._est_factor = 1.0
         self._est_factor_samples = 0
+        self._call_factor = 1.0
+        self._call_factor_samples = 0
+        self._round_real_calls = 0
         self.status = "running"
         self._pause_event.set()
         await self.event_bus.publish({
@@ -943,6 +975,7 @@ class Orchestrator:
                 self.round += 1
                 self.phase = "debating"
                 is_last = (self.round >= self.max_rounds)
+                self._round_real_calls = 0  # 本轮真实 LLM 调用计数清零（自适应 N）
                 # 预算规划：为「剩余轮次 + 裁判 + 汇总」算出本轮生效输出上限（降级阶梯）
                 await self._plan_for_round(self.max_rounds - self.round + 1)
                 await self.event_bus.publish({
@@ -1005,6 +1038,9 @@ class Orchestrator:
                               "且无新证据，提前进入裁决",
                               level="info", event="convergence.trigger")
                     break
+
+                # 5.5) 自适应 N 校准：用本轮真实调用次数更新工具调用乘数（影响下轮规划）
+                self._update_call_factor(self._round_real_calls)
 
                 # 6) 预算熔断（最后防线——预算规划器已尽量保证剩余轮次可完成）
                 remaining = self.budget - self.spent
@@ -1364,6 +1400,7 @@ class Orchestrator:
             "budget_overshoot": bool(plan.get("overshoot")),
             "budget_degraded": bool(plan.get("degraded")),
             "est_factor": round(self._est_factor, 2),  # 自适应校准因子（调试/观测用）
+            "call_factor": round(self._call_factor, 2),  # 自适应 N 因子（工具调用乘数校准）
             "elapsed_time_ms": int((time.time() - self._started_at) * 1000)
             if self._started_at else 0,
         }
