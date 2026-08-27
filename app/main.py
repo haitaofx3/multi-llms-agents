@@ -155,6 +155,7 @@ async def configure(payload: ConfigureRequest):
             orchestrator.budget = max(0, int(budget))
     except ValueError as e:
         return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+    feasibility = orchestrator.budget_preview("debate", orchestrator.max_rounds)
     return {
         "ok": True,
         "agents": [{"name": a.name, "role": a.role, "is_main": a.is_main,
@@ -167,6 +168,14 @@ async def configure(payload: ConfigureRequest):
         "budget": orchestrator.budget,
         "max_rounds": orchestrator.max_rounds,
         "max_tokens": orchestrator.max_tokens,
+        "feasibility": {
+            "effective_max_tokens": feasibility["effective_max_tokens"],
+            "feasible_rounds": feasibility["feasible_rounds"],
+            "projected_total": feasibility["projected_total"],
+            "overshoot": feasibility["overshoot"],
+            "degraded": feasibility["degraded"],
+            "tail_reserve": feasibility["tail_reserve"],
+        },
     }
 
 
@@ -262,6 +271,7 @@ async def end():
 @app.get("/api/status")
 async def status():
     remaining = max(0, orchestrator.budget - orchestrator.spent)
+    plan = orchestrator.budget_preview()
     return {
         "status": orchestrator.status,
         "phase": orchestrator.phase,
@@ -279,6 +289,11 @@ async def status():
         "budget": orchestrator.budget,
         "spent": orchestrator.spent,
         "remaining_budget": remaining,
+        "effective_max_tokens": orchestrator.effective_max_tokens,
+        "feasible_rounds": plan.get("feasible_rounds", 0),
+        "projected_total": plan.get("projected_total", orchestrator.spent),
+        "budget_overshoot": bool(plan.get("overshoot")),
+        "budget_degraded": bool(plan.get("degraded")),
         "elapsed_time_ms": int((time.time() - orchestrator._started_at) * 1000)
         if orchestrator._started_at else 0,
         "judgment": orchestrator.judgment,

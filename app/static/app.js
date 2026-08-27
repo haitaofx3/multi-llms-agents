@@ -302,6 +302,19 @@ async function startDiscussion() {
   $("discussion").classList.remove("hidden");
   setPill("running");
 
+  // 配置后立即展示预算可行性（预启动预警）
+  if (cfg.feasibility) {
+    renderRunStatus({
+      phase: "idle", current_round: 0, budget: cfg.budget,
+      remaining_budget: cfg.budget, spent_budget: 0,
+      effective_max_tokens: cfg.feasibility.effective_max_tokens,
+      feasible_rounds: cfg.feasibility.feasible_rounds,
+      projected_total: cfg.feasibility.projected_total,
+      budget_overshoot: cfg.feasibility.overshoot,
+      elapsed_time_ms: 0, trace_id: cfg.trace_id,
+    });
+  }
+
   // 启动讨论
   const st = await fetch("/api/start", {
     method: "POST", headers: {"Content-Type": "application/json"},
@@ -410,6 +423,11 @@ function handleEvent(ev) {
         phase: ev.phase, current_round: ev.round,
         remaining_budget: ev.remaining_budget != null ? ev.remaining_budget : (ev.budget != null ? ev.budget - (ev.spent || 0) : null),
         spent_budget: ev.spent,
+        budget: ev.budget,
+        effective_max_tokens: ev.effective_max_tokens,
+        feasible_rounds: ev.feasible_rounds,
+        projected_total: ev.projected_total,
+        budget_overshoot: ev.budget_overshoot,
         elapsed_time_ms: ev.elapsed_time_ms,
         trace_id: ev.trace_id,
       });
@@ -605,6 +623,11 @@ function startElapsedTick() {
         current_round: s.round,
         remaining_budget: s.remaining_budget,
         spent_budget: s.spent,
+        budget: s.budget,
+        effective_max_tokens: s.effective_max_tokens,
+        feasible_rounds: s.feasible_rounds,
+        projected_total: s.projected_total,
+        budget_overshoot: s.budget_overshoot,
         elapsed_time_ms: s.elapsed_time_ms,
         trace_id: s.trace_id,
       });
@@ -629,10 +652,17 @@ function renderRunStatus(data) {
     : "-";
   const elapsed = data.elapsed_time_ms != null
     ? `用时 ${(data.elapsed_time_ms / 1000).toFixed(1)}s` : "";
+  const eff = data.effective_max_tokens != null ? `生效输出上限 ${data.effective_max_tokens}` : "";
+  const feas = data.feasible_rounds != null ? `预算可支撑约 ${data.feasible_rounds} 轮` : "";
+  const warn = (data.budget_overshoot || (data.budget != null && data.projected_total != null
+              && data.projected_total > data.budget))
+    ? ' <span style="color:#d33">（预算不足，将降级/超支完成）</span>' : "";
   box.innerHTML = `
     <div class="kv"><b>阶段</b>：${phase}</div>
     <div class="kv"><b>轮次</b>：${round}</div>
     <div class="kv"><b>预算</b>：${budget}</div>
+    ${eff ? `<div class="kv"><b>生效上限</b>：${eff}</div>` : ""}
+    ${feas ? `<div class="kv"><b>预算可行性</b>：${feas}${warn}</div>` : ""}
     ${elapsed ? `<div class="kv"><b>${elapsed}</b></div>` : ""}
     ${data.trace_id ? `<div class="kv muted" style="font-size:11px">Trace: ${data.trace_id}</div>` : ""}
   `;

@@ -124,6 +124,8 @@ class Orchestrator:
         self.budget = settings.TOKEN_BUDGET
         self.spent = 0
         self.max_tokens = settings.MAX_TOKENS  # 单次模型输出上限（全局）
+        self.effective_max_tokens = self.max_tokens  # 预算规划器每轮计算的生效输出上限
+        self._budget_plan = None                      # 最近一次预算规划结果 dict
 
         # ---- 辩论状态 ----
         self._started_at = None
@@ -160,6 +162,8 @@ class Orchestrator:
         self.spent = 0
         if max_tokens:
             self.max_tokens = max(1, int(max_tokens))
+        self.effective_max_tokens = self.max_tokens
+        self._budget_plan = None
         self.phase = "idle"
         self.convergence_streak = 0
         self.round_arguments = {}
@@ -404,17 +408,17 @@ class Orchestrator:
                     try:
                         result = await self._consume_stream(
                             messages, agent.model_config, tools, _emit_delta,
-                            max_tokens=self.max_tokens)
+                            max_tokens=self.effective_max_tokens)
                     except Exception as e:
                         self._log(f"[LLM流式失败:{agent.name}] {e}，回退非流式",
                                   level="warning", event="llm.stream_fallback")
                         result = await self._run_llm_retry(
                             messages, agent.model_config, tools,
-                            max_tokens=self.max_tokens)
+                            max_tokens=self.effective_max_tokens)
                 else:
                     result = await self._run_llm_retry(
                         messages, agent.model_config, tools,
-                        max_tokens=self.max_tokens)
+                        max_tokens=self.effective_max_tokens)
             except Exception as e:
                 msg = f"[LLM错误:{agent.name}] {e}"
                 self._log(msg, level="error", event="llm.error")
@@ -684,6 +688,161 @@ class Orchestrator:
             self.convergence_streak = 0
         return self.convergence_streak >= settings.CONVERGENCE_ROUNDS
 
+    # ---------------- 预算规划与降级（budget planner） ----------------
+    def _estimate_call_prompt(self, agent: Agent, user_msg: str) -> int:
+        """估算一次 LLM 调用的提示词 token（system_prompt + history + user_msg）。
+
+        用于预算规划的前置估算；仅做保守估计，绝不抛异常。
+        """
+        from app.llm import _estimate_usage  # module-level helper, char//2 based
+        collaborators_meta = [{"name": c.name} for c in self.collaborators]
+        sys_prompt = agent.system_prompt(collaborators_meta, self.shared_context,
+                                         self._task_status_text(), "discussion", self.topic)
+        messages = [{"role": "system", "content": sys_prompt},
+                    *list(agent.history),
+                    {"role": "user", "content": user_msg}]
+        return _estimate_usage(messages)["prompt_tokens"]
+
+    def _estimate_round_prompt_tokens(self) -> int:
+        """一个完整辩论轮（主持人 + 各协作辩手）的提示词 token 估算。"""
+        total = 0
+        try:
+            if self.main:
+                total += self._estimate_call_prompt(
+                    self.main, self._main_directive(self.round, False, False, False))
+            for c in self.collaborators:
+                total += self._estimate_call_prompt(c, self._debate_prompt(c))
+        except Exception:
+            pass  # 规划绝不能因估算失败而中断辩论
+        return total
+
+    def _calls_per_round(self) -> int:
+        """每轮 LLM 调用次数 = (主持人 + 协作辩手) × 工具调用乘数。"""
+        import math
+        base = 1 + len(self.collaborators)
+        return max(1, math.ceil(base * settings.BUDGET_TOOL_OVERHEAD))
+
+    def _judge_prompt_tokens_now(self) -> int:
+        """裁判当前轮次的提示词 token 估算（完整未截断的辩论记录）。"""
+        judge_text = self._build_judge_debate_text()  # full untruncated transcript
+        return max(1, (len(judge_text) + 400) // 2)   # +400 chars: judge_sys + prompt wrappers
+
+    def _summary_prompt_tokens(self) -> int:
+        """主持人最终汇总的提示词 token 估算（bounded history ≤ CONTEXT_MAX_CHARS）。"""
+        return max(1, (settings.CONTEXT_MAX_CHARS + 2000) // 2)
+
+    def _tail_base_tokens(self) -> int:
+        """尾段基础成本 J0 + S0：裁判（当前记录）+ 最终汇总的提示词 token（输出为 0 时）。"""
+        j0 = 0 if not self.collaborators else self._judge_prompt_tokens_now()  # 无辩手时裁判短路
+        s0 = self._summary_prompt_tokens()
+        return max(settings.BUDGET_TAIL_RESERVE, j0 + s0)
+
+    def _compute_plan(self, phase: str = "debate", remaining_rounds: int = 0) -> dict:
+        """纯数学规划：求解 E（effective_max_tokens），使剩余工作 + 尾段落在预算内。
+
+        不修改任何状态。phase in {"debate","judge","summary"}。
+        """
+        if not self.agents:
+            return {"effective_max_tokens": self.max_tokens, "overshoot": False,
+                    "degraded": False, "feasible_rounds": 0,
+                    "projected_total": self.spent, "tail_reserve": 0}
+        floor = min(settings.BUDGET_OUTPUT_FLOOR, self.max_tokens)  # 永不高于用户设定上限
+        remaining = max(0, self.budget - self.spent)
+        base = self._tail_base_tokens()
+        R = max(0, remaining_rounds)
+        P = self._estimate_round_prompt_tokens() if phase == "debate" else 0
+        N = self._calls_per_round() if phase == "debate" else 0
+        S = max(1, len(self.collaborators)) if phase == "debate" else 0
+
+        if phase == "debate":
+            # E ≤ (remaining − base − R·P) / (R·N + R·S + 2)
+            #   R·S·E = 剩余轮次导致的裁判记录增长；2E = 裁判输出 + 汇总输出
+            numer, denom = remaining - base - R * P, R * N + R * S + 2
+        elif phase == "judge":
+            numer, denom = remaining - base, 2  # 裁判输出 + 剩余汇总输出
+        else:  # summary
+            numer, denom = remaining - self._summary_prompt_tokens(), 1
+
+        E = int(numer / denom) if (denom > 0 and numer > 0) else floor
+        E = max(floor, min(E, self.max_tokens))
+
+        # overshoot = 即便用下限输出，规划总成本仍超出剩余预算
+        if phase == "debate":
+            planned = R * P + (R * N + R * S + 2) * floor + base
+        elif phase == "judge":
+            planned = base + 2 * floor
+        else:
+            planned = self._summary_prompt_tokens() + floor
+        overshoot = planned > remaining
+
+        # projected_total = 已花费 + 采用 E 时剩余全程（含尾段）的规划成本
+        if phase == "debate":
+            projected = self.spent + R * P + (R * N + R * S + 2) * E + base
+        elif phase == "judge":
+            projected = self.spent + base + 2 * E
+        else:
+            projected = self.spent + self._summary_prompt_tokens() + E
+
+        # feasible_rounds：当前 E 下，剩余预算（扣除尾段）还能支撑几轮
+        den = max(1, P + (N + S) * E)
+        feasible = max(0, int((remaining - base - 2 * E) // den)) if phase == "debate" else 0
+
+        return {
+            "effective_max_tokens": E, "overshoot": overshoot,
+            "degraded": E < self.max_tokens, "feasible_rounds": feasible,
+            "projected_total": int(projected), "tail_reserve": int(base),
+            "phase": phase, "remaining_rounds": R,
+        }
+
+    def budget_preview(self, phase: str = "debate", remaining_rounds: int = 0) -> dict:
+        """当前规划（若有），否则即时同步估算（无副作用）。"""
+        return self._budget_plan or self._compute_plan(
+            phase, remaining_rounds or self.max_rounds)
+
+    async def _force_compress_all(self) -> None:
+        """预算吃紧：强制压缩所有 Agent 历史以缩小后续输入。"""
+        for a in self.agents:
+            try:
+                usage = await a.compress_history(force=True)
+                if usage:
+                    total = usage.get("total_tokens") or 0
+                    if total:
+                        self.spent += int(total)
+                        self.run_stats["compressions"] = \
+                            self.run_stats.get("compressions", 0) + 1
+            except Exception:
+                pass
+        self._log("预算吃紧：已强制压缩所有 Agent 历史以缩小输入",
+                  level="warning", event="budget.force_compress")
+
+    async def _plan_for_round(self, remaining_rounds: int) -> dict:
+        """为即将到来的辩论轮次计算 effective_max_tokens（降级阶梯）。
+
+        优先降输出上限；不足则强制压缩历史；仍不足则允许小幅超支完成，绝不中断。
+        """
+        plan = self._compute_plan("debate", remaining_rounds)
+        if plan["overshoot"] and remaining_rounds > 0:
+            # 降级第 2 步：强制压缩全部历史后重新规划（压缩已改变 agent 状态）
+            await self._force_compress_all()
+            plan = self._compute_plan("debate", remaining_rounds)
+            if plan["overshoot"]:
+                # 降级第 3 步：允许小幅超支，跑完辩论
+                self._log("预算不足以完成剩余轮次，允许小幅超支完成辩论",
+                          level="warning", event="budget.overshoot")
+        self.effective_max_tokens = plan["effective_max_tokens"]
+        self._budget_plan = plan
+        return plan
+
+    async def _plan_for_phase(self, phase: str) -> dict:
+        """裁判 / 汇总阶段的单次规划（压缩无法缩小记录，跳过降级阶梯）。"""
+        plan = self._compute_plan(phase=phase, remaining_rounds=0)
+        if plan["overshoot"]:
+            self._log(f"预算不足，{phase} 阶段允许小幅超支完成",
+                      level="warning", event="budget.overshoot")
+        self.effective_max_tokens = plan["effective_max_tokens"]
+        self._budget_plan = plan
+        return plan
+
     # ---------------- 讨论主循环 ----------------
     async def run_discussion(self, topic: str = "", max_rounds: int | None = None,
                              budget: int | None = None, max_tokens: int | None = None):
@@ -711,6 +870,9 @@ class Orchestrator:
         self.last_debate_speaker = None
         self.run_stats = {"compressions": 0, "started_at": time.time()}
         self.agent_metrics = {}
+        # 预算规划器状态：开局即做一次全量可行性预估
+        self.effective_max_tokens = self.max_tokens
+        self._budget_plan = self._compute_plan("debate", self.max_rounds) if self.agents else None
         self.status = "running"
         self._pause_event.set()
         await self.event_bus.publish({
@@ -735,6 +897,8 @@ class Orchestrator:
                 self.round += 1
                 self.phase = "debating"
                 is_last = (self.round >= self.max_rounds)
+                # 预算规划：为「剩余轮次 + 裁判 + 汇总」算出本轮生效输出上限（降级阶梯）
+                await self._plan_for_round(self.max_rounds - self.round + 1)
                 await self.event_bus.publish({
                     "type": "round", "round": self.round, "max": self.max_rounds,
                 })
@@ -796,11 +960,11 @@ class Orchestrator:
                               level="info", event="convergence.trigger")
                     break
 
-                # 6) 预算熔断（架构文档 §6.3）
+                # 6) 预算熔断（最后防线——预算规划器已尽量保证剩余轮次可完成）
                 remaining = self.budget - self.spent
-                if remaining < settings.MIN_TOKEN_THRESHOLD:
-                    self._log(f"预算熔断：剩余Token({remaining})低于阈值"
-                              f"({settings.MIN_TOKEN_THRESHOLD})，强制进入裁决",
+                plan = self._budget_plan or {}
+                if not plan.get("overshoot") and remaining < settings.MIN_TOKEN_THRESHOLD:
+                    self._log(f"预算熔断（最后防线）：剩余Token({remaining})低于阈值，强制进入裁决",
                               level="warning", event="budget.circuit_break")
                     break
 
@@ -821,7 +985,8 @@ class Orchestrator:
             else:
                 self.phase = "judging"
                 await self.event_bus.publish({"type": "status", "status": "running", "phase": self.phase})
-                # 裁判裁决不受预算熔断约束：即使预算耗尽也必须执行 LLM 裁决（优化项）
+                # 预算规划：为裁判阶段计算生效输出上限（裁判不受硬熔断约束）
+                await self._plan_for_phase("judge")
                 judgment = await self._judge_round()
                 self.judgment = judgment
                 await self.event_bus.publish({
@@ -838,15 +1003,15 @@ class Orchestrator:
                 })
                 await self.event_bus.publish(self._status_sync())
 
-                # ---- Finished：主持人汇总最终报告（同样受预算硬熔断约束） ----
+                # ---- Finished：主持人汇总最终报告（小额超支用 LLM 完成，严重超支才确定性回退） ----
                 self.phase = "finished"
-                remaining = self.budget - self.spent
-                if remaining >= settings.MIN_TOKEN_THRESHOLD:
-                    summary = await self._final_summary(judgment)
-                else:
-                    self._log(f"预算硬熔断：剩余Token({remaining})低于阈值，主持人汇总使用确定性回退",
+                await self._plan_for_phase("summary")
+                if self.spent > self.budget + settings.MIN_TOKEN_THRESHOLD:
+                    self._log(f"预算严重超支：已用({self.spent})超预算，主持人汇总使用确定性回退",
                               level="warning", event="budget.hard_break")
                     summary = self._fallback_summary(judgment)
+                else:
+                    summary = await self._final_summary(judgment)
                 await self._emit_summary(summary)
                 self.status = "done"
                 await self.event_bus.publish({"type": "status", "status": "done", "phase": self.phase})
@@ -1026,7 +1191,7 @@ class Orchestrator:
             result = await self._run_llm_retry(
                 [{"role": "system", "content": judge_sys},
                  {"role": "user", "content": prompt}],
-                judge_model, tools=None, temperature=0.3, max_tokens=self.max_tokens)
+                judge_model, tools=None, temperature=0.3, max_tokens=self.effective_max_tokens)
             self._apply_usage(result)
             data = self._extract_json(result["content"])
             judgment = Judgment(**data)
@@ -1133,6 +1298,7 @@ class Orchestrator:
 
     # ---------------- 状态同步（架构文档 §3.5） ----------------
     def _status_sync(self) -> dict:
+        plan = self._budget_plan or {}
         return {
             "type": "status_sync",
             "trace_id": self.trace_id,
@@ -1141,6 +1307,11 @@ class Orchestrator:
             "agent_states": {a.name: "IDLE" for a in self.agents},
             "remaining_budget": max(0, self.budget - self.spent),
             "spent_budget": self.spent,
+            "effective_max_tokens": self.effective_max_tokens,
+            "feasible_rounds": plan.get("feasible_rounds", 0),
+            "projected_total": plan.get("projected_total", self.spent),
+            "budget_overshoot": bool(plan.get("overshoot")),
+            "budget_degraded": bool(plan.get("degraded")),
             "elapsed_time_ms": int((time.time() - self._started_at) * 1000)
             if self._started_at else 0,
         }

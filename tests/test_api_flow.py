@@ -9,7 +9,9 @@ _judge_round / _final_summary）实现确定性输出，覆盖：
   2. /api/save_markdown 路径穿越防护（filename 仅保留 basename）；
   3. /api/save_markdown 空请求体（前端发送无 body 的 POST）可用默认文件名；
   4. /api/configure 空 Agent 列表返回既有 400 错误契约；
-  5. /api/configure 的 max_tokens 透传到 orchestrator.max_tokens。
+  5. /api/configure 的 max_tokens 透传到 orchestrator.max_tokens；
+  6. /api/configure 返回预算可行性（feasibility）；
+  7. /api/status 携带预算规划字段（生效输出上限 / 可达轮数 / 预估总耗）。
 
 运行方式（无需服务器、无需真实 LLM）：
     python -m unittest tests.test_api_flow -v
@@ -166,6 +168,41 @@ class ApiFlowTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(cfg2.status_code, 200, cfg2.text)
         self.assertIsInstance(cfg2.json().get("max_tokens"), int)
         self.assertEqual(cfg2.json()["max_tokens"], orchestrator.max_tokens)
+
+    async def test_configure_returns_feasibility(self):
+        """/api/configure 应返回预算可行性（生效上限 / 可达轮数 / 预估总耗 / 是否超支）。"""
+        cfg = await self.client.post("/api/configure", json={
+            "agents": [HOST_CFG, PRO_CFG, CON_CFG], "topic": "预算可行性",
+            "max_rounds": 3, "budget": 1_000_000, "max_tokens": 4096,
+        })
+        self.assertEqual(cfg.status_code, 200, cfg.text)
+        data = cfg.json()
+        self.assertTrue(data["ok"])
+        feas = data.get("feasibility")
+        self.assertIsNotNone(feas)
+        for key in ("effective_max_tokens", "feasible_rounds", "projected_total",
+                    "overshoot", "degraded", "tail_reserve"):
+            self.assertIn(key, feas)
+        self.assertEqual(feas["effective_max_tokens"], 4096)
+        self.assertGreaterEqual(feas["feasible_rounds"], 3)
+        self.assertIs(feas["overshoot"], False)
+
+    async def test_api_status_has_budget_plan_fields(self):
+        """/api/status 应携带预算规划字段（供前端状态栏展示与预警）。"""
+        cfg = await self.client.post("/api/configure", json={
+            "agents": [HOST_CFG, PRO_CFG], "topic": "预算状态",
+            "max_rounds": 2, "budget": 100000,
+        })
+        self.assertEqual(cfg.status_code, 200, cfg.text)
+        r = await self.client.get("/api/status")
+        self.assertEqual(r.status_code, 200)
+        s = r.json()
+        for key in ("effective_max_tokens", "feasible_rounds", "projected_total",
+                    "budget_overshoot", "budget_degraded"):
+            self.assertIn(key, s)
+        self.assertIsInstance(s["effective_max_tokens"], int)
+        self.assertIsInstance(s["feasible_rounds"], int)
+        self.assertIsInstance(s["budget_overshoot"], bool)
 
 
 if __name__ == "__main__":

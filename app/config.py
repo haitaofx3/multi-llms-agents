@@ -117,8 +117,13 @@ class Settings:
 
     # ---- Token 预算与熔断（架构文档 §6.3） ----
     TOKEN_BUDGET = _int("TOKEN_BUDGET", 100000)              # 单场辩论全局预算
-    MIN_TOKEN_THRESHOLD = _int("MIN_TOKEN_THRESHOLD", 1000)   # 低于此阈值强制结束
+    MIN_TOKEN_THRESHOLD = _int("MIN_TOKEN_THRESHOLD", 1000)   # 低于此阈值强制结束（预算规划器最后防线）
     MAX_TOKENS = _int("MAX_TOKENS", 4096)                     # 单次模型输出上限（全局）
+
+    # ---- 预算规划与降级（budget planner） ----
+    BUDGET_OUTPUT_FLOOR = _int("BUDGET_OUTPUT_FLOOR", 256)        # 单次输出下限；低于此触发压缩/超支
+    BUDGET_TAIL_RESERVE = _int("BUDGET_TAIL_RESERVE", 8000)       # 裁判+汇总 尾段保留下限（动态估算的下限）
+    BUDGET_TOOL_OVERHEAD = _float("BUDGET_TOOL_OVERHEAD", 1.5)    # 工具调用迭代对 LLM 调用次数的乘数
 
     # ---- 收敛检测（架构文档 §4.3/4.4） ----
     CONVERGENCE_SIMILARITY = _float("CONVERGENCE_SIMILARITY", 0.85)
