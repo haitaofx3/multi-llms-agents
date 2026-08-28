@@ -11,7 +11,7 @@ _judge_round / _final_summary）实现确定性输出，覆盖：
   4. /api/configure 空 Agent 列表返回既有 400 错误契约；
   5. /api/configure 的 max_tokens 透传到 orchestrator.max_tokens；
   6. /api/configure 返回预算可行性（feasibility）；
-  7. /api/status 携带预算规划字段（生效输出上限 / 可达轮数 / 预估总耗）。
+  7. /api/status 携带预算规划字段（生效输出上限 / 可达轮数 / 预估总耗 / 校准因子）。
 
 运行方式（无需服务器、无需真实 LLM）：
     python -m unittest tests.test_api_flow -v
@@ -198,11 +198,20 @@ class ApiFlowTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(r.status_code, 200)
         s = r.json()
         for key in ("effective_max_tokens", "feasible_rounds", "projected_total",
-                    "budget_overshoot", "budget_degraded"):
+                    "budget_overshoot", "budget_degraded",
+                    "est_factor", "call_factor", "growth_ratio",
+                    "safety_margin", "prompt_forecast"):
             self.assertIn(key, s)
         self.assertIsInstance(s["effective_max_tokens"], int)
         self.assertIsInstance(s["feasible_rounds"], int)
         self.assertIsInstance(s["budget_overshoot"], bool)
+        # 校准因子 / 安全余量 / 提示词预估：前端预算面板渲染所需
+        self.assertIsInstance(s["est_factor"], float)
+        self.assertIsInstance(s["call_factor"], float)
+        self.assertIsInstance(s["growth_ratio"], float)
+        self.assertIsInstance(s["safety_margin"], float)
+        self.assertIsInstance(s["prompt_forecast"], int)
+        self.assertGreaterEqual(s["est_factor"], 1.0)  # 保守先验 / 档案载入均钳制 ≥1.0
 
 
 if __name__ == "__main__":

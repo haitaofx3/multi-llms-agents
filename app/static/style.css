@@ -254,6 +254,34 @@ button.ghost-btn:hover { color: var(--gold); border-color: rgba(184,134,45,.5); 
 .task-item .doing { color: var(--warn); }
 .task-item .t-body { color: var(--muted); font-size: 12px; margin-top: 3px; }
 
+/* ---------------- 预算状态面板 ---------------- */
+.budget-bar {
+  height: 8px; background: var(--surface2); border-radius: 4px;
+  overflow: hidden; margin: 8px 0 4px;
+}
+.budget-bar-fill {
+  height: 100%; background: var(--accent); border-radius: 4px;
+  transition: width .3s ease;
+}
+.budget-bar.over .budget-bar-fill { background: var(--err); }
+.budget-sub {
+  margin-top: 14px; padding-top: 12px; border-top: 1px dashed var(--border-soft);
+}
+.budget-events {
+  max-height: 96px; overflow-y: auto; font-size: 12px;
+}
+.budget-event {
+  display: flex; align-items: baseline; gap: 6px;
+  padding: 3px 0; color: var(--muted); line-height: 1.4;
+}
+.ev-tag {
+  flex-shrink: 0; font-size: 10px; padding: 1px 6px;
+  border-radius: 8px; letter-spacing: .4px;
+}
+.ev-warn { color: var(--gold); background: rgba(184,134,45,.12); }
+.ev-err { color: var(--err); background: rgba(196,61,61,.12); }
+.ev-ok { color: var(--ok); background: rgba(63,122,88,.12); }
+
 /* ---------------- 讨论记录（聊天气泡） ---------------- */
 .transcript-box {
   margin-top: 22px; background: var(--surface);

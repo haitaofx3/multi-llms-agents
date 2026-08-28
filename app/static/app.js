@@ -16,6 +16,7 @@ const state = {
   currentHistory: null,   // 正在查看的历史记录 {filename, topic, ...}
   historyActiveFilename: null,
   elapsedTimer: null,   // 实时耗时轮询定时器（讨论中每秒刷新）
+  budgetEvents: [],     // 预算告警事件（结构化展示，保留最近 6 条）
 };
 
 const STATUS_TEXT = {
@@ -304,14 +305,27 @@ async function startDiscussion() {
 
   // 配置后立即展示预算可行性（预启动预警）
   if (cfg.feasibility) {
+    const feas = cfg.feasibility;
     renderRunStatus({
       phase: "idle", current_round: 0, budget: cfg.budget,
       remaining_budget: cfg.budget, spent_budget: 0,
-      effective_max_tokens: cfg.feasibility.effective_max_tokens,
-      feasible_rounds: cfg.feasibility.feasible_rounds,
-      projected_total: cfg.feasibility.projected_total,
-      budget_overshoot: cfg.feasibility.overshoot,
+      effective_max_tokens: feas.effective_max_tokens,
+      feasible_rounds: feas.feasible_rounds,
+      projected_total: feas.projected_total,
+      budget_overshoot: feas.overshoot,
       elapsed_time_ms: 0, trace_id: cfg.trace_id,
+    });
+    renderBudgetPanel({
+      budget: cfg.budget,
+      spent_budget: 0,
+      remaining_budget: cfg.budget,
+      effective_max_tokens: feas.effective_max_tokens,
+      feasible_rounds: feas.feasible_rounds,
+      projected_total: feas.projected_total,
+      budget_overshoot: feas.overshoot,
+      budget_degraded: feas.degraded,
+      safety_margin: feas.safety_margin,
+      prompt_forecast: feas.prompt_forecast,
     });
   }
 
@@ -422,7 +436,7 @@ function handleEvent(ev) {
       renderRunStatus({
         phase: ev.phase, current_round: ev.round,
         remaining_budget: ev.remaining_budget != null ? ev.remaining_budget : (ev.budget != null ? ev.budget - (ev.spent || 0) : null),
-        spent_budget: ev.spent,
+        spent_budget: ev.spent_budget != null ? ev.spent_budget : ev.spent,
         budget: ev.budget,
         effective_max_tokens: ev.effective_max_tokens,
         feasible_rounds: ev.feasible_rounds,
@@ -431,6 +445,7 @@ function handleEvent(ev) {
         elapsed_time_ms: ev.elapsed_time_ms,
         trace_id: ev.trace_id,
       });
+      renderBudgetPanel(ev);
       if (ev.status === "done" || ev.status === "stopped") {
         stopElapsedTick();
         $("done-bar").classList.remove("hidden");
@@ -500,6 +515,7 @@ function handleEvent(ev) {
       break;
     case "status_sync":
       renderRunStatus(ev);
+      renderBudgetPanel(ev);
       break;
     case "judgment": {
       const scoreTxt = Object.entries(ev.scores || {})
@@ -525,6 +541,7 @@ function handleEvent(ev) {
     }
     case "log":
       addMsg("系统", ev.text, "log", null, "");
+      addBudgetEvent(ev);   // budget.* 告警事件额外进入结构化面板
       break;
     case "agent_error":
       addMsg(ev.agent || "系统", ev.error, "error", null, "模型调用失败");
@@ -622,7 +639,7 @@ function startElapsedTick() {
         phase: s.phase,
         current_round: s.round,
         remaining_budget: s.remaining_budget,
-        spent_budget: s.spent,
+        spent_budget: s.spent_budget != null ? s.spent_budget : s.spent,
         budget: s.budget,
         effective_max_tokens: s.effective_max_tokens,
         feasible_rounds: s.feasible_rounds,
@@ -631,6 +648,7 @@ function startElapsedTick() {
         elapsed_time_ms: s.elapsed_time_ms,
         trace_id: s.trace_id,
       });
+      renderBudgetPanel(s);
     } catch (e) { /* 轮询失败时静默忽略，下次再试 */ }
   }, 1000);
 }
@@ -666,6 +684,91 @@ function renderRunStatus(data) {
     ${elapsed ? `<div class="kv"><b>${elapsed}</b></div>` : ""}
     ${data.trace_id ? `<div class="kv muted" style="font-size:11px">Trace: ${data.trace_id}</div>` : ""}
   `;
+}
+
+// ---------------- 预算状态面板 ----------------
+// 结构化展示预算进度 / 校准因子，并把 budget.* 告警事件渲染为彩色标签（防 XSS：全部 textContent）
+const BUDGET_EVENT_TEXT = {
+  "budget.force_compress":   { text: "强制压缩历史", level: "warn" },
+  "budget.overshoot":        { text: "允许小幅超支", level: "warn" },
+  "budget.round_trim":       { text: "自动削减轮次", level: "warn" },
+  "budget.phase_min_output": { text: "输出抬至保底", level: "ok" },
+  "budget.circuit_break":    { text: "预算熔断", level: "err" },
+  "budget.hard_break":       { text: "硬熔断回退", level: "err" },
+};
+
+function fmtTokens(n) {
+  return n == null ? "-" : n.toLocaleString();
+}
+
+function renderBudgetPanel(data) {
+  const box = $("budget-panel");
+  if (!box) return;
+  // status_sync 无 budget 总量：由「已用 + 剩余」反推
+  const spent = data.spent_budget != null ? data.spent_budget : data.spent;
+  const total = data.budget != null ? data.budget
+    : (spent != null && data.remaining_budget != null ? spent + data.remaining_budget : null);
+  const remaining = data.remaining_budget != null ? data.remaining_budget
+    : (total != null && spent != null ? Math.max(0, total - spent) : null);
+  if (total == null && spent == null && remaining == null) {
+    box.innerHTML = '<div class="muted">未开始</div>';
+    return;
+  }
+  const over = !!(data.budget_overshoot || (total != null && spent != null && spent > total));
+  const pct = (total != null && spent != null) ? Math.min(100, Math.round(spent / total * 100)) : 0;
+  const rows = [];
+  if (remaining != null) rows.push(`<div class="kv"><b>预算剩余</b>：${fmtTokens(remaining)}</div>`);
+  if (spent != null) rows.push(`<div class="kv"><b>预算已用</b>：${fmtTokens(spent)}</div>`);
+  if (total != null) rows.push(`<div class="kv"><b>预算总量</b>：${fmtTokens(total)}</div>`);
+  if (data.effective_max_tokens != null) {
+    const deg = data.budget_degraded ? ' <span class="muted">（降级）</span>' : "";
+    rows.push(`<div class="kv"><b>输出上限</b>：${fmtTokens(data.effective_max_tokens)}${deg}</div>`);
+  }
+  if (data.projected_total != null) {
+    let proj = `<b>预计总耗</b>：${fmtTokens(data.projected_total)}`;
+    if (total != null && data.projected_total > total) {
+      proj += ` <span class="muted">（超预算 ${Math.round((data.projected_total - total) / total * 100)}%）</span>`;
+    }
+    rows.push(`<div class="kv">${proj}</div>`);
+  }
+  if (data.feasible_rounds != null) {
+    const m = data.safety_margin != null
+      ? ` <span class="muted">（安全余量 ${Math.round(data.safety_margin * 100)}%）</span>` : "";
+    rows.push(`<div class="kv"><b>可支撑轮数</b>：${data.feasible_rounds}${m}</div>`);
+  }
+  if (data.est_factor != null || data.call_factor != null || data.growth_ratio != null) {
+    const est = data.est_factor != null ? `${data.est_factor}×` : "-";
+    const call = data.call_factor != null ? `${data.call_factor}×` : "-";
+    const g = data.growth_ratio != null ? `${data.growth_ratio}×` : "-";
+    rows.push(`<div class="kv"><b>校准因子</b>：提示词 ${est} / 调用 ${call} / 增长 ${g}</div>`);
+  }
+  box.innerHTML = `
+    <div class="budget-bar${over ? " over" : ""}"><div class="budget-bar-fill" style="width:${pct}%"></div></div>
+    ${rows.join("")}
+  `;
+}
+
+function addBudgetEvent(ev) {
+  const meta = BUDGET_EVENT_TEXT[ev.event];
+  if (!meta) return;   // 非预算告警事件（含 EMA 频发事件 / 档案载入保存）不入面板
+  state.budgetEvents.unshift({ tag: meta.text, level: meta.level, time: new Date().toLocaleTimeString() });
+  if (state.budgetEvents.length > 6) state.budgetEvents.length = 6;
+  const box = $("budget-events");
+  if (!box) return;
+  box.innerHTML = "";
+  state.budgetEvents.forEach(e => {
+    const row = document.createElement("div");
+    row.className = "budget-event";
+    const tag = document.createElement("span");
+    tag.className = `ev-tag ev-${e.level}`;
+    tag.textContent = e.tag;
+    const t = document.createElement("span");
+    t.className = "muted";
+    t.textContent = e.time;
+    row.appendChild(tag);
+    row.appendChild(t);
+    box.appendChild(row);
+  });
 }
 
 // ---------------- 历史讨论（记忆检索 / 查看 / 导出） ----------------

@@ -175,6 +175,8 @@ async def configure(payload: ConfigureRequest):
             "overshoot": feasibility["overshoot"],
             "degraded": feasibility["degraded"],
             "tail_reserve": feasibility["tail_reserve"],
+            "safety_margin": feasibility.get("safety_margin", 0.0),
+            "prompt_forecast": feasibility.get("prompt_forecast", 0),
         },
     }
 
@@ -294,6 +296,11 @@ async def status():
         "projected_total": plan.get("projected_total", orchestrator.spent),
         "budget_overshoot": bool(plan.get("overshoot")),
         "budget_degraded": bool(plan.get("degraded")),
+        "est_factor": round(orchestrator._est_factor, 2),
+        "call_factor": round(orchestrator._call_factor, 2),
+        "growth_ratio": round(orchestrator._growth_ratio, 2),
+        "safety_margin": plan.get("safety_margin", 0.0),
+        "prompt_forecast": plan.get("prompt_forecast", 0),
         "elapsed_time_ms": int((time.time() - orchestrator._started_at) * 1000)
         if orchestrator._started_at else 0,
         "judgment": orchestrator.judgment,
@@ -378,6 +385,11 @@ async def ws_endpoint(websocket: WebSocket):
             "max_rounds": orchestrator.max_rounds,
             "budget": orchestrator.budget,
             "spent": orchestrator.spent,
+            "remaining_budget": max(0, orchestrator.budget - orchestrator.spent),
+            "spent_budget": orchestrator.spent,
+            "est_factor": round(orchestrator._est_factor, 2),
+            "call_factor": round(orchestrator._call_factor, 2),
+            "growth_ratio": round(orchestrator._growth_ratio, 2),
             "agents": [{"name": a.name, "role": a.role, "is_main": a.is_main,
                         "stance": a.stance} for a in orchestrator.agents],
         })
