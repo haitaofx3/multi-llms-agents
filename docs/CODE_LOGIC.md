@@ -105,6 +105,8 @@ HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 python start.py
 | **收敛检测** | `CONVERGENCE_SIMILARITY`（默认 0.85）、`CONVERGENCE_ROUNDS`（默认 2） |
 | **LLM 重试** | `LLM_RETRY_ATTEMPTS`（默认 3）、`LLM_RETRY_DELAYS`（(1.0, 3.0)） |
 | **流式超时** | `STREAM_TIMEOUT`（默认 300s，对齐 `LLM_TIMEOUT`） |
+| **辩论对手/输出约束** | `OPPONENT_SNIPPET_MAX_CHARS`（第 2 轮对手发言原文截断上限，默认 500 字）、`OPPONENT_SUMMARY_MAX_CHARS`（第 3 轮起对手发言 LLM 摘要上限，默认 200 字）、`OUTPUT_CHAR_PER_TOKEN`（每 token 换算字数，中文约 2 字/token，默认 2）、`BUDGET_KEEP_LAST_ROUNDS`（预算吃紧强压缩时保留的最近轮次，默认 2） |
+| **记忆压缩** | `MEMORY_SUMMARY_MAX_CHARS`（短期 → 情境的 LLM 聚合摘要上限，默认 200 字） |
 
 > `PROJECT_ROOT = Path(__file__).resolve().parent.parent`（`app/` 的上一级）供其余模块定位项目根目录与资源目录。
 
@@ -146,6 +148,12 @@ HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 python start.py
   - `{"type":"final","result":{...}}`：流结束，携带完整结果（结构同 `chat()`）。
 - `ThinkFilter` 类处理**跨 chunk 边界**的 `<think>`/`</think>` 剥离：维护短缓冲，当尾部是 `<think>` 前缀时暂存等待后续 chunk，保证流式结果与非流式 `_strip_think` 一致。
 
+### 5.5 摘要工具 `summarize_text(model_config, text, max_chars)`
+共享的 LLM 压缩工具，供**对手发言摘要**与**历史强压缩**复用：
+- `asyncio.to_thread` 调用同步 `chat()`，要求输出 ≤ `max_chars` 字的浓缩摘要，返回 `(summary, usage|None)`。
+- 调用失败 / 返回为空 / 超长时回退 `_fallback_truncate(text, max_chars)`：确定性保留**头部 + 尾部**片段（以 `…` 相连），保证绝不超过 `max_chars`、不因摘要失败抛异常。
+- 短文本（≤ max_chars）原样返回，不做无谓调用。
+
 ---
 
 ## 6. 嵌入与向量库
@@ -185,7 +193,7 @@ HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 python start.py
 ### 7.2 转化（互相转化）
 - `_promote_or_drop_short()`：短期溢出时，最不重要者移除，重要者（`≥promote_importance*0.6`）提升为长期。
 - `promote_short_to_long(min_importance=0.75)`：**短期 → 长期** 的显式提升。
-- `summarize_short_to_context(summarizer=None)`：**短期 → 情境** 的压缩（默认简单拼接，可选 LLM 摘要），压缩后清空短期缓冲。
+- `summarize_short_to_context(summarizer=None)`：**短期 → 情境** 的压缩（`async`；支持同步/异步 `summarizer(texts)->str`，失败回退拼接），压缩后清空短期缓冲。编排器在记忆管家（§12.6 第 4 步）偶数轮传入 LLM 摘要器（`summarize_text` + `MEMORY_SUMMARY_MAX_CHARS`），摘要 usage 计入预算。
 - 长期 ⇄ 情境：检索时合并长期事实与情境摘要，互相补充。
 
 ### 7.3 遗忘体系（每 Agent 可独立配置 `forget_config`）
@@ -272,6 +280,14 @@ Agent(agent_id, name, role, personality, model_config, is_main, forget_config, s
    - 协作 Agent（task 模式）：只通过 `report_result` 返回**最终结果 + 是否完成**；
    - 协作 Agent（discussion 模式）：针对他人观点辩护/反驳，可调用 `knowledge_search` 检索论据。
 
+### 10.2 历史轮次标记与按轮强压缩（辩论机制）
+`history` 的**平行列表** `history_rounds`：每条历史消息记录所属辩论轮次（`append_history(role, content, round_no)`，缺省取当前最大轮次）。
+
+- **三处裁剪必须同步**：① 条数上限（`max_history` 滚动窗口）；② 字符硬上限（`CONTEXT_MAX_CHARS`，超限丢最旧轮次）；③ 压缩截断。三处均同时裁剪 `history` 与 `history_rounds`，否则「按轮保留」会错位。
+- `compress_history(force, keep_rounds=None)`：`keep_rounds=None` 走优化 A9 原逻辑（保留最近 `CONTEXT_COMPRESS_KEEP_RECENT` 条）；`keep_rounds=N` 委托 `_compress_keep_rounds(N)`（需求 6）。
+- `_compress_keep_rounds(keep_rounds)`：**从尾部扫描最近 N 个不同轮次**的起始下标 `cut`，`history[:cut]` 全部经 `_summarize`（`summarize_text`，失败回退确定性截断）压入 `compressed_summary`（与既有摘要拼接），保留 `history[cut:]` 原文；不同轮次数 ≤ N 时无需压缩返回 `None`。
+- `reset_history()` 同时清空 `history_rounds`。
+
 ---
 
 ## 11. RAG 事实核查服务 — `rag.py`（架构文档 §2.5）
@@ -328,8 +344,9 @@ Agent(agent_id, name, role, personality, model_config, is_main, forget_config, s
 6. 每次调用 `_apply_usage(result)` 累加 `spent`；
 7. 收到首个文本增量即推送 `speech_start`，随后逐个 `speech_delta`；
 8. 工具调用循环：主 Agent `delegate_task` → 收集 `delegate`；协作 Agent `report_result` → 收集 `report`；普通工具 → `mcp.call` 并把 tool 消息回传，继续循环；
-9. 回合结束若发生过流式发言，补发 `speech_end`（携带完整文本）并写入 transcript；
-10. 把 user/assistant 写入 `history`，返回 `{content, delegate, report, streamed, token_cost}`。
+9. **输出字数约束（需求 5）**：`mode=="discussion"` 时按 `limit = max(1, int(effective_max_tokens × OUTPUT_CHAR_PER_TOKEN))` 截断超长发言（`content[:limit].rstrip()`，事件 `debate.output_truncate`）——提示词字数要求失效时仍受硬截断兜底；
+10. 回合结束若发生过流式发言，补发 `speech_end`（携带完整文本）并写入 transcript；
+11. 把 user/assistant 写入 `history`（带 `round_no=self.round`，与 `history_rounds` 平行），返回 `{content, delegate, report, streamed, token_cost}`。
 
 **`_consume_stream`**：后台线程 + `asyncio.Queue` 桥接，`wait_for` 整体超时（`STREAM_TIMEOUT`）；`_drain` 消费 chunk 时实测 `ttft_s`（首 token 延迟）/ `gen_s` / `chars`，随结果返回 `metrics`。
 **`_run_llm_retry`**：`asyncio.to_thread(chat, ...)` 包装，指数退避重试。
@@ -351,7 +368,8 @@ while round < max_rounds:
     # 1) 主持人回合（分派 / 追问）→ _create_task + task_assigned 事件
     # 2) 协作 Agent 回合：
     #    第 1 轮 → asyncio.gather 并行立论（架构文档 §4.2/§6.2）
-    #    后续轮 → 串行反驳/辩护（依赖对方最新论点）
+    #    后续轮 → 串行反驳/辩护（_prepare_opponent_context 注入对手上轮发言：
+    #              第 2 轮原文截断 / 第 3 轮起 LLM 摘要）
     # 3) RAG 事实核查（_rag_check_round，异步注入下一轮上下文）
     # 4) 记忆管家（_memory_housekeeping：提升/压缩/遗忘）
     # 5) 收敛检测（_check_convergence）→ 连续 N 轮相似且无新证据则 break
@@ -376,9 +394,9 @@ while round < max_rounds:
   - `R` = 剩余轮次；`P` = 每轮提示词 token 估算（见下）；`N` = 每轮 LLM 调用次数（含工具循环）；`S` = 辩手数（裁判记录随轮次增长）；`2E` = 裁判输出 + 汇总输出；
   - **历史增长模型**：`prompt_cost(R) = R·P + g·P·R·(R−1)/2`（算术级数）——后续轮次历史变长、输入递增，不再按常数 R·P 低估；
   - 同时计算 `overshoot`（即便用下限输出仍超支）、`projected_total`、`feasible_rounds`、`degraded`。
-- **降级阶梯**（`_plan_for_round`）：① 优先降 `effective_max_tokens` 上限（不低于阶段输出保底，见下）；② 仍超支则 `_force_compress_all()` 强制压缩全部 Agent 历史后重新规划；③ 仍不足且 `BUDGET_AUTO_TRIM_ROUNDS=1` 时**自动削减轮次**（`feasible_rounds` 反解最大可行轮次，`max_rounds` 裁剪到该值，本轮跑完即进裁决，事件 `budget.round_trim`）；④ 仍不足则允许小幅超支跑完（`budget.overshoot`），**辩论绝不中断**。预算熔断 `budget.circuit_break` 仅作最后防线（剩余 < `MIN_TOKEN_THRESHOLD`）。
+- **降级阶梯**（`_plan_for_round`）：① 优先降 `effective_max_tokens` 上限（不低于阶段输出保底，见下）；② 仍超支则 `_force_compress_all()` 强制压缩全部 Agent 历史后重新规划（**需求 6：按轮强压缩，只保留最近 `BUDGET_KEEP_LAST_ROUNDS` 轮原文，更早轮次压入 `compressed_summary`**）；③ 仍不足且 `BUDGET_AUTO_TRIM_ROUNDS=1` 时**自动削减轮次**（`feasible_rounds` 反解最大可行轮次，`max_rounds` 裁剪到该值，本轮跑完即进裁决，事件 `budget.round_trim`）；④ 仍不足则允许小幅超支跑完（`budget.overshoot`），**辩论绝不中断**。预算熔断 `budget.circuit_break` 仅作最后防线（剩余 < `MIN_TOKEN_THRESHOLD`）。
 - **阶段输出保底**：裁判/汇总的 `effective_max_tokens` 不低于 `JUDGE_MIN_OUTPUT` / `SUMMARY_MIN_OUTPUT`（默认 512）——当反解 E 低于保底时提升到保底并记 `budget.phase_min_output`（即使超支也保证裁决 JSON 完整，避免空 JSON 确定性回退）。
-- **每轮 N 次调用建模**：`_calls_per_round()` = `ceil((1+C)×BUDGET_TOOL_OVERHEAD)`（C=协作辩手数，默认乘数 1.5，即同一辩手可能多次工具调用）；`_estimate_round_prompt_tokens()` 按 N 次调用折算每轮提示词成本（而非每位辩手一次）。
+- **每轮 N 次调用建模**：`_calls_per_round()` = `ceil((1+C)×BUDGET_TOOL_OVERHEAD)`（C=协作辩手数，默认乘数 1.5，即同一辩手可能多次工具调用）；`_estimate_round_prompt_tokens()` 按 N 次调用折算每轮提示词成本（而非每位辩手一次）。**第 3 轮起**每轮为每个 PRO/CON 辩手额外计入对手发言摘要的输入成本（`OPPONENT_SUMMARY_MAX_CHARS // 2 + 200` token），摘要本身由预算记账（`self.spent`）但规划时已折算。
 - **自适应校准（三路 EMA，只放大"尚未发生的预测"，已发生费用永远按真实 usage 记账）**：
   - `_est_factor`（提示词尺寸偏差）：每次真实 LLM 调用后，用 `实测 total_tokens / 启发式估算` 的比值 EMA 更新（α=0.2，钳制 [0.5, 10]），作用于提示词估算。真实冒烟中首轮样例会达 2.68×，收敛后稳定在 ~1.3×。
   - `_call_factor`（工具调用次数偏差）：每轮结束用 `本轮实测 LLM 调用次数 / 基数 ceil((1+C)×1.5)` 的比值 EMA 更新（α=0.2，钳制 [0.5, 5]），作用于 `_calls_per_round()`。真实冒烟实测每轮真实调用约为基数的 1.2–3.2×。
@@ -386,9 +404,15 @@ while round < max_rounds:
   - **档案持久化**：三因子在正常结束时写入 `data/budget_profile.json`（`_save_profile`，IO 失败仅警告），启动时 `_load_profile()` 载入；无档案时用保守先验 `EST_FACTOR_INIT=2.0`（历史乐观档案的 est_factor 钳制 ≥1.0）。不再每轮重置为 1.0——首轮规划即基于历史校准，而非盲目乐观的 1.0。
 - **观测**：`_status_sync` 暴露 `feasible_rounds / projected_total / budget_overshoot / budget_degraded / est_factor / call_factor / growth_ratio / prompt_forecast / safety_margin`；降级事件以 `budget.force_compress`（日志如实报告"实际压缩 X 个 / 历史过短跳过 Y 个"，短历史压缩为空转）、`budget.round_trim`、`budget.overshoot`、`budget.circuit_break` 记录。
 
-### 12.8 协作 Agent 回合 `_collab_turn(collab)`
+### 12.8 协作 Agent 回合与对手定向反驳（需求 1–5）
+**`_collab_turn(collab)`**：
 - 有未完成任务：逐个 `_agent_turn(..., mode="task")`；收到 `report` → `_apply_report` + 发布 `task_result`；未回报则 `rounds_waiting+1`，超 3 轮强制标记完成。
-- 无任务（辩论环节）：`_debate_prompt(collab)` 构造立论/反驳 prompt（含上一轮 RAG 证据注入），`_agent_turn(..., mode="discussion", stream=True)`。
+- 无任务（辩论环节）：先 `await self._prepare_opponent_context(collab)` 准备对手上轮发言，再 `_debate_prompt(collab)` 构造立论/反驳 prompt（含对手引用 + 上一轮 RAG 证据注入 + 字数提示），`_agent_turn(..., mode="discussion", stream=True)`。
+
+**对手定向（需求 2/3）**：
+- `_find_opponent(collab)`：`OPPONENT_STANCE = {"PRO": "CON", "CON": "PRO"}`（编排器类常量，`ClassVar` 标注）。先在上一轮 `round_arguments[round-1]` 找对立场**最近发言人**（`reversed` 扫描）；上一轮无对立场发言者时回退 `latest_arguments` 全局最近对立场发言者；`NEUTRAL`/`HOST` 无固定对手返回 `None`。
+- `_prepare_opponent_context(collab)`：第 1 轮不准备；**第 2 轮**取对手上轮发言原文截断到 `OPPONENT_SNIPPET_MAX_CHARS` 字；**第 3 轮起**调用 `summarize_text`（`llm.py`）压缩到 `OPPONENT_SUMMARY_MAX_CHARS` 字，按 `(对手名, 轮次)` 缓存进 `_opponent_summary_cache` 防同轮重复调用，usage 计入 `self.spent` **但不计入** `_round_real_calls`（避免污染 N 次调用校准），事件 `debate.opponent_summary`；结果写入 `_opponent_prep`（每轮开始清空，`configure()` 重置）。
+- `_debate_prompt(collab)`：第 1 轮基于角色/性格立论（需求 1，PRO/CON 分立场措辞）；第 2 轮起优先注入 `_opponent_prep`（标注"发言"（第 2 轮原文）/ "摘要"（第 3 轮起））；`NEUTRAL`/无立场对手回退旧 `last_debate_speaker` 逻辑；**全轮**追加 `【输出要求】... {limit} 字以内 ...`（需求 5），`limit = max(1, int(self.effective_max_tokens × settings.OUTPUT_CHAR_PER_TOKEN))`。
 
 ### 12.9 任务与变量
 - `_create_task(d)`：**校验 recipient 存在**（P15 修复，非法则忽略并记日志）；生成任务 `{id, task_id(UUID), recipient, content, expected_outcome, var_name, completed, rounds_waiting, timestamp(ms), token_cost}`，并在 `shared_context[var_name]` 登记。
@@ -563,6 +587,7 @@ FastAPI 应用，挂载 `/static`，提供 REST + WebSocket。
 | LLM 调用异常（429/5xx/超时） | `_run_llm_retry` 指数退避重试（1s、3s） |
 | 流式失败 | 回退非流式重试调用，保证发言不丢失 |
 | 流式整体超时（>STREAM_TIMEOUT） | `_consume_stream` 抛超时 → 回退非流式 |
+| LLM 摘要失败 / 返回超长 | `summarize_text` 回退 `_fallback_truncate` 确定性头尾截断（`…` 相连），绝不超过 `max_chars`，摘要流程不抛异常 |
 | 裁判调用失败 / JSON 解析失败 | 确定性 `Judgment`（DRAW + 说明） |
 | 预算规划：降级阶梯（§6.3） | 优先降 `effective_max_tokens` → 强制压缩历史 → 允许小幅超支完成；辩论**绝不因预算中断** |
 | 强制压缩历史但历史过短 | 日志如实报告"实际压缩 X 个 / 历史过短跳过 Y 个"（短历史无可压内容，属正常空转） |
@@ -595,6 +620,7 @@ FastAPI 应用，挂载 `/static`，提供 REST + WebSocket。
 | 共享黑板（§5.2） | 内存 `shared_context` + `transcript`（未持久化） |
 | 心跳与故障恢复（§5.3） | 未实现（`status_sync` 事件承担部分状态广播） |
 | Token 预算控制（§6.3） | `budget / spent` + 每轮 `_apply_usage` + 预算规划器/降级阶梯（`_compute_plan` + `_plan_for_round`）+ 自适应校准（`_est_factor`/`_call_factor`） + 熔断最后防线 |
+| 对手定向反驳 + 输出字数约束 + 按轮强压缩 | `_find_opponent`（PRO↔CON 立场映射，回退全局最近）/ `_prepare_opponent_context`（第 2 轮原文截断、第 3 轮起 `summarize_text` 摘要 + 缓存）/ `_debate_prompt` 注入与字数提示 / `_agent_turn` 超长截断兜底 / `_compress_keep_rounds`（`BUDGET_KEEP_LAST_ROUNDS` 按轮保留） |
 | 缓存策略（§6.4） | RAG 检索 24h 缓存（`rag.py:_search_cached`） |
 | 可观测性：Trace ID（§7.2） | `trace_id` 贯穿事件/日志/导出 |
 | 审计回溯：快照 + 回放（§7.3） | 未实现（仅最终 Markdown 落盘） |

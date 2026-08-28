@@ -33,6 +33,10 @@
 22. **工程化与质量门禁**：`pyproject.toml` 统一 ruff / mypy / coverage 配置；`requirements-dev.txt` 提供开发依赖；新增 `tests/test_api_flow.py` 接口级测试（`httpx.ASGITransport` 直接驱动应用 + LLM 调用点打桩），无需服务器 / 真实模型即可在 CI 全量覆盖 HTTP 链路，与 `test_ci_fast` 一并构成快速回归门禁。
 23. **Token 预算规划与自适应校准**：每轮开始前用纯数学规划求解本轮生效输出上限 `effective_max_tokens`（`_compute_plan`），让「剩余轮次 + 裁判 + 汇总」落在预算内；预算吃紧时走降级阶梯（降输出上限 → 强制压缩历史 → 允许小幅超支），辩论永不因预算中断。规划用量经两路 EMA 自适应校准（`_est_factor` 提示词尺寸、`_call_factor` 每轮调用次数），真实冒烟 2 轮短辩论超支从 42% 收敛到 4.3%（长辩论输入成本建模见 `docs/CODE_LOGIC.md` §20）。
 24. **预算状态前端面板**：讨论页侧栏实时可视化 token 预算运行状态——已用/剩余/总量进度条（超预算标红）、生效输出上限（降级标注）、预计总耗超支比、可支撑轮数与安全余量、三路校准因子（提示词/调用/增长）；预算告警事件（削轮次/超支/保底/压缩/熔断）以彩色标签结构化展示，全量文本 `textContent` 填充防 XSS。
+25. **对手定向反驳（辩论机制）**：第 1 轮基于角色/性格立论；第 2 轮引用**对手上轮发言原文**（截断至 `OPPONENT_SNIPPET_MAX_CHARS` 字）逐条反驳；第 3 轮起引用对手上轮发言的 **LLM 摘要**（`OPPONENT_SUMMARY_MAX_CHARS` 字，按 `(对手,轮次)` 缓存防重复调用，usage 计入预算）——PRO↔CON 互为对手，NEUTRAL/HOST 无固定对手时回退「上一发言人」逻辑。
+26. **输出字数约束（需求 5）**：每轮发言都受 `effective_max_tokens × OUTPUT_CHAR_PER_TOKEN` 字数上限约束——提示词显式给出字数要求（API `max_tokens` 同步生效），LLM 仍超长时按字数硬截断兜底（`debate.output_truncate` 告警），保证单轮输出可控、不挤占后续轮次预算。
+27. **预算吃紧按轮强压缩（需求 6）**：预算不足触发 `_force_compress_all` 时，只保留最近 `BUDGET_KEEP_LAST_ROUNDS`（默认 2）轮的原文，更早轮次经 LLM 摘要压入 `compressed_summary`（由系统提示注入）；`history` 与 `history_rounds` 平行维护、三处裁剪同步，长辩论下输入成本可控。
+28. **记忆 LLM 摘要压缩**：记忆管家偶数轮把短期记忆聚合为一条情境记忆时，调用 `summarize_text` 生成 LLM 摘要（上限 `MEMORY_SUMMARY_MAX_CHARS` 字，usage 计入预算；LLM 失败回退确定性拼接），替代原来的简单 `"近期要点："` 拼接，情境记忆更精炼、可检索性更好。
 
 ## 目录结构
 
@@ -103,6 +107,10 @@ pip install -r requirements.txt
 | `CONTEXT_MAX_CHARS` | 单 Agent 上下文字符硬上限，超出时丢弃最旧轮次（默认 8000） |
 | `CONTEXT_COMPRESS_THRESHOLD` | 触发 LLM 摘要压缩的字符阈值（默认 6000） |
 | `CONTEXT_COMPRESS_KEEP_RECENT` | 摘要压缩后保留的最近轮次条数（默认 8） |
+| `OPPONENT_SNIPPET_MAX_CHARS` / `OPPONENT_SUMMARY_MAX_CHARS` | 辩论机制：第 2 轮对手发言原文截断上限（默认 500 字）、第 3 轮起对手发言 LLM 摘要上限（默认 200 字） |
+| `MEMORY_SUMMARY_MAX_CHARS` | 记忆压缩：短期 → 情境的 LLM 聚合摘要上限（默认 200 字），摘要 usage 计入预算 |
+| `OUTPUT_CHAR_PER_TOKEN` | 输出字数约束：每 token 换算字数（中文约 2 字符/token，默认 2），用于把 `effective_max_tokens` 换算成发言字数上限 |
+| `BUDGET_KEEP_LAST_ROUNDS` | 预算吃紧强压缩时保留的最近轮次数（默认 2），更早轮次压入压缩摘要 |
 | `BUDGET_*`（`BUDGET_GROWTH_RATIO_INIT` / `BUDGET_GROWTH_RATIO_MIN` / `BUDGET_GROWTH_RATIO_MAX` / `BUDGET_SAFETY_MARGIN` / `EST_FACTOR_INIT` / `BUDGET_PROFILE_PATH` / `JUDGE_MIN_OUTPUT` / `SUMMARY_MIN_OUTPUT` / `BUDGET_AUTO_TRIM_ROUNDS` / `BUDGET_OUTPUT_FLOOR` / `BUDGET_TAIL_RESERVE` / `BUDGET_TOOL_OVERHEAD`） | token 预算规划器：历史增长比（EMA 校准，默认 0.5）、安全余量（默认 8%）、初始估算因子（默认 2.0 保守先验）、校准档案路径（默认 `data/budget_profile.json`）、裁判/汇总输出保底（默认 512）、预算不足时自动削减轮次（默认开启）。预算吃紧时按「降输出上限 → 强制压缩历史 → 削轮次 → 允许小幅超支」阶梯降级，辩论不中断 |
 
 ### 3. 启动
@@ -187,6 +195,7 @@ P0 / P1 优化项已实施落地：
 - **P1-3 lifespan 落盘可靠性**：讨论完成自动保存失败不再静默吞掉，改为结构化日志（`lifespan.save_markdown`）+ 幂等重试（1, 2 次）。
 - **P1-4 接口级测试 + CI 静态检查**：`tests/test_api_flow.py`（`httpx.ASGITransport` + LLM 调用点打桩）覆盖 HTTP 全链路与安全用例；ruff / mypy 纳入 CI 质量门禁。
 - **P1-5 依赖与工程化配置**：新增 `pyproject.toml`（ruff / mypy / coverage）与 `requirements-dev.txt`，`requirements.txt` 全部依赖改为 `>=` 版本下限。
+- **辩论机制：对手定向反驳 + 输出约束 + 按轮强压缩**：`orchestrator._find_opponent`（PRO↔CON 立场映射，回退全局最近）→ `_prepare_opponent_context`（第 2 轮原文截断 / 第 3 轮起 `summarize_text` LLM 摘要，缓存 + 预算记账）→ `_debate_prompt` 注入 + 全轮字数提示；`_agent_turn` 超长截断兜底；`agent.history_rounds` 平行维护、`compress_history(keep_rounds=BUDGET_KEEP_LAST_ROUNDS)` 按轮强压缩（详见 `docs/CODE_LOGIC.md` §12.7–12.8）。
 
 ## 项目依赖
 

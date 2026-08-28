@@ -16,8 +16,11 @@ import math
 import os
 import tempfile
 import unittest
+from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
 from app.config import settings
+from app.memory import MemorySystem
 from app.orchestrator import orchestrator
 from app.protocol import Judgment
 
@@ -25,6 +28,10 @@ HOST_CFG = {"name": "主持", "role": "主持", "personality": "",
             "provider": "default", "stance": "HOST"}
 PRO_CFG = {"name": "正方", "role": "正方", "personality": "",
            "provider": "default", "stance": "PRO"}
+CON_CFG = {"name": "反方", "role": "反方", "personality": "",
+           "provider": "default", "stance": "CON"}
+NEUTRAL_CFG = {"name": "中立", "role": "中立", "personality": "",
+               "provider": "default", "stance": "NEUTRAL"}
 
 
 def _fake_llm_result(content="发言"):
@@ -205,9 +212,13 @@ class BudgetPlannerTest(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(plan["feasible_rounds"], 3)
 
     async def test_planner_tight_budget_lowers_cap(self):
-        """预算吃紧：自动下调生效输出上限（低于 max_tokens，但不低于下限、不超支）。"""
+        """预算吃紧：自动下调生效输出上限（低于 max_tokens，但不低于下限、不超支）。
+
+        注：预算数值需随规划估算精度的提升保持"吃紧"语义——当前数学下
+        80000 足够 2 席 3 轮（projected≈71K），不再触发降级，故取 60000。
+        """
         await self._configure(max_rounds=3)
-        orchestrator.budget = 80000
+        orchestrator.budget = 60000
         orchestrator.spent = 0
         plan = orchestrator._compute_plan("debate", 3)
         self.assertLess(plan["effective_max_tokens"], orchestrator.max_tokens)
@@ -223,7 +234,7 @@ class BudgetPlannerTest(unittest.IsolatedAsyncioTestCase):
         calls = []
         for a in orchestrator.agents:
             async def fake_compress(agent=a, **kwargs):
-                calls.append((agent.name, kwargs.get("force")))
+                calls.append((agent.name, kwargs.get("force"), kwargs.get("keep_rounds")))
                 if len(agent.history) > 2:
                     agent.history = agent.history[-2:]
                 return {"total_tokens": 10}
@@ -231,7 +242,9 @@ class BudgetPlannerTest(unittest.IsolatedAsyncioTestCase):
 
         plan = await orchestrator._plan_for_round(3)
         self.assertEqual(len(calls), len(orchestrator.agents))
-        self.assertTrue(all(force is True for _, force in calls))
+        self.assertTrue(all(force is True for _, force, _ in calls))
+        # 需求 6：强压缩按轮保留（keep_rounds = BUDGET_KEEP_LAST_ROUNDS）
+        self.assertTrue(all(k == settings.BUDGET_KEEP_LAST_ROUNDS for _, _, k in calls))
         self.assertGreaterEqual(orchestrator.run_stats.get("compressions", 0), 1)
         self.assertEqual(plan["effective_max_tokens"],
                          min(settings.BUDGET_OUTPUT_FLOOR, orchestrator.max_tokens))
@@ -629,6 +642,312 @@ class BudgetMathTest(unittest.TestCase):
         self.assertEqual(budget_math.feasible_rounds(
             remaining=2000, base=8000, P=10000, g=0.5, N=3, S=1,
             E=256, max_r=5), 0)
+
+
+class DebateMechanismTest(unittest.IsolatedAsyncioTestCase):
+    """辩论机制改造（需求 1-6）：对手定向反驳、输出约束、按轮强压缩。"""
+
+    def setUp(self):
+        # 隔离校准档案
+        self._tmp_dir = tempfile.TemporaryDirectory()
+        self._old_profile_path = settings.BUDGET_PROFILE_PATH
+        settings.BUDGET_PROFILE_PATH = os.path.join(
+            self._tmp_dir.name, "budget_profile.json")
+
+    def tearDown(self):
+        settings.BUDGET_PROFILE_PATH = self._old_profile_path
+        self._tmp_dir.cleanup()
+
+    @staticmethod
+    async def _drain(q):
+        while True:
+            try:
+                await asyncio.wait_for(q.get(), timeout=0.1)
+            except asyncio.TimeoutError:
+                break
+
+    async def _configure4(self, max_rounds=3):
+        """HOST + PRO + CON + NEUTRAL 四席位，覆盖对手映射与无对手回退。"""
+        orchestrator.configure([HOST_CFG, PRO_CFG, CON_CFG, NEUTRAL_CFG],
+                               topic="对手反驳测试", max_rounds=max_rounds)
+        q = orchestrator.event_bus.subscribe()
+        await self._drain(q)
+        return q
+
+    @staticmethod
+    def _collab(stance):
+        for c in orchestrator.collaborators:
+            if c.stance == stance:
+                return c
+        raise AssertionError(f"无 {stance} 立场协作辩手")
+
+    # ---------------- 需求 5/6：history_rounds 平行维护 ----------------
+
+    async def test_append_history_tracks_rounds_and_trims_sync(self):
+        """append_history 记录轮次；条数/字符裁剪与 history_rounds 保持平行。"""
+        await self._configure4()
+        a = self._collab("PRO")
+        a.reset_history()
+        a.append_history("user", "u1")
+        a.append_history("assistant", "a1")
+        self.assertEqual(a.history_rounds, [1, 1])
+        a.append_history("user", "u2", round_no=2)
+        a.append_history("assistant", "a2", round_no=2)
+        self.assertEqual(a.history_rounds, [1, 1, 2, 2])
+        # 条数裁剪同步
+        a.max_history = 3
+        a.append_history("user", "u3", round_no=3)
+        self.assertEqual(a.history_rounds, [2, 2, 3])
+        self.assertEqual(len(a.history), len(a.history_rounds))
+        # 缺省 round 取当前最大轮次
+        a.append_history("assistant", "a3")
+        self.assertEqual(a.history_rounds[-1], 3)
+        # 字符硬上限裁剪同步（长内容）
+        a.max_history = 100
+        a.reset_history()
+        for r in range(1, 40):
+            a.append_history("user", "长" * 400, round_no=r)
+        self.assertEqual(len(a.history), len(a.history_rounds))
+        self.assertLessEqual(a._history_chars(), settings.CONTEXT_MAX_CHARS)
+        self.assertGreater(len(a.history), 2)
+        # reset 清空
+        a.reset_history()
+        self.assertEqual(a.history, [])
+        self.assertEqual(a.history_rounds, [])
+
+    async def test_compress_history_keep_rounds(self):
+        """按轮强压缩：保留最近 N 轮原文，更早轮次压入 compressed_summary。"""
+        await self._configure4()
+        a = self._collab("PRO")
+        a.reset_history()
+        for r in (1, 2, 3):
+            a.append_history("user", f"u{r}", round_no=r)
+            a.append_history("assistant", f"a{r}", round_no=r)
+        # 不同轮次数 ≤ keep_rounds → 无需压缩
+        self.assertIsNone(await a.compress_history(force=True, keep_rounds=3))
+
+        async def fake_summarize(texts):
+            return "历史要点", {"total_tokens": 10}
+        a._summarize = fake_summarize
+        usage = await a.compress_history(force=True, keep_rounds=2)
+        self.assertIsNotNone(usage)
+        self.assertEqual(usage.get("total_tokens"), 10)
+        self.assertEqual(a.history_rounds, [2, 2, 3, 3])
+        self.assertEqual(len(a.history), len(a.history_rounds))
+        self.assertIn("历史要点", a.compressed_summary)
+        # 二次压缩幂等：仍只剩 2 轮时无需再压
+        self.assertIsNone(await a.compress_history(force=True, keep_rounds=2))
+
+    # ---------------- 需求 2/3：对手定向反驳 ----------------
+
+    async def test_find_opponent_pro_con_mapping(self):
+        """PRO↔CON 互为对手；无对立场时回退全局最近；NEUTRAL 无对手。"""
+        await self._configure4()
+        pro = self._collab("PRO")
+        con = self._collab("CON")
+        neutral = self._collab("NEUTRAL")
+        orchestrator.round = 2
+        orchestrator.round_arguments[1] = {pro.name: "P1", con.name: "C1"}
+        self.assertEqual(orchestrator._find_opponent(pro).name, con.name)
+        self.assertEqual(orchestrator._find_opponent(con).name, pro.name)
+        # 上一轮无对立场 → 回退全局最近发言
+        orchestrator.round_arguments[1] = {pro.name: "P1"}
+        orchestrator.latest_arguments[con.name] = {"text": "C1", "round": 1}
+        self.assertEqual(orchestrator._find_opponent(pro).name, con.name)
+        # 彻底无对立场 → None
+        orchestrator.latest_arguments = {}
+        self.assertIsNone(orchestrator._find_opponent(pro))
+        # NEUTRAL 无固定对手
+        self.assertIsNone(orchestrator._find_opponent(neutral))
+
+    async def test_prepare_opponent_context_snippet_and_summary(self):
+        """第 2 轮原文截断；第 3 轮起 LLM 摘要（缓存 + 预算记账）；第 1 轮不准备。"""
+        await self._configure4()
+        pro = self._collab("PRO")
+        con = self._collab("CON")
+        # 第 1 轮：不准备
+        orchestrator.round = 1
+        await orchestrator._prepare_opponent_context(pro)
+        self.assertNotIn(pro.name, orchestrator._opponent_prep)
+        # 第 2 轮：原文截断到 OPPONENT_SNIPPET_MAX_CHARS
+        orchestrator.round = 2
+        orchestrator.round_arguments[1] = {pro.name: "P1", con.name: "C" * 1000}
+        await orchestrator._prepare_opponent_context(pro)
+        prep = orchestrator._opponent_prep[pro.name]
+        self.assertEqual(prep["speaker"], con.name)
+        self.assertEqual(prep["round"], 1)
+        self.assertEqual(len(prep["text"]), settings.OPPONENT_SNIPPET_MAX_CHARS)
+        # 第 3 轮：LLM 摘要（mock summarize_text），并缓存
+        from app import orchestrator as orch_mod
+        orchestrator.round = 3
+        orchestrator.round_arguments[2] = {con.name: "C" * 1000}
+        calls = []
+
+        async def fake_summarize_text(model_config, text, max_chars=150):
+            calls.append(max_chars)
+            return "浓缩要点", {"total_tokens": 20}
+        orig = orch_mod.summarize_text
+        orch_mod.summarize_text = fake_summarize_text
+        try:
+            await orchestrator._prepare_opponent_context(pro)
+        finally:
+            orch_mod.summarize_text = orig
+        prep = orchestrator._opponent_prep[pro.name]
+        self.assertEqual(prep["text"], "浓缩要点")
+        self.assertEqual(calls, [settings.OPPONENT_SUMMARY_MAX_CHARS])
+        # 同一 (对手,轮次) 再次准备：命中缓存，不重复调用 LLM
+        await orchestrator._prepare_opponent_context(pro)
+        self.assertEqual(len(calls), 1)
+        # 摘要调用计入预算
+        self.assertGreaterEqual(orchestrator.spent, 20)
+
+    async def test_debate_prompt_injects_opponent_and_char_hint(self):
+        """需求 1/5：第 1 轮立论 + 全轮字数提示；第 2 轮起注入对手发言。"""
+        await self._configure4()
+        pro = self._collab("PRO")
+        limit = max(1, int(orchestrator.effective_max_tokens * settings.OUTPUT_CHAR_PER_TOKEN))
+        # 第 1 轮：立论 + 字数提示
+        orchestrator.round = 1
+        p1 = orchestrator._debate_prompt(pro)
+        self.assertIn("立论", p1)
+        self.assertIn(f"{limit} 字", p1)
+        # 第 2 轮：对手发言注入
+        orchestrator.round = 2
+        orchestrator._opponent_prep[pro.name] = {
+            "speaker": "反方", "stance": "反方", "round": 1, "text": "必须重视成本"}
+        p2 = orchestrator._debate_prompt(pro)
+        self.assertIn("必须重视成本", p2)
+        self.assertIn(f"{limit} 字", p2)
+
+    # ---------------- 需求 5：输出截断兜底 ----------------
+
+    async def test_agent_turn_truncates_long_discussion_output(self):
+        """discussion 模式即使 LLM 超长输出，也按字数上限截断兜底。"""
+        await self._configure4()
+        long_text = "长" * 500
+
+        async def _fake_retry(*a, **k):
+            return _fake_llm_result(content=long_text)
+        orchestrator._run_llm_retry = _fake_retry
+        orchestrator.effective_max_tokens = 50
+        out = await orchestrator._agent_turn(
+            self._collab("PRO"), "请发言", mode="discussion", stream=False)
+        limit = max(1, int(50 * settings.OUTPUT_CHAR_PER_TOKEN))
+        self.assertLessEqual(len(out["content"]), limit)
+        # 未超长时不截断
+        orchestrator.effective_max_tokens = 4096
+        out2 = await orchestrator._agent_turn(
+            self._collab("CON"), "请发言", mode="discussion", stream=False)
+        self.assertEqual(out2["content"], long_text)
+
+    # ---------------- 需求 3：摘要回退 ----------------
+
+    async def test_summarize_text_fallback_truncates(self):
+        """LLM 摘要失败时确定性头尾截断回退，绝不超过 max_chars。"""
+        from app.llm import summarize_text
+        text = "甲乙丙丁" * 200  # 800 字
+        s, usage = await summarize_text({}, text, max_chars=100)
+        self.assertIsNone(usage)
+        self.assertLessEqual(len(s), 100)
+        self.assertIn("…", s)
+        self.assertTrue(s.startswith("甲"))
+        # 短文本原样返回
+        s2, _ = await summarize_text({}, "短文本", max_chars=100)
+        self.assertEqual(s2, "短文本")
+
+
+class MemorySummarizeTest(unittest.IsolatedAsyncioTestCase):
+    """短期 → 情境记忆的 LLM 摘要（开启 LLM 摘要替换简单拼接）。"""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.mem = MemorySystem("test_mem", Path(self._tmp.name))
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    async def test_default_concat_when_no_summarizer(self):
+        """未提供 summarizer 时保持简单拼接（近期要点前缀），短期清空。"""
+        self.mem.add_short("要点甲", importance=0.6)
+        self.mem.add_short("要点乙", importance=0.6)
+        out = await self.mem.summarize_short_to_context()
+        self.assertTrue(out.startswith("近期要点："))
+        self.assertIn("要点甲", out)
+        self.assertEqual(len(self.mem.contextual), 1)
+        self.assertEqual(self.mem.contextual[0]["text"], out)
+        self.assertEqual(self.mem.short_term, [])  # 压缩后短期清空
+
+    async def test_sync_summarizer_used(self):
+        """同步 summarizer 的返回值作为情境摘要落库。"""
+        self.mem.add_short("a", importance=0.6)
+        self.mem.add_short("b", importance=0.6)
+        out = await self.mem.summarize_short_to_context(
+            lambda texts: "LLM 摘要结果")
+        self.assertEqual(out, "LLM 摘要结果")
+        self.assertEqual(self.mem.contextual[0]["text"], "LLM 摘要结果")
+
+    async def test_async_summarizer_used(self):
+        """async summarizer（协程）同样被 await。"""
+        self.mem.add_short("a", importance=0.6)
+
+        async def _sum(texts):
+            await asyncio.sleep(0)
+            return "异步摘要结果"
+        out = await self.mem.summarize_short_to_context(_sum)
+        self.assertEqual(out, "异步摘要结果")
+        self.assertEqual(self.mem.contextual[0]["text"], "异步摘要结果")
+
+    async def test_summarizer_exception_falls_back(self):
+        """summarizer 抛异常时回退拼接，不中断。"""
+        self.mem.add_short("甲", importance=0.6)
+        self.mem.add_short("乙", importance=0.6)
+
+        def _boom(texts):
+            raise RuntimeError("LLM 挂了")
+        out = await self.mem.summarize_short_to_context(_boom)
+        self.assertEqual(out, "甲；乙")
+
+    async def test_summarizer_empty_result_falls_back(self):
+        """summarizer 返回空串时回退拼接，避免空摘要落库。"""
+        self.mem.add_short("甲", importance=0.6)
+        out = await self.mem.summarize_short_to_context(lambda texts: "")
+        self.assertEqual(out, "甲")
+
+    async def test_empty_short_term_noop(self):
+        """无短期记忆时不调用 summarizer，返回 None。"""
+        called = []
+
+        def _should_not_run(texts):
+            called.append(1)
+            return "x"
+        out = await self.mem.summarize_short_to_context(_should_not_run)
+        self.assertIsNone(out)
+        self.assertEqual(called, [])
+        self.assertEqual(self.mem.contextual, [])
+
+    # ---------------- 编排器接入：LLM 摘要器 + 预算记账 ----------------
+
+    async def test_orchestrator_llm_summarizer_wires_budget(self):
+        """_memory_summarizer 用 summarize_text 生成摘要并把 usage 计入预算。"""
+        orchestrator.configure([PRO_CFG, CON_CFG], topic="记忆摘要", max_rounds=3)
+        a = orchestrator.collaborators[0]
+        # 清掉磁盘/历史残留，保证断言只针对本用例新增内容
+        a.memory.short_term = []
+        a.memory.contextual = []
+        a.memory.long_term = []
+        a.memory.add_short("甲：观点一", importance=0.6)
+        a.memory.add_short("乙：观点二", importance=0.6)
+        orchestrator.spent = 100
+        orchestrator.run_stats = {"compressions": 0}
+        fake_usage = {"total_tokens": 42}
+        with patch("app.orchestrator.summarize_text",
+                   new=AsyncMock(return_value=("LLM 压缩摘要", fake_usage))):
+            await a.memory.summarize_short_to_context(
+                orchestrator._memory_summarizer(a))
+        self.assertEqual(a.memory.contextual[0]["text"], "LLM 压缩摘要")
+        self.assertEqual(a.memory.short_term, [])
+        self.assertEqual(orchestrator.spent, 142)  # 100 + 42 记账
+        self.assertEqual(orchestrator.run_stats.get("memory_summaries"), 1)
 
 
 if __name__ == "__main__":

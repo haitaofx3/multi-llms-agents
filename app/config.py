@@ -154,5 +154,18 @@ class Settings:
     CONTEXT_COMPRESS_THRESHOLD = _int("CONTEXT_COMPRESS_THRESHOLD", 6000)  # 触发 LLM 摘要的字符阈值
     CONTEXT_COMPRESS_KEEP_RECENT = _int("CONTEXT_COMPRESS_KEEP_RECENT", 8)  # 摘要后保留的最近条数
 
+    # ---- 辩论对手上下文（需求 2/3：对手发言的引用与压缩） ----
+    OPPONENT_SNIPPET_MAX_CHARS = _int("OPPONENT_SNIPPET_MAX_CHARS", 500)      # 第 2 轮对手上轮发言原文截断上限（字）
+    OPPONENT_SUMMARY_MAX_CHARS = _int("OPPONENT_SUMMARY_MAX_CHARS", 200)      # 第 3 轮起对手发言 LLM 摘要上限（字）
+
+    # ---- 记忆压缩（短期 → 情境的 LLM 摘要上限） ----
+    MEMORY_SUMMARY_MAX_CHARS = _int("MEMORY_SUMMARY_MAX_CHARS", 200)          # 短期记忆聚合摘要上限（字）
+
+    # ---- 输出 token 约束（需求 5：按字符数控制发言长度） ----
+    OUTPUT_CHAR_PER_TOKEN = _int("OUTPUT_CHAR_PER_TOKEN", 2)                  # 中文约 2 字符/token，用于换算字数上限
+
+    # ---- 预算吃紧时的保留轮数（需求 6：只保留最近 N 轮输出） ----
+    BUDGET_KEEP_LAST_ROUNDS = _int("BUDGET_KEEP_LAST_ROUNDS", 2)
+
 
 settings = Settings()

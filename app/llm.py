@@ -360,3 +360,43 @@ def chat(messages, model_config: dict, tools=None, tool_choice="auto", temperatu
 
     return {"content": content, "tool_calls": tool_calls,
             "assistant_message": assistant_message, "usage": usage}
+
+
+def _fallback_truncate(text: str, max_chars: int) -> str:
+    """确定性兜底摘要：保留头尾片段，避免超长文本导致 token 膨胀。"""
+    if not text:
+        return ""
+    if len(text) <= max_chars:
+        return text
+    half = max(max_chars // 2, 1)
+    return (text[:half] + "…" + text[-half:])[:max_chars]
+
+
+async def summarize_text(model_config: dict, text: str, max_chars: int = 150) -> tuple[str, dict | None]:
+    """用 LLM 把文本压缩为 ≤ max_chars 字的摘要。
+
+    供「对手上轮发言摘要」（第 3 轮起）与「预算吃紧历史强压缩」共用。
+    经 to_thread 调用同步 chat()，避免阻塞事件循环；LLM 失败时回退为
+    确定性头尾截断（_fallback_truncate）。返回 (summary, usage | None)，
+    usage 用于预算统计，回退时返回 None。
+    """
+    if not text or not text.strip():
+        return _fallback_truncate(text, max_chars), None
+    try:
+        import asyncio
+
+        from app.llm import chat
+        messages = [
+            {"role": "system",
+             "content": f"你是文本摘要器。把给定内容压缩为核心要点，控制在 {max_chars} 字以内，"
+                        "保留关键事实、结论与分歧点，不要输出任何其他内容。"},
+            {"role": "user", "content": text},
+        ]
+        result = await asyncio.to_thread(
+            lambda: chat(messages, model_config, temperature=0.3))
+        content = (result.get("content") or "").strip()
+        if content:
+            return content[:max_chars], result.get("usage") or {}
+    except Exception:
+        pass
+    return _fallback_truncate(text, max_chars), None

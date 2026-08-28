@@ -18,11 +18,12 @@ import os
 import re
 import threading
 import time
+from typing import ClassVar
 
 from app import budget as budget_math
 from app.agent import Agent
 from app.config import settings
-from app.llm import _estimate_usage, chat, chat_stream
+from app.llm import _estimate_usage, chat, chat_stream, summarize_text
 from app.protocol import Judgment, new_trace_id, new_uuid, now_ms
 from app.rag import rag_service
 
@@ -193,6 +194,9 @@ class Orchestrator:
         self.latest_arguments = {}
         self.round_evidence = {}
         self.judgment = None
+        self.last_debate_speaker = None
+        self._opponent_prep = {}            # 对手定向反驳上下文（需求 2/3）
+        self._opponent_summary_cache = {}   # (对手,轮次) -> 摘要，防同轮重复调用
         self.run_stats = {"compressions": 0}
         self.agent_metrics = {}
 
@@ -524,6 +528,14 @@ class Orchestrator:
             if not tcs:
                 break
 
+        # 需求 5 兜底：discussion 模式下即使 LLM 输出超长也按字数上限截断
+        if mode == "discussion" and content:
+            limit = max(1, int(self.effective_max_tokens * settings.OUTPUT_CHAR_PER_TOKEN))
+            if len(content) > limit:
+                self._log(f"[输出截断] {agent.name} 发言 {len(content)} 字，截断至 {limit} 字",
+                          level="warning", event="debate.output_truncate")
+                content = content[:limit].rstrip()
+
         # 流式收尾：补发 speech_end（前端用完整文本替换），并记录 transcript
         if emitting and content:
             await self.event_bus.publish({
@@ -537,9 +549,9 @@ class Orchestrator:
                 "is_main": agent.is_main, "text": content,
             })
 
-        agent.append_history("user", user_msg)
+        agent.append_history("user", user_msg, round_no=self.round)
         if content:
-            agent.append_history("assistant", content)
+            agent.append_history("assistant", content, round_no=self.round)
         return {"content": content, "delegate": delegate, "report": report,
                 "streamed": emitting, "token_cost": token_cost}
 
@@ -566,6 +578,71 @@ class Orchestrator:
         self.round_arguments.setdefault(round_no, {})[speaker] = text
         self.latest_arguments[speaker] = {"text": text, "round": round_no}
 
+    # ---------------- 对手定向反驳（需求 2/3） ----------------
+    # PRO↔CON 立场互为对手；NEUTRAL/HOST 无固定对手
+    OPPONENT_STANCE: ClassVar[dict[str, str]] = {"PRO": "CON", "CON": "PRO"}
+
+    def _find_opponent(self, collab: Agent) -> Agent | None:
+        """找到 collab 的立场对手：优先取上一轮对立场的最新发言人，空则回退全局最近。"""
+        target = self.OPPONENT_STANCE.get(collab.stance)
+        if target is None:
+            return None
+        # 先在上一轮找对立场最近发言人
+        names = list((self.round_arguments.get(self.round - 1, {}) or {}).keys())
+        for name in reversed(names):  # 末位 = 最近发言
+            agent = self.get_agent(name)
+            if agent is not None and agent.stance == target:
+                return agent
+        # 上一轮无对立场 → 回退全局最近发言
+        for name in reversed(list((self.latest_arguments or {}).keys())):
+            agent = self.get_agent(name)
+            if agent is not None and agent.stance == target:
+                return agent
+        return None
+
+    async def _prepare_opponent_context(self, collab: Agent) -> None:
+        """为辩手准备对手上轮发言并写入 self._opponent_prep（由 _debate_prompt 注入）。
+
+        - 第 2 轮：对手原文截断到 OPPONENT_SNIPPET_MAX_CHARS 字；
+        - 第 3 轮起：对手发言 LLM 摘要到 OPPONENT_SUMMARY_MAX_CHARS 字
+          （按 (对手,轮次) 缓存；usage 计入 self.spent 但不计入 _round_real_calls）。
+        """
+        self._opponent_prep.pop(collab.name, None)
+        if self.round < 2:
+            return
+        opp = self._find_opponent(collab)
+        if opp is None:
+            return
+        round_no = self.round - 1
+        text = (self.round_arguments.get(round_no, {}) or {}).get(opp.name, "")
+        if not text:
+            text = (self.latest_arguments.get(opp.name) or {}).get("text", "")
+        if not text:
+            return
+        if self.round == 2:
+            brief = text[: settings.OPPONENT_SNIPPET_MAX_CHARS]
+        else:
+            key = (opp.name, round_no)
+            if key not in self._opponent_summary_cache:
+                summary, usage = await summarize_text(
+                    opp.model_config, text,
+                    max_chars=settings.OPPONENT_SUMMARY_MAX_CHARS)
+                self._opponent_summary_cache[key] = summary
+                total = (usage or {}).get("total_tokens") or 0
+                if total:
+                    self.spent += int(total)
+                self._log(
+                    f"[对手摘要] {collab.name} 引用 {opp.name} 第{round_no}轮发言"
+                    f"（摘要 {len(summary)} 字）",
+                    level="info", event="debate.opponent_summary")
+            brief = self._opponent_summary_cache[key]
+        self._opponent_prep[collab.name] = {
+            "speaker": opp.name,
+            "stance": STANCE_LABEL.get(opp.stance, opp.stance),
+            "round": round_no,
+            "text": brief,
+        }
+
     def _evidence_for_round(self, round_no: int) -> str:
         items = self.round_evidence.get(round_no)
         if not items:
@@ -581,7 +658,7 @@ class Orchestrator:
                    if collab.role or collab.personality else "你的人物设定")
         parts = []
         if self.round == 1:
-            # 立论阶段
+            # 立论阶段（需求 1：基于性格设定的单轮分析与回复）
             if collab.stance == "PRO":
                 parts.append(f"这是第 1 轮立论。请作为「{stance_label}」就主题「{self.topic}」发表开场立论："
                              "包含核心观点、逻辑推导、事实依据（可调用 knowledge_search 检索）。"
@@ -594,37 +671,52 @@ class Orchestrator:
                 parts.append(f"这是第 1 轮立论。请基于你的角色「{collab.role}」就主题「{self.topic}」发表开场观点。")
             parts.append(f"请以{persona}为出发点发表立论，保持人设一致。")
         else:
-            # 反驳 / 辩护阶段：只针对上一位实际发言的辩手（或主持人）进行针对性反驳
-            prev = None
-            prev_stance = ""
-            if (self.last_debate_speaker and self.last_debate_speaker != collab.name
-                    and self.last_debate_speaker in self.latest_arguments):
-                prev = self.latest_arguments[self.last_debate_speaker]
-                prev_agent = self.get_agent(self.last_debate_speaker)
-                if prev_agent:
-                    prev_stance = STANCE_LABEL.get(prev_agent.stance, prev_agent.stance)
-            if prev:
-                brief = (f"【上一位发言人：{self.last_debate_speaker}"
-                         f"（{prev_stance or '未声明立场'}）】（第{prev['round']}轮）：\n"
-                         f"{prev['text'][:500]}")
-                parts.append(f"这是第 {self.round} 轮反驳/辩护阶段。上一发言人「{self.last_debate_speaker}」"
-                             f"的立场为「{prev_stance or '未声明立场'}」，与你作为「{stance_label}」的立场"
-                             "存在分歧。以下是其最新发言：\n" + brief)
+            # 反驳 / 辩护阶段：优先针对对手上轮发言（需求 2/3）
+            opp_prep = self._opponent_prep.get(collab.name)
+            if opp_prep:
+                digest = ("摘要" if self.round >= 3 else "发言")
+                parts.append(f"这是第 {self.round} 轮反驳/辩护阶段。你的对手「{opp_prep['speaker']}」"
+                             f"（{opp_prep['stance']}）在第 {opp_prep['round']} 轮的{digest}如下：\n"
+                             f"{opp_prep['text']}")
                 parts.append(f"请以{persona}为出发点进行反驳：优先逐条回应对方发言中"
                              "与你立场相悖的核心观点，指出逻辑谬误（如滑坡谬误、稻草人）或提供反证"
                              "（可调用 knowledge_search 检索）。必须坚定维护你的「"
                              + stance_label + "」立场，禁止倒戈。")
             else:
-                brief = f"主持人最新发言：{self.last_main_message}"
-                parts.append(f"这是第 {self.round} 轮反驳/辩护阶段。以下是最新交锋内容：\n{brief}")
-                parts.append(f"请以{persona}为出发点，针对上述观点进行反驳或辩护："
-                             "直接回应对方核心论据，指出逻辑谬误（如滑坡谬误、稻草人）或提供反证"
-                             "（可调用 knowledge_search 检索）。必须坚定维护你的「"
-                             + stance_label + "」立场，禁止倒戈。")
+                # 回退：无立场对手（NEUTRAL/多辩手场景）时沿用原「上一发言人」逻辑
+                prev = None
+                prev_stance = ""
+                if (self.last_debate_speaker and self.last_debate_speaker != collab.name
+                        and self.last_debate_speaker in self.latest_arguments):
+                    prev = self.latest_arguments[self.last_debate_speaker]
+                    prev_agent = self.get_agent(self.last_debate_speaker)
+                    if prev_agent:
+                        prev_stance = STANCE_LABEL.get(prev_agent.stance, prev_agent.stance)
+                if prev:
+                    brief = (f"【上一位发言人：{self.last_debate_speaker}"
+                             f"（{prev_stance or '未声明立场'}）】（第{prev['round']}轮）：\n"
+                             f"{prev['text'][:500]}")
+                    parts.append(f"这是第 {self.round} 轮反驳/辩护阶段。上一发言人「{self.last_debate_speaker}」"
+                                 f"的立场为「{prev_stance or '未声明立场'}」，与你作为「{stance_label}」的立场"
+                                 "存在分歧。以下是其最新发言：\n" + brief)
+                    parts.append(f"请以{persona}为出发点进行反驳：优先逐条回应对方发言中"
+                                 "与你立场相悖的核心观点，指出逻辑谬误（如滑坡谬误、稻草人）或提供反证"
+                                 "（可调用 knowledge_search 检索）。必须坚定维护你的「"
+                                 + stance_label + "」立场，禁止倒戈。")
+                else:
+                    brief = f"主持人最新发言：{self.last_main_message}"
+                    parts.append(f"这是第 {self.round} 轮反驳/辩护阶段。以下是最新交锋内容：\n{brief}")
+                    parts.append(f"请以{persona}为出发点，针对上述观点进行反驳或辩护："
+                                 "直接回应对方核心论据，指出逻辑谬误（如滑坡谬误、稻草人）或提供反证"
+                                 "（可调用 knowledge_search 检索）。必须坚定维护你的「"
+                                 + stance_label + "」立场，禁止倒戈。")
         # RAG 证据注入（上一轮核查结果）
         ev = self._evidence_for_round(self.round - 1)
         if ev:
             parts.append(ev)
+        # 需求 5：每轮输出符合 token 约束 —— 全轮追加字数提示（API max_tokens + 截断兜底）
+        limit = max(1, int(self.effective_max_tokens * settings.OUTPUT_CHAR_PER_TOKEN))
+        parts.append(f"【输出要求】你的发言请控制在 {limit} 字以内，输出完即止，不要复述历史。")
         parts.append("请以第一人称输出你的发言，不要输出任何 JSON。")
         return "\n\n".join(parts)
 
@@ -685,6 +777,7 @@ class Orchestrator:
                         if task["var_name"] in self.shared_context:
                             self.shared_context[task["var_name"]]["value"] = "（超时未完成）"
         # 辩论环节（立论 / 反驳）：无论是否处理过任务，辩手每轮都发言，保证严格交替
+        await self._prepare_opponent_context(collab)  # 需求 2/3：注入对手上轮发言（截断/摘要）
         umsg = self._debate_prompt(collab)
         out = await self._agent_turn(collab, umsg, mode="discussion", stream=True)
         if out["content"]:
@@ -771,6 +864,12 @@ class Orchestrator:
             pass  # 规划绝不能因估算失败而中断辩论
         if total <= 0:
             return 0
+        # 需求 3/4：第 3 轮起每轮会为每个 PRO/CON 辩手注入对手发言摘要
+        # （OPPONENT_SUMMARY_MAX_CHARS 字 ≈ //2 token，加上引用框架约 200 token）
+        if self.round >= 3:
+            n_opp = sum(1 for c in self.collaborators if c.stance in ("PRO", "CON"))
+            if n_opp:
+                total += n_opp * (settings.OPPONENT_SUMMARY_MAX_CHARS // 2 + 200)
         base = max(1, 1 + len(self.collaborators))  # 每位辩手一次调用的基准成本
         return round(total * self._calls_per_round() / base)
 
@@ -979,12 +1078,17 @@ class Orchestrator:
                       event="budget.profile_save")
 
     async def _force_compress_all(self) -> None:
-        """预算吃紧：强制压缩所有 Agent 历史以缩小后续输入。"""
+        """预算吃紧：强制压缩所有 Agent 历史以缩小后续输入。
+
+        需求 6：按轮强压缩，只保留最近 BUDGET_KEEP_LAST_ROUNDS 轮的原文，
+        更早轮次压入 compressed_summary，由 system_prompt 注入。
+        """
         compressed = 0
         skipped = 0
         for a in self.agents:
             try:
-                usage = await a.compress_history(force=True)
+                usage = await a.compress_history(
+                    force=True, keep_rounds=settings.BUDGET_KEEP_LAST_ROUNDS)
                 if usage:
                     total = usage.get("total_tokens") or 0
                     if total:
@@ -1080,6 +1184,10 @@ class Orchestrator:
         self.round_evidence = {}
         self.judgment = None
         self.last_debate_speaker = None
+        # 对手定向反驳（需求 2/3）：collab.name -> {speaker, stance, round, text}；
+        # 摘要按 (对手,轮次) 缓存，避免同轮多个辩手引用同一对手重复调用 LLM
+        self._opponent_prep = {}
+        self._opponent_summary_cache = {}
         self.run_stats = {"compressions": 0, "started_at": time.time()}
         self.agent_metrics = {}
         # 预算规划器状态：开局即做一次全量可行性预估
@@ -1112,6 +1220,7 @@ class Orchestrator:
 
                 self.round += 1
                 self.phase = "debating"
+                self._opponent_prep.clear()  # 每轮重新准备对手上轮发言上下文
                 is_last = (self.round >= self.max_rounds)
                 self._round_real_calls = 0  # 本轮真实 LLM 调用计数清零（自适应 N）
                 self._round_prompt_real = 0  # 本轮真实提示词用量清零（自适应增长比 g）
@@ -1499,7 +1608,8 @@ class Orchestrator:
             try:
                 a.memory.promote_short_to_long(threshold=0.7)
                 if self.round % 2 == 0:
-                    a.memory.summarize_short_to_context()
+                    await a.memory.summarize_short_to_context(
+                        self._memory_summarizer(a))
                 a.memory.forget()
                 # 长对话管理（优化 A9）：轮次边界触发历史摘要压缩，并计入预算
                 usage = await a.compress_history()
@@ -1511,6 +1621,20 @@ class Orchestrator:
                             self.run_stats.get("compressions", 0) + 1
             except Exception:
                 pass
+
+    def _memory_summarizer(self, agent: Agent):
+        """构造「短期 → 情境」记忆的 LLM 摘要器（async 闭包），usage 计入预算。"""
+        async def _summarize(texts: list[str]) -> str:
+            summary, usage = await summarize_text(
+                agent.model_config, "\n".join(texts),
+                max_chars=settings.MEMORY_SUMMARY_MAX_CHARS)
+            total = (usage or {}).get("total_tokens") or 0
+            if total:
+                self.spent += int(total)
+                self.run_stats["memory_summaries"] = \
+                    self.run_stats.get("memory_summaries", 0) + 1
+            return summary or ""
+        return _summarize
 
     # ---------------- 控制状态事件（暂停/继续/结束 后推送给前端） ----------------
     def _status_event(self) -> dict:

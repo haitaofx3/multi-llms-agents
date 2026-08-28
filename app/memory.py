@@ -14,6 +14,7 @@ memory.py — 每个 Agent 的记忆系统
 遗忘体系（每个 agent 可独立配置）：
   - 基于时间衰减 + 访问频次的"有效重要性"，低于阈值或超出容量则遗忘
 """
+import inspect
 import json
 import re
 import threading
@@ -185,23 +186,31 @@ class MemorySystem:
             self._save()
         return [p["text"] for p in promoted]
 
-    def summarize_short_to_context(self, summarizer=None):
+    async def summarize_short_to_context(self, summarizer=None):
         """
         把短期记忆压缩为一条情境摘要（知识摘要）。
-        summarizer: 可选的可调用对象(texts:list)->str，用于调用 LLM 生成摘要；
-                    未提供时使用简单拼接摘要。
+        summarizer: 可选的可调用对象(texts:list)->str（同步或 async 均可），
+                    用于调用 LLM 生成摘要；未提供时使用简单拼接摘要。
+        注意：为避免跨 await 持有 threading.Lock，LLM 摘要在锁外执行；
+              摘要结果落库与短期清空仍在锁内完成。
         """
         with self.lock:
             if not self.short_term:
                 return None
             texts = [it["text"] for it in self.short_term]
-            if summarizer:
-                try:
-                    summary = summarizer(texts)
-                except Exception:
-                    summary = "；".join(texts)
-            else:
-                summary = "近期要点：" + "；".join(texts[:8])
+        if summarizer:
+            try:
+                result = summarizer(texts)
+                if inspect.isawaitable(result):
+                    result = await result
+                summary = result or ""
+            except Exception:
+                summary = ""
+        else:
+            summary = "近期要点：" + "；".join(texts[:8])
+        if not summary:
+            summary = "；".join(texts) or "（空摘要）"
+        with self.lock:
             self.contextual.append({
                 "id": self._new_id(),
                 "text": summary,

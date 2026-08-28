@@ -32,6 +32,7 @@ class Agent:
         self.memory = MemorySystem(agent_id, MEMORY_DIR, forget_config)
         self.mcp = build_default_tools(name, self.memory)
         self.history = []  # [{role, content}] 不含 system
+        self.history_rounds = []  # 与 history 平行：每条消息所属辩论轮次（预算强压缩按轮保留）
         self.max_history = 24
         self.compressed_summary = ""  # 长对话压缩摘要（优化 A9）
 
@@ -114,31 +115,50 @@ class Agent:
                     "你的职责是引导辩论、追问与归纳，不亲自立论或倒向某一方。")
         return ""  # NEUTRAL：不作强制声明
 
-    def append_history(self, role, content):
+    def append_history(self, role, content, round_no=None):
+        """追加一条历史消息。round_no 缺省取当前最大轮次（第 1 轮起记 1）。
+
+        history 与 history_rounds 平行维护：三处裁剪（条数上限、字符硬上限、
+        压缩截断）都必须同步，否则预算强压缩的「按轮保留」会错位。
+        """
+        if round_no is None:
+            round_no = max(self.history_rounds, default=1)
         self.history.append({"role": role, "content": content})
-        # 条数裁剪（原有：滚动窗口）
+        self.history_rounds.append(int(round_no))
+        # 条数裁剪（原有：滚动窗口）—— history_rounds 同步
         if len(self.history) > self.max_history:
             self.history = self.history[-self.max_history:]
+            self.history_rounds = self.history_rounds[-self.max_history:]
         # 字符硬上限（优化 A9）：超出 CONTEXT_MAX_CHARS 时丢弃最旧的轮次，
         # 保证单 Agent 上下文不超过硬性预算，防止长对话 token 膨胀。
         while self._history_chars() > settings.CONTEXT_MAX_CHARS and len(self.history) > 2:
             self.history.pop(0)
+            self.history_rounds.pop(0)
 
     def _history_chars(self) -> int:
         return sum(len(str(m.get("content", ""))) for m in self.history)
 
     # ---------------- 长对话压缩（优化 A9） ----------------
-    async def compress_history(self, force: bool = False):
+    async def compress_history(self, force: bool = False, keep_rounds: int | None = None):
         """
-        把最旧的轮次压缩为一条摘要，保留最近 CONTEXT_COMPRESS_KEEP_RECENT 条原文。
+        压缩历史以缩小后续输入。
 
-        触发条件：历史字符数 ≥ CONTEXT_COMPRESS_THRESHOLD（或 force=True），
-        且历史条数多于「保留条数 + 2」。摘要存放在 self.compressed_summary，
-        由 system_prompt 注入；history 截断为最近保留条。
-        摘要优先用自身 model_config 调用 LLM 生成（经 to_thread 避免阻塞事件循环），
-        失败时回退为确定性截断拼接。返回本次调用的 usage dict（用于预算统计），
-        未触发压缩时返回 None。
+        keep_rounds=None（默认，优化 A9）：
+          把最旧的轮次压缩为一条摘要，保留最近 CONTEXT_COMPRESS_KEEP_RECENT 条原文。
+          触发条件：历史字符数 ≥ CONTEXT_COMPRESS_THRESHOLD（或 force=True），
+          且历史条数多于「保留条数 + 2」。摘要存放在 self.compressed_summary，
+          由 system_prompt 注入；history 截断为最近保留条。
+
+        keep_rounds=N（需求 6：预算吃紧强压缩）：
+          从尾部扫描最近 N 个不同辩论轮次，仅保留这些轮次的原文，更早轮次全部
+          压入 compressed_summary（与既有摘要拼接）。历史不足 N 个不同轮次时
+          无需压缩，返回 None。force 在按轮模式下恒生效（调用方均为预算触发）。
+
+        摘要优先用 LLM 生成（经 to_thread 避免阻塞事件循环），失败回退为
+        确定性截断。返回本次调用的 usage dict（用于预算统计），未触发时返回 None。
         """
+        if keep_rounds is not None:
+            return await self._compress_keep_rounds(int(keep_rounds))
         keep = max(2, settings.CONTEXT_COMPRESS_KEEP_RECENT)
         if len(self.history) <= keep + 2:
             return None
@@ -149,29 +169,41 @@ class Agent:
         summary, usage = await self._summarize(texts)
         self.compressed_summary = summary
         self.history = self.history[-keep:]
+        self.history_rounds = self.history_rounds[-keep:]
+        return usage
+
+    async def _compress_keep_rounds(self, keep_rounds: int):
+        """按轮强压缩：只保留最近 keep_rounds 个不同轮次的原文，更早轮次摘要化。"""
+        if not self.history_rounds:
+            return None
+        # 尾部扫描最近 keep_rounds 个不同轮次的起始下标 cut
+        seen = set()
+        cut = len(self.history_rounds)
+        for i in range(len(self.history_rounds) - 1, -1, -1):
+            r = self.history_rounds[i]
+            if r not in seen:
+                seen.add(r)
+                if len(seen) > keep_rounds:
+                    break
+            cut = i
+        # 不同轮次数 ≤ keep_rounds：历史本身已足够小，无需压缩
+        if len(seen) <= keep_rounds:
+            return None
+        cut = min(cut, len(self.history))
+        old = self.history[:cut]
+        texts = [f"{m['role']}: {m['content']}" for m in old]
+        summary, usage = await self._summarize(texts)
+        if summary:
+            self.compressed_summary = (
+                f"{self.compressed_summary}\n{summary}" if self.compressed_summary else summary)
+        self.history = self.history[cut:]
+        self.history_rounds = self.history_rounds[cut:]
         return usage
 
     async def _summarize(self, texts):
         """生成摘要文本，返回 (summary, usage|None)。"""
-        try:
-            import asyncio
-
-            from app.llm import chat
-            joined = "\n".join(texts)
-            messages = [
-                {"role": "system",
-                 "content": "你是对话历史摘要器。把给定的对话历史压缩为核心要点，"
-                            "保留关键事实、结论与分歧点，150 字以内，不要输出其他内容。"},
-                {"role": "user", "content": joined},
-            ]
-            result = await asyncio.to_thread(
-                lambda: chat(messages, self.model_config, temperature=0.3))
-            content = (result.get("content") or "").strip()
-            if content:
-                return content, result.get("usage") or {}
-        except Exception:
-            pass
-        return self._naive_summary(texts), None
+        from app.llm import summarize_text
+        return await summarize_text(self.model_config, "\n".join(texts), max_chars=150)
 
     def _naive_summary(self, texts) -> str:
         """非 LLM 兜底摘要：保留每条文本头部片段。"""
@@ -186,4 +218,5 @@ class Agent:
 
     def reset_history(self):
         self.history = []
+        self.history_rounds = []
         self.compressed_summary = ""
