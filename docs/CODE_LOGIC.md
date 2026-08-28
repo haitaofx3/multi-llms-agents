@@ -435,11 +435,11 @@ FastAPI 应用，挂载 `/static`，提供 REST + WebSocket。
 | --- | --- | --- |
 | GET | `/` | 返回 `index.html` |
 | GET | `/api/defaults` | 返回供应商预设（**已剥离 api_key**）、向量库后端、最大 Agent 数 |
-| POST | `/api/configure` | 配置 Agent（1–6）、主题、最大轮次、预算；**请求体 `ConfigureRequest`（pydantic 校验，非法 422）**；返回 `agents/stance/phase/trace_id/budget/max_rounds` |
+| POST | `/api/configure` | 配置 Agent（1–6）、主题、最大轮次、预算；**请求体 `ConfigureRequest`（pydantic 校验，非法 422）**；返回 `agents/stance/phase/trace_id/budget/max_rounds` + `feasibility`（生效上限 / 可达轮数 / 预估总耗 / **`safety_margin` / `prompt_forecast`**） |
 | POST | `/api/ingest` | 向共享向量库注入知识（**请求体 `IngestRequest` 校验**，按段落切分） |
 | POST | `/api/start` | 启动讨论（**请求体 `StartRequest` 可省略**，`_spawn_task(run_discussion)` 登记后台任务） |
 | POST | `/api/pause` `/api/resume` `/api/end` | 暂停/继续/结束 |
-| GET | `/api/status` | 状态、阶段、轮次、Agent、任务、共享上下文、预算、裁判结果 |
+| GET | `/api/status` | 状态、阶段、轮次、Agent、任务、共享上下文、预算、裁判结果、**校准因子（`est_factor` / `call_factor` / `growth_ratio` / `safety_margin` / `prompt_forecast`）** |
 | GET | `/api/export` | 返回 Markdown 文本 |
 | POST | `/api/save_markdown` | 保存 Markdown 到服务器（**请求体 `SaveMarkdownRequest`；`filename` 经 `_safe_discussion_filename` 清洗防路径穿越**，空请求体回退默认名；同时写入历史记忆索引） |
 | GET | `/api/history?q=` | 历史讨论列表（`items` 按时间倒序；`q` 非空时按题目 / trace_id 关键词过滤） |
@@ -450,7 +450,7 @@ FastAPI 应用，挂载 `/static`，提供 REST + WebSocket。
 > **`_safe_discussion_filename(fname)`（P0-1，`app/main.py:284`）**：`filename` 只保留 `Path(fname).name`（丢弃目录 / 绝对路径 / `..`），清洗后为空回退 `discussion_{_ts()}.md`，未以 `.md` 结尾则补后缀；与读取侧 `history.get_markdown` 的 `resolve()` + `relative_to()` 防护（§13.4）构成读写两侧的路径穿越防线。
 
 ### 13.3 WebSocket `/ws`
-- 连接即推送当前 `status`（含 agents/topic/max_rounds/budget/spent/phase），便于前端初始化席位；
+- 连接即推送当前 `status`（含 agents/topic/max_rounds/budget/spent/phase + **`remaining_budget` / `spent_budget` / `est_factor` / `call_factor` / `growth_ratio`**），便于前端初始化席位与预算面板；
 - 订阅 `event_bus`，把每个事件 `send_json` 给前端；
 - 断开/异常时在 `finally` 中退订，避免订阅队列泄漏。
 
@@ -495,7 +495,7 @@ FastAPI 应用，挂载 `/static`，提供 REST + WebSocket。
 
 - **`pyproject.toml`**：声明 `requires-python = ">=3.10"`；`[tool.ruff]` 启用 `E4/E7/E9/F/I/UP/RUF/B/S` 规则（`line-length=110`，忽略 `BLE001/S110/RUF001/002/003` 中文标点误报；`tests/*` per-file-ignores `S101/S310`）；`[tool.mypy]` strict 模式仅覆盖 `app/protocol.py`（全量开启为后续工作）；`[tool.coverage]` 以 `app/` 为源码、`branch=true`。
 - **`requirements-dev.txt`**：`-r requirements.txt` + `ruff>=0.5` / `mypy>=1.10` / `coverage>=7.0`，与运行依赖分离。
-- **接口级测试 `tests/test_api_flow.py`**：`httpx.AsyncClient(transport=ASGITransport(app))` 直接驱动 FastAPI 应用，monkeypatch `_judge_round / _final_summary / _consume_stream / _run_llm_retry` 四个 LLM 调用点实现确定性输出，**无需启动服务器、无需真实模型**。4 个用例：HTTP 全链路（configure→start→done→export→save_markdown→history）、`../../evil.md` 路径穿越被清洗为 `evil.md`、空请求体 save_markdown 回退默认文件名、空 Agent 列表保持 `400` 契约。运行：`python -m unittest tests.test_api_flow -v`。
+- **接口级测试 `tests/test_api_flow.py`**：`httpx.AsyncClient(transport=ASGITransport(app))` 直接驱动 FastAPI 应用，monkeypatch `_judge_round / _final_summary / _consume_stream / _run_llm_retry` 四个 LLM 调用点实现确定性输出，**无需启动服务器、无需真实模型**。7 个用例：HTTP 全链路（configure→start→done→export→save_markdown→history）、`../../evil.md` 路径穿越被清洗为 `evil.md`、空请求体 save_markdown 回退默认文件名、空 Agent 列表保持 `400` 契约、configure 返回 feasibility、**status 携带预算规划 + 校准因子字段（含 `est_factor` 钳制 ≥1.0 断言）**。运行：`python -m unittest tests.test_api_flow -v`。
 - **CI 门禁**（`.github/workflows/ci.yml`）：安装步骤含 `fastapi httpx ruff mypy`，在 fast 单测之后新增 `Lint (ruff)`、`Type check (mypy)`、`API flow tests` 三步。
 - **RUF006 后台任务强引用**：`main.py` / `orchestrator.py` 均以模块级 `_background_tasks: set[asyncio.Task]` 持有后台任务引用（`_spawn_task` helper 登记 + 完成回调自动 discard），防止任务被 GC 提前回收。
 
@@ -506,7 +506,7 @@ FastAPI 应用，挂载 `/static`，提供 REST + WebSocket。
 ### 14.1 页面结构 `index.html`
 - **顶栏 `.topbar`**：Logo + "历史记录"按钮 + 状态胶囊。
 - **配置区 `#setup`**（双栏：`.setup-col` + `.side-col`）：Agent 数量（2–6）、每个 Agent 卡片（名称/角色/性格/**立场**/模型供应商 + 自定义字段）、主题、最大轮次、Token 预算、知识注入、开始按钮。
-- **讨论区 `#discussion`**：左侧圆桌（`#round-table`）含等分席位与中心信息（主题/轮次/任务进度）；右侧控制（暂停/继续/结束/返回）+ 运行状态（阶段/轮次/预算/Trace ID）+ 任务面板 + 变量面板；下方**聊天气泡**发言流；结束栏（预览 / 一键导出 Markdown）。
+- **讨论区 `#discussion`**：左侧圆桌（`#round-table`）含等分席位与中心信息（主题/轮次/任务进度）；右侧控制（暂停/继续/结束/返回）+ 运行状态（阶段/轮次/预算/Trace ID）+ **预算状态面板（进度条 / 校准因子 / 预算告警事件）** + 任务面板 + 变量面板；下方**聊天气泡**发言流；结束栏（预览 / 一键导出 Markdown）。
 - **历史弹窗 `#history-modal`**：左侧搜索框 + 记录列表（题目 / 时间 / 状态 / 轮次 / 人数），右侧 Markdown 预览 + 一键导出。
 
 ### 14.2 样式 `style.css`
@@ -516,6 +516,7 @@ FastAPI 应用，挂载 `/static`，提供 REST + WebSocket。
 - **聊天气泡**：`.bubble-row`（flex 行 + `bubbleIn` 弹出动画）内含 `.bubble-avatar` + `.bubble-main`（`.bubble-meta` 名字/轮次标签 + `.bubble` 气泡）；任务/总结/裁决/日志/错误各有专属气泡风格；`.bubble-row.speaking` 高亮金边。
 - **流式光标**：`.caret`（金色竖线 + `blink` 闪烁动画），流式增量时保持在文本末尾。
 - 历史面板 `.history-modal` / `.history-layout` / `.h-item`。
+- **预算状态面板**：`.budget-bar`（8px 圆角进度条，`.over` 超预算时填充变 err 红）+ `.budget-bar-fill`（accent 蓝，宽度过渡 .3s）；`.budget-sub` 虚线分隔「预算事件」；`.budget-events`（max-height 96px 滚动）；`.budget-event`（12px 行）+ `.ev-tag`（10px 圆角小标签，`ev-warn` 金 / `ev-err` 红 / `ev-ok` 绿）。
 
 ### 14.3 逻辑 `app.js`
 - `init()`：拉取 `/api/defaults`、生成卡片、绑定事件、连接 WS；探测服务器是否存在可继续的讨论（`/api/status`）。
@@ -526,6 +527,7 @@ FastAPI 应用，挂载 `/static`，提供 REST + WebSocket。
 - `connectWS()` / `handleEvent(ev)`：按事件类型更新 UI（见 §15 事件协议）。
 - **并发流式气泡**：`state.streamBoxes = {}`（speaker → el），`speech_start` 按 speaker 建独立气泡（`.bubble-row` + 空 `.body` + `.caret`），`speech_delta` 把增量插入到光标前，`speech_end` 用完整文本替换（移除光标）并删除该 key——第 1 轮并行立论时多个 Agent 可同时流式发言而不互相覆盖；**每次气泡只承载当前发言内容，不拼接历史**。
 - `renderRunStatus(data)`：展示阶段/轮次/预算（剩余+已用）/用时/Trace ID。
+- **预算状态面板**：`renderBudgetPanel(data)` 渲染进度条（已用/总量百分比，`budget_overshoot` 或已用超总量时标红）+ 预算剩余/已用/总量 + 生效输出上限（`budget_degraded` 标注"降级"）+ 预计总耗（超预算显示百分比）+ 可支撑轮数（含 `safety_margin` 安全余量）+ 校准因子（提示词 `est_factor` / 调用 `call_factor` / 增长 `growth_ratio`）；`case "status"`（含 WS 连接快照）、`case "status_sync"`、每秒 `/api/status` 轮询、配置后可行性预览共四处接线；`addBudgetEvent(ev)` 命中 `BUDGET_EVENT_TEXT`（6 类 `budget.*` 告警：强制压缩历史/允许小幅超支/自动削减轮次/输出抬至保底/预算熔断/硬熔断回退）时以彩色标签入「预算事件」列表（保留 6 条，全量文本 `textContent` 填充防 XSS）。
 - `exportMarkdown()` / `downloadMarkdown()`：拉取 `/api/export` 弹出/下载 Markdown（下载同时调用 `/api/save_markdown` 落盘并写入历史索引）。
 - **历史面板**：`openHistory()` 打开弹窗并 `loadHistory()` 拉取 `/api/history`；搜索框 300ms 防抖后带 `?q=` 重新检索；点击列表项 `viewHistory(filename)` 拉取 `/api/history/{filename}` 预览；`downloadHistoryMarkdown()` 把当前查看内容下载为 Markdown 文件。
 
@@ -535,7 +537,7 @@ FastAPI 应用，挂载 `/static`，提供 REST + WebSocket。
 
 | `type` | 关键字段 | 含义 |
 | --- | --- | --- |
-| `status` | `status, phase, topic, max_rounds, trace_id, agents` | 状态变化/初始化 |
+| `status` | `status, phase, topic, max_rounds, trace_id, agents, budget, spent, remaining_budget, spent_budget, est_factor, call_factor, growth_ratio, safety_margin, prompt_forecast` | 状态变化/初始化（含预算面板所需校准因子） |
 | `round` | `round, max` | 进入新一轮 |
 | `speech` | `speaker, text, is_main, round` | 发言（非流式回退时使用） |
 | `speech_start` | `speaker, round, is_main` | 流式发言开始（前端建气泡 + 席位高亮） |
@@ -543,11 +545,11 @@ FastAPI 应用，挂载 `/static`，提供 REST + WebSocket。
 | `speech_end` | `speaker, round, text` | 流式发言结束（以完整文本收尾） |
 | `task_assigned` | `from, to, content, expected, var, task_id, timestamp` | 任务分派 |
 | `task_result` | `from, var, value, completed, message, task_id, timestamp, token_cost` | 任务回报/变量回填 |
-| `status_sync` | `trace_id, phase, current_round, agent_states, remaining_budget, spent_budget, elapsed_time_ms` | 状态同步（架构状态机/预算心跳） |
+| `status_sync` | `trace_id, phase, current_round, agent_states, remaining_budget, spent_budget, effective_max_tokens, feasible_rounds, projected_total, budget_overshoot, budget_degraded, est_factor, call_factor, growth_ratio, elapsed_time_ms` | 状态同步（架构状态机/预算心跳，驱动预算面板实时刷新） |
 | `judgment` | `judge, scores, agent_scores, model_performance, composite_scores, winner, critique, convergence_flag, round` | 裁判裁决（含按辩手评分、模型质量分与综合评分） |
 | `summary` | `speaker, text, round` | 最终总结 |
 | `agent_error` | `agent, error` | 某 Agent LLM 调用失败（前端展示错误气泡） |
-| `log` | `text` | 系统日志（带 trace_id） |
+| `log` | `text, event` | 系统日志（带 trace_id）；`event` 为 `budget.*` 时前端同步入「预算事件」告警列表 |
 
 ---
 
@@ -670,7 +672,9 @@ FastAPI 应用，挂载 `/static`，提供 REST + WebSocket。
 2. **保守先验 + 档案持久化**：`est_factor / call_factor / growth_ratio` 落盘 `data/budget_profile.json`，启动载入；无档案时用 `EST_FACTOR_INIT=2.0`（对照冒烟 #6 首轮 2.68× 实测，2.0 先验避免首轮 40% 预算被单轮烧掉），历史乐观档案钳制 ≥1.0。
 3. **预算不足自动削轮次**：规划超支且质量下限（`JUDGE_MIN_OUTPUT` / `SUMMARY_MIN_OUTPUT` = 512）仍无法覆盖全部轮次时，按 `feasible_rounds` 把 `max_rounds` 裁剪到可支撑范围（`BUDGET_AUTO_TRIM_ROUNDS=1`，事件 `budget.round_trim`）；阶段输出保底保证裁决/汇总 JSON 不再因 E 触底为空。
 
-**已知边界**（尚未覆盖，后续可选）：EMA 收敛仍需数轮样本，极端首轮暴涨仍可能短期超支；`growth_ratio` 校准依赖轮间环比，单轮辩论无样本可循；自动削轮次会改变对话深度，前端需展示实际生效轮次。
+**已知边界**（尚未覆盖，后续可选）：EMA 收敛仍需数轮样本，极端首轮暴涨仍可能短期超支；`growth_ratio` 校准依赖轮间环比，单轮辩论无样本可循；自动削轮次会改变对话深度，实际生效轮数已由前端预算面板展示（`feasible_rounds` + `budget.round_trim` 告警标签）。
+
+**实现更新（前端展示）**：上述缺口中的"前端展示实际生效轮次"已落地——讨论页新增**预算状态面板**（§14），经 `/api/status` / `/ws` / `status_sync` 实时展示进度条、输出上限降级、预计总耗超支比、可支撑轮数与三路校准因子，并把 `budget.*` 告警事件（削轮次/超支/保底/压缩/熔断）渲染为结构化彩色标签。
 
 ---
 
