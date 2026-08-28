@@ -13,6 +13,8 @@ test_ci_fast.py — 快速确定性单元测试（CI 用，无需真实 LLM API�
 """
 import asyncio
 import math
+import os
+import tempfile
 import unittest
 
 from app.config import settings
@@ -32,6 +34,17 @@ def _fake_llm_result(content="发言"):
 
 class OrchestratorControlTest(unittest.IsolatedAsyncioTestCase):
     """编排器控制流（暂停/继续/结束 + 手动结束收尾）测试。"""
+
+    def setUp(self):
+        # 隔离校准档案：run_discussion 会 load/save，避免用 mock LLM 数据污染真实档案
+        self._tmp_dir = tempfile.TemporaryDirectory()
+        self._old_profile_path = settings.BUDGET_PROFILE_PATH
+        settings.BUDGET_PROFILE_PATH = os.path.join(
+            self._tmp_dir.name, "budget_profile.json")
+
+    def tearDown(self):
+        settings.BUDGET_PROFILE_PATH = self._old_profile_path
+        self._tmp_dir.cleanup()
 
     async def _configure(self, max_rounds=3):
         """在事件循环内执行 configure（_log 需要运行中的 loop）。"""
@@ -153,6 +166,17 @@ class OrchestratorControlTest(unittest.IsolatedAsyncioTestCase):
 
 class BudgetPlannerTest(unittest.IsolatedAsyncioTestCase):
     """预算规划器与降级阶梯（预算充足 / 吃紧 / 强制压缩 / 小额超支不中断）。"""
+
+    def setUp(self):
+        # 隔离校准档案：run_discussion 相关测试会 load/save，避免污染真实档案
+        self._tmp_dir = tempfile.TemporaryDirectory()
+        self._old_profile_path = settings.BUDGET_PROFILE_PATH
+        settings.BUDGET_PROFILE_PATH = os.path.join(
+            self._tmp_dir.name, "budget_profile.json")
+
+    def tearDown(self):
+        settings.BUDGET_PROFILE_PATH = self._old_profile_path
+        self._tmp_dir.cleanup()
 
     async def _configure(self, max_rounds=3):
         orchestrator.configure([HOST_CFG, PRO_CFG], topic="预算规划测试",
@@ -376,6 +400,235 @@ class BudgetPlannerTest(unittest.IsolatedAsyncioTestCase):
         orchestrator._call_factor = 2.0
         p1 = orchestrator._estimate_round_prompt_tokens()
         self.assertGreater(p1, p0)
+
+    # ---------------- 历史增长模型 g / 档案持久化 / 自动削减轮次 ----------------
+
+    async def test_planner_growth_ratio_ema_calibration(self):
+        """自适应历史增长比 g：环比 EMA 平滑，样本#1 跳过，负增长钳 0，钳制 [MIN, MAX]。"""
+        await self._configure(max_rounds=3)
+        orchestrator._growth_ratio = settings.BUDGET_GROWTH_RATIO_INIT
+        orchestrator._growth_ratio_samples = 0
+        # 样本#1（无上轮基准）：跳过更新，仅记录 prev 供第 2 轮使用
+        orchestrator._update_growth_ratio(real_round_prompt=100)
+        self.assertEqual(orchestrator._growth_ratio, settings.BUDGET_GROWTH_RATIO_INIT)
+        self.assertEqual(orchestrator._growth_ratio_samples, 0)
+        # 第 2 轮环比 (300-100)/100=2.0，EMA α=0.2：0.5 → 0.8
+        orchestrator._update_growth_ratio(real_round_prompt=300)
+        self.assertAlmostEqual(orchestrator._growth_ratio, 0.8)
+        self.assertEqual(orchestrator._growth_ratio_samples, 1)
+        # 负增长钳 0：环比 (200-300)/300<0 → 0，EMA 0.8 → 0.64
+        orchestrator._update_growth_ratio(real_round_prompt=200)
+        self.assertAlmostEqual(
+            orchestrator._growth_ratio, 0.8 * 0.8 + 0.2 * 0.0)
+        # 钳制上限：因子不超 BUDGET_GROWTH_RATIO_MAX
+        orchestrator._growth_ratio = settings.BUDGET_GROWTH_RATIO_MAX
+        orchestrator._prev_round_prompt_real = 1
+        orchestrator._update_growth_ratio(real_round_prompt=1000)
+        self.assertLessEqual(orchestrator._growth_ratio, settings.BUDGET_GROWTH_RATIO_MAX)
+        # 钳制下限：因子不低于 BUDGET_GROWTH_RATIO_MIN
+        orchestrator._growth_ratio = settings.BUDGET_GROWTH_RATIO_MIN
+        orchestrator._prev_round_prompt_real = 1000
+        orchestrator._update_growth_ratio(real_round_prompt=1)
+        self.assertGreaterEqual(orchestrator._growth_ratio, settings.BUDGET_GROWTH_RATIO_MIN)
+        # 非法样本（0 用量）不污染因子、也不改 prev 基准
+        prev_factor = orchestrator._growth_ratio
+        prev_prompt = orchestrator._prev_round_prompt_real
+        orchestrator._update_growth_ratio(real_round_prompt=0)
+        self.assertEqual(orchestrator._growth_ratio, prev_factor)
+        self.assertEqual(orchestrator._prev_round_prompt_real, prev_prompt)
+
+    async def test_planner_growth_model_is_conservative(self):
+        """历史增长模型生效：同预算下带 growth 的 prompt_forecast 更大、E 更保守。"""
+        await self._configure(max_rounds=3)
+        orchestrator.budget = 80000
+        orchestrator.spent = 0
+        orchestrator._growth_ratio = 0.5
+        plan_growth = orchestrator._compute_plan("debate", 3)
+        orchestrator._growth_ratio = 0.0
+        plan_flat = orchestrator._compute_plan("debate", 3)
+        self.assertGreater(plan_growth["prompt_forecast"], plan_flat["prompt_forecast"])
+        self.assertLessEqual(
+            plan_growth["effective_max_tokens"], plan_flat["effective_max_tokens"])
+        # plan dict 应携带增长模型观测字段
+        for key in ("growth_ratio", "safety_margin", "prompt_forecast"):
+            self.assertIn(key, plan_growth)
+
+    async def test_tail_base_tokens_reserves_outputs(self):
+        """尾段基础成本 ≥ 裁判/汇总提示词 + 两者输出保底。"""
+        await self._configure(max_rounds=3)
+        j0 = (0 if not orchestrator.collaborators
+              else orchestrator._judge_prompt_tokens_now())
+        s0 = orchestrator._summary_prompt_tokens()
+        base = orchestrator._tail_base_tokens()
+        self.assertGreaterEqual(
+            base, j0 + s0 + settings.JUDGE_MIN_OUTPUT + settings.SUMMARY_MIN_OUTPUT)
+        self.assertGreaterEqual(base, settings.BUDGET_TAIL_RESERVE)
+
+    async def test_plan_for_phase_judge_overshoot_keeps_min_output(self):
+        """预算不足时，裁判阶段 E 抬到 JUDGE_MIN_OUTPUT 保底（避免 JSON 截断→确定性回退）。"""
+        await self._configure(max_rounds=3)
+        orchestrator.budget = 5000
+        orchestrator.spent = 0
+        orchestrator.max_tokens = 4096
+        plan = await orchestrator._plan_for_phase("judge")
+        self.assertTrue(plan["overshoot"])
+        self.assertGreaterEqual(plan["effective_max_tokens"], settings.JUDGE_MIN_OUTPUT)
+
+    async def test_planner_auto_trim_rounds(self):
+        """BUDGET_AUTO_TRIM_ROUNDS=1：预算不足时自动削减 max_rounds（不削减到低于当前轮）。"""
+        await self._configure(max_rounds=8)
+        orchestrator.budget = 20000
+        orchestrator.spent = 0
+        orchestrator.round = 1  # 模拟规划发生在第 1 轮
+        old_trim = settings.BUDGET_AUTO_TRIM_ROUNDS
+        settings.BUDGET_AUTO_TRIM_ROUNDS = 1
+        try:
+            plan = await orchestrator._plan_for_round(8)
+            self.assertTrue(plan["overshoot"])
+            self.assertLess(orchestrator.max_rounds, 8)
+            self.assertGreaterEqual(orchestrator.max_rounds, orchestrator.round)
+        finally:
+            settings.BUDGET_AUTO_TRIM_ROUNDS = old_trim
+
+    async def test_planner_auto_trim_disabled_keeps_rounds(self):
+        """BUDGET_AUTO_TRIM_ROUNDS=0：预算不足也不削减轮次（保持现状跑满）。"""
+        await self._configure(max_rounds=8)
+        orchestrator.budget = 20000
+        orchestrator.spent = 0
+        orchestrator.round = 1
+        old_trim = settings.BUDGET_AUTO_TRIM_ROUNDS
+        settings.BUDGET_AUTO_TRIM_ROUNDS = 0
+        try:
+            await orchestrator._plan_for_round(8)
+            self.assertEqual(orchestrator.max_rounds, 8)
+        finally:
+            settings.BUDGET_AUTO_TRIM_ROUNDS = old_trim
+
+    async def test_profile_save_load_roundtrip(self):
+        """校准档案保存/载入往返（临时路径，不污染真实档案）。"""
+        await self._configure(max_rounds=3)
+        path = os.path.join(self._tmp_dir.name, "roundtrip.json")
+        old_path = settings.BUDGET_PROFILE_PATH
+        settings.BUDGET_PROFILE_PATH = path
+        try:
+            orchestrator._est_factor = 3.5
+            orchestrator._est_factor_samples = 7
+            orchestrator._call_factor = 2.2
+            orchestrator._call_factor_samples = 3
+            orchestrator._growth_ratio = 1.3
+            orchestrator._growth_ratio_samples = 4
+            orchestrator._save_profile()
+            self.assertTrue(os.path.exists(path))
+            # 重置后载入应还原
+            orchestrator._est_factor = 1.0
+            orchestrator._est_factor_samples = 0
+            orchestrator._call_factor = 1.0
+            orchestrator._call_factor_samples = 0
+            orchestrator._growth_ratio = 0.5
+            orchestrator._growth_ratio_samples = 0
+            orchestrator._load_profile()
+            self.assertAlmostEqual(orchestrator._est_factor, 3.5)
+            self.assertEqual(orchestrator._est_factor_samples, 7)
+            self.assertAlmostEqual(orchestrator._call_factor, 2.2)
+            self.assertEqual(orchestrator._call_factor_samples, 3)
+            self.assertAlmostEqual(orchestrator._growth_ratio, 1.3)
+            self.assertEqual(orchestrator._growth_ratio_samples, 4)
+        finally:
+            settings.BUDGET_PROFILE_PATH = old_path
+
+    async def test_profile_load_missing_uses_conservative_prior(self):
+        """无档案时载入保守先验 EST_FACTOR_INIT；历史乐观档案的 est_factor 被钳制 ≥1.0。"""
+        await self._configure(max_rounds=3)
+        path = os.path.join(self._tmp_dir.name, "missing.json")
+        old_path = settings.BUDGET_PROFILE_PATH
+        settings.BUDGET_PROFILE_PATH = path
+        try:
+            orchestrator._load_profile()
+            self.assertEqual(orchestrator._est_factor, settings.EST_FACTOR_INIT)
+            self.assertEqual(orchestrator._est_factor_samples, 0)
+            self.assertEqual(orchestrator._call_factor, 1.0)
+            self.assertEqual(orchestrator._growth_ratio, settings.BUDGET_GROWTH_RATIO_INIT)
+            # 载入乐观档案（est<1.0）应被钳制到 ≥1.0
+            with open(path, "w", encoding="utf-8") as f:
+                f.write('{"est_factor": 0.4, "est_samples": 5, '
+                        '"call_factor": 0.6, "call_samples": 2, '
+                        '"growth_ratio": 0.9, "growth_samples": 3}')
+            orchestrator._load_profile()
+            self.assertGreaterEqual(orchestrator._est_factor, 1.0)
+            self.assertEqual(orchestrator._est_factor_samples, 5)
+            self.assertGreaterEqual(orchestrator._call_factor, 0.5)
+            self.assertGreaterEqual(orchestrator._growth_ratio, settings.BUDGET_GROWTH_RATIO_MIN)
+        finally:
+            settings.BUDGET_PROFILE_PATH = old_path
+
+    async def test_status_sync_includes_growth_ratio(self):
+        """_status_sync 携带 growth_ratio 字段供前端/观测。"""
+        await self._configure(max_rounds=3)
+        orchestrator._growth_ratio = 1.25
+        s = orchestrator._status_sync()
+        self.assertIn("growth_ratio", s)
+        self.assertIsInstance(s["growth_ratio"], float)
+        self.assertAlmostEqual(s["growth_ratio"], 1.25)
+
+
+class BudgetMathTest(unittest.TestCase):
+    """app/budget.py 纯数学核心（无外部依赖）。"""
+
+    def test_prompt_growth_sum(self):
+        """提示词算术级数和：R·P + g·P·R·(R-1)/2。"""
+        from app import budget as budget_math
+        self.assertEqual(budget_math.prompt_growth_sum(100, 0.5, 3), 450)
+        self.assertEqual(budget_math.prompt_growth_sum(100, 0.0, 3), 300)
+        self.assertEqual(budget_math.prompt_growth_sum(100, 0.5, 1), 100)
+        self.assertEqual(budget_math.prompt_growth_sum(100, 0.5, 0), 0)
+        self.assertEqual(budget_math.prompt_growth_sum(0, 0.5, 3), 0)
+
+    def test_solve_output_cap(self):
+        """反解输出上限：充足取 cap，吃紧降 cap，不足取 floor；钳制在 [floor, cap]。"""
+        from app import budget as budget_math
+        # 充足：usable - base - prompt ≥ denom·cap → 取 cap。
+        # 验算（remaining=200000, usable=184000, prompt=45000, denom=14）：
+        #   e = (184000-8000-45000)/14 = 9357 → 钳制到 4096。
+        cap = budget_math.solve_output_cap(
+            remaining=200000, base=8000, P=10000, g=0.5, N=3, S=1, R=3,
+            floor=256, cap=4096, margin=0.08)
+        self.assertEqual(cap, 4096)
+        # 吃紧：numer/14 ∈ (256, 4096) → 降 cap 但不触底。
+        #   remaining=80000, usable=73600, e = (73600-8000-45000)/14 ≈ 1471。
+        e = budget_math.solve_output_cap(
+            remaining=80000, base=8000, P=10000, g=0.5, N=3, S=1, R=3,
+            floor=256, cap=4096, margin=0.08)
+        self.assertGreater(e, 256)
+        self.assertLess(e, 4096)
+        # 不足：numer ≤ 0 → 取 floor。
+        f = budget_math.solve_output_cap(
+            remaining=5000, base=8000, P=10000, g=0.5, N=3, S=1, R=3,
+            floor=256, cap=4096, margin=0.08)
+        self.assertEqual(f, 256)
+
+    def test_overshoot_at_floor(self):
+        """下限输出仍超预算才判定 overshoot（margin 不参与判定）。"""
+        from app import budget as budget_math
+        self.assertTrue(budget_math.overshoot_at_floor(
+            remaining=5000, base=8000, P=10000, g=0.5, N=3, S=1, R=3, floor=256))
+        self.assertFalse(budget_math.overshoot_at_floor(
+            remaining=100000, base=8000, P=10000, g=0.5, N=3, S=1, R=3, floor=256))
+
+    def test_feasible_rounds(self):
+        """从 max_r 向下迭代返回首个可行轮次（含 0）。"""
+        from app import budget as budget_math
+        # 充足：max_r 全可行
+        self.assertEqual(budget_math.feasible_rounds(
+            remaining=50000, base=5000, P=1000, g=0.1, N=3, S=1,
+            E=100, max_r=5), 5)
+        # 中间：仅部分轮次可行
+        self.assertEqual(budget_math.feasible_rounds(
+            remaining=40000, base=8000, P=10000, g=0.5, N=3, S=1,
+            E=256, max_r=5), 2)
+        # 不足：连尾段都覆盖不了 → 0
+        self.assertEqual(budget_math.feasible_rounds(
+            remaining=2000, base=8000, P=10000, g=0.5, N=3, S=1,
+            E=256, max_r=5), 0)
 
 
 if __name__ == "__main__":

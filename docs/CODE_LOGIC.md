@@ -368,18 +368,23 @@ while round < max_rounds:
 **并行立论**（架构文档 §6.2）：第 1 轮协作 Agent 无相互依赖，用 `asyncio.gather(..., return_exceptions=True)` 并发立论；流式事件带 `speaker`，前端按 speaker 独立气泡，天然支持并发流式。
 
 ### 12.7 预算规划与降级（budget planner）
-每轮开始前用纯数学规划求解本轮生效的输出上限 E = `effective_max_tokens`，目标是「剩余轮次 + 裁判 + 汇总」的总成本落在预算内；任何情况下不因预算中断辩论。
+每轮开始前用纯数学规划求解本轮生效的输出上限 E = `effective_max_tokens`，目标是「剩余轮次 + 裁判 + 汇总」的总成本落在预算内；任何情况下不因预算中断辩论。数学核心独立在 `app/budget.py`（无外部依赖，可单测）。
 
-- **规划函数 `_compute_plan(phase, remaining_rounds)`**（无副作用）：`E ≤ (remaining − tail − R·P) / (R·N + R·S + 2)`，其中
-  - `R` = 剩余轮次；`P` = 每轮提示词 token 估算（见下）；`N` = 每轮 LLM 调用次数（含工具循环）；`S` = 辩手数（裁判记录随轮次增长）；`2E` = 裁判输出 + 汇总输出；`tail` = 裁判/汇总提示词基础成本；
+- **规划函数 `_compute_plan(phase, remaining_rounds)`**（无副作用）：`E ≤ (usable − base − prompt_cost(R)) / (R·N + R·S + 2)`，其中
+  - `usable = remaining × (1 − safety_margin)`（`BUDGET_SAFETY_MARGIN`，默认 8%，只压低 E，不参与超支判定）；
+  - `base` = 裁判/汇总提示词尾段保底，`_tail_base_tokens()` = `max(BUDGET_TAIL_RESERVE, judge_prompt + summary_prompt + JUDGE_MIN_OUTPUT + SUMMARY_MIN_OUTPUT)`（输出保底计入尾段，避免裁决/汇总被截断）；
+  - `R` = 剩余轮次；`P` = 每轮提示词 token 估算（见下）；`N` = 每轮 LLM 调用次数（含工具循环）；`S` = 辩手数（裁判记录随轮次增长）；`2E` = 裁判输出 + 汇总输出；
+  - **历史增长模型**：`prompt_cost(R) = R·P + g·P·R·(R−1)/2`（算术级数）——后续轮次历史变长、输入递增，不再按常数 R·P 低估；
   - 同时计算 `overshoot`（即便用下限输出仍超支）、`projected_total`、`feasible_rounds`、`degraded`。
-- **降级阶梯**（`_plan_for_round`）：① 优先降 `effective_max_tokens` 上限（不低于 `BUDGET_OUTPUT_FLOOR`）；② 仍超支则 `_force_compress_all()` 强制压缩全部 Agent 历史后重新规划；③ 仍不足则允许小幅超支跑完（`budget.overshoot`），**辩论绝不中断**。预算熔断 `budget.circuit_break` 仅作最后防线（剩余 < `MIN_TOKEN_THRESHOLD`）。
+- **降级阶梯**（`_plan_for_round`）：① 优先降 `effective_max_tokens` 上限（不低于阶段输出保底，见下）；② 仍超支则 `_force_compress_all()` 强制压缩全部 Agent 历史后重新规划；③ 仍不足且 `BUDGET_AUTO_TRIM_ROUNDS=1` 时**自动削减轮次**（`feasible_rounds` 反解最大可行轮次，`max_rounds` 裁剪到该值，本轮跑完即进裁决，事件 `budget.round_trim`）；④ 仍不足则允许小幅超支跑完（`budget.overshoot`），**辩论绝不中断**。预算熔断 `budget.circuit_break` 仅作最后防线（剩余 < `MIN_TOKEN_THRESHOLD`）。
+- **阶段输出保底**：裁判/汇总的 `effective_max_tokens` 不低于 `JUDGE_MIN_OUTPUT` / `SUMMARY_MIN_OUTPUT`（默认 512）——当反解 E 低于保底时提升到保底并记 `budget.phase_min_output`（即使超支也保证裁决 JSON 完整，避免空 JSON 确定性回退）。
 - **每轮 N 次调用建模**：`_calls_per_round()` = `ceil((1+C)×BUDGET_TOOL_OVERHEAD)`（C=协作辩手数，默认乘数 1.5，即同一辩手可能多次工具调用）；`_estimate_round_prompt_tokens()` 按 N 次调用折算每轮提示词成本（而非每位辩手一次）。
-- **自适应校准（两路 EMA，只放大"尚未发生的预测"，已发生费用永远按真实 usage 记账）**：
-  - `_est_factor`（提示词尺寸偏差）：每次真实 LLM 调用后，用 `实测 total_tokens / len//2 启发式估算` 的比值 EMA 更新（α=0.2，钳制 [0.5, 10]），作用于 `_estimate_call_prompt` / 裁判 / 汇总的提示词估算。真实冒烟中首轮样例会达 3–4×，收敛后稳定在 ~1.3×。
+- **自适应校准（三路 EMA，只放大"尚未发生的预测"，已发生费用永远按真实 usage 记账）**：
+  - `_est_factor`（提示词尺寸偏差）：每次真实 LLM 调用后，用 `实测 total_tokens / 启发式估算` 的比值 EMA 更新（α=0.2，钳制 [0.5, 10]），作用于提示词估算。真实冒烟中首轮样例会达 2.68×，收敛后稳定在 ~1.3×。
   - `_call_factor`（工具调用次数偏差）：每轮结束用 `本轮实测 LLM 调用次数 / 基数 ceil((1+C)×1.5)` 的比值 EMA 更新（α=0.2，钳制 [0.5, 5]），作用于 `_calls_per_round()`。真实冒烟实测每轮真实调用约为基数的 1.2–3.2×。
-  - 两个因子都在 `__init__` / `configure` / `run_discussion` 重置为 1.0；首轮规划必然基于 1.0（尚无真实用量）。**注意**：轮次越多并不自动等于校准越好——4 轮冒烟实测超支 71.9%（见 §20 根因复盘），因为规划按"当前历史"估算常数 P，未建模历史随轮次累积导致的输入成本递增。
-- **观测**：`_status_sync` 暴露 `feasible_rounds / projected_total / budget_overshoot / budget_degraded / est_factor / call_factor`；降级事件以 `budget.force_compress`（日志如实报告"实际压缩 X 个 / 历史过短跳过 Y 个"，短历史压缩为空转）、`budget.overshoot`、`budget.circuit_break` 记录。
+  - `_growth_ratio`（每轮历史增长比 g，新增）：每轮结束用 `本轮实测提示词 / 上轮实测提示词 − 1` 的环比 EMA 更新（α=0.2，负增长钳为 0，钳制 [0.05, 2.0]，跳过首轮样本），作用于 `prompt_cost(R)` 的 g。
+  - **档案持久化**：三因子在正常结束时写入 `data/budget_profile.json`（`_save_profile`，IO 失败仅警告），启动时 `_load_profile()` 载入；无档案时用保守先验 `EST_FACTOR_INIT=2.0`（历史乐观档案的 est_factor 钳制 ≥1.0）。不再每轮重置为 1.0——首轮规划即基于历史校准，而非盲目乐观的 1.0。
+- **观测**：`_status_sync` 暴露 `feasible_rounds / projected_total / budget_overshoot / budget_degraded / est_factor / call_factor / growth_ratio / prompt_forecast / safety_margin`；降级事件以 `budget.force_compress`（日志如实报告"实际压缩 X 个 / 历史过短跳过 Y 个"，短历史压缩为空转）、`budget.round_trim`、`budget.overshoot`、`budget.circuit_break` 记录。
 
 ### 12.8 协作 Agent 回合 `_collab_turn(collab)`
 - 有未完成任务：逐个 `_agent_turn(..., mode="task")`；收到 `report` → `_apply_report` + 发布 `task_result`；未回报则 `rounds_waiting+1`，超 3 轮强制标记完成。
@@ -658,7 +663,14 @@ FastAPI 应用，挂载 `/static`，提供 REST + WebSocket。
 - **call_factor 收敛方向正确但节奏太慢**：实测每轮调用 16/15/11 次 vs 基数 5（比值 2.2–3.2×），EMA 只影响"下一轮"规划，3 次样本后因子到 1.84，来不及阻止已发生的超支。
 - **裁判在 E 下限时输出为空** → 确定性回退（winner=CON, `scores={}`, `critique_len=14`），复现已知边界（§12.12 预算兜底）。
 
-**结论**：两路 EMA 校准对 2 轮短辩论有效（超支 42%→4.3%），但**规划器对"历史累积输入成本"建模不足**——轮次越多超支越差。后续优化方向：按剩余轮次建模历史增长（P 随 R 递增），或对长辩论做输入侧截断/压缩（当前只压输出上限）。
+**结论**：两路 EMA 校准对 2 轮短辩论有效（超支 42%→4.3%），但**规划器对"历史累积输入成本"建模不足**——轮次越多超支越差。
+
+**实现更新（同日志实现）**：上述缺口已通过三处补齐（§12.7）——
+1. **历史增长模型**：规划公式升级为 `prompt_cost(R) = R·P + g·P·R·(R−1)/2`（`app/budget.py`），g 为每轮历史增长比，由新增 `_growth_ratio` 环比 EMA 校准（α=0.2，钳制 [0.05, 2.0]，负增长钳为 0，跳过首轮）。
+2. **保守先验 + 档案持久化**：`est_factor / call_factor / growth_ratio` 落盘 `data/budget_profile.json`，启动载入；无档案时用 `EST_FACTOR_INIT=2.0`（对照冒烟 #6 首轮 2.68× 实测，2.0 先验避免首轮 40% 预算被单轮烧掉），历史乐观档案钳制 ≥1.0。
+3. **预算不足自动削轮次**：规划超支且质量下限（`JUDGE_MIN_OUTPUT` / `SUMMARY_MIN_OUTPUT` = 512）仍无法覆盖全部轮次时，按 `feasible_rounds` 把 `max_rounds` 裁剪到可支撑范围（`BUDGET_AUTO_TRIM_ROUNDS=1`，事件 `budget.round_trim`）；阶段输出保底保证裁决/汇总 JSON 不再因 E 触底为空。
+
+**已知边界**（尚未覆盖，后续可选）：EMA 收敛仍需数轮样本，极端首轮暴涨仍可能短期超支；`growth_ratio` 校准依赖轮间环比，单轮辩论无样本可循；自动削轮次会改变对话深度，前端需展示实际生效轮次。
 
 ---
 

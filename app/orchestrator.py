@@ -14,10 +14,12 @@ orchestrator.py — 多 Agent 辩论系统编排器（Supervisor Agent 实现）
 """
 import asyncio
 import json
+import os
 import re
 import threading
 import time
 
+from app import budget as budget_math
 from app.agent import Agent
 from app.config import settings
 from app.llm import _estimate_usage, chat, chat_stream
@@ -133,6 +135,11 @@ class Orchestrator:
         self._call_factor = 1.0
         self._call_factor_samples = 0
         self._round_real_calls = 0  # 本轮累计真实 LLM 调用次数（_agent_turn 内自增）
+        # 自适应历史增长比 g：每轮提示词成本随历史累积递增（EMA，见 _update_growth_ratio）
+        self._growth_ratio = settings.BUDGET_GROWTH_RATIO_INIT
+        self._growth_ratio_samples = 0
+        self._round_prompt_real = 0      # 本轮累计真实提示词用量（_agent_turn 内自增）
+        self._prev_round_prompt_real = 0  # 上一轮真实提示词用量（增长比基准）
 
         # ---- 辩论状态 ----
         self._started_at = None
@@ -176,6 +183,10 @@ class Orchestrator:
         self._call_factor = 1.0
         self._call_factor_samples = 0
         self._round_real_calls = 0
+        self._growth_ratio = settings.BUDGET_GROWTH_RATIO_INIT
+        self._growth_ratio_samples = 0
+        self._round_prompt_real = 0
+        self._prev_round_prompt_real = 0
         self.phase = "idle"
         self.convergence_streak = 0
         self.round_arguments = {}
@@ -475,6 +486,9 @@ class Orchestrator:
             _used = self._apply_usage(result)
             token_cost += _used
             self._round_real_calls += 1  # 自适应 N：真实 LLM 调用次数计数（含工具循环迭代）
+            # 自适应历史增长比 g：累计本轮真实提示词用量（跨轮递增 → 输入成本建模）
+            _usage = result.get("usage") or {}
+            self._round_prompt_real += int(_usage.get("prompt_tokens") or 0)
             # 自适应校准：用本次真实用量与同一批消息的启发式估算更新偏差因子
             self._update_est_factor(
                 _used, _estimate_usage(messages, result.get("content") or "")["total_tokens"])
@@ -787,6 +801,31 @@ class Orchestrator:
             f"因子→{self._call_factor:.2f}（样本#{self._call_factor_samples}）",
             level="info", event="budget.call_factor")
 
+    def _update_growth_ratio(self, real_round_prompt: int) -> None:
+        """自适应历史增长比 g：用「本轮真实提示词 / 上轮真实提示词」的环比 EMA 平滑。
+
+        输入是长辩论成本的大头：每轮历史变长，提示词随轮次递增（中文实测约 1.5~3×/轮）。
+        本比值捕获该递增率，规划器据此把后续轮次输入成本计入预算（prompt_growth_sum）。
+        样本#1 无上轮基准，跳过（仅记录 prev 供下一轮使用）；负增长钳 0（历史只增不减，
+        压缩/遗忘造成的回落不应压低预测）。
+        钳制在 [BUDGET_GROWTH_RATIO_MIN, BUDGET_GROWTH_RATIO_MAX]，防止单轮异常
+        （任务风暴/压缩抖动）失控。只影响"尚未发生的预测"，已发生的费用永远按真实 usage 记账。
+        """
+        prev = self._prev_round_prompt_real
+        if prev > 0 and real_round_prompt > 0:
+            ratio = max(0.0, (real_round_prompt - prev) / prev)
+            self._growth_ratio = min(
+                settings.BUDGET_GROWTH_RATIO_MAX,
+                max(settings.BUDGET_GROWTH_RATIO_MIN,
+                    0.8 * self._growth_ratio + 0.2 * ratio))
+            self._growth_ratio_samples += 1
+            self._log(
+                f"[预算校准g] 本轮提示词={real_round_prompt} 上轮={prev} 环比={ratio:.2f} "
+                f"增长比→{self._growth_ratio:.2f}（样本#{self._growth_ratio_samples}）",
+                level="info", event="budget.growth_ratio")
+        if real_round_prompt > 0:
+            self._prev_round_prompt_real = real_round_prompt
+
     def _judge_prompt_tokens_now(self) -> int:
         """裁判当前轮次的提示词 token 估算（完整未截断的辩论记录）。"""
         judge_text = self._build_judge_debate_text()  # full untruncated transcript
@@ -797,20 +836,29 @@ class Orchestrator:
         return max(1, int(((settings.CONTEXT_MAX_CHARS + 2000) // 2) * self._est_factor))
 
     def _tail_base_tokens(self) -> int:
-        """尾段基础成本 J0 + S0：裁判（当前记录）+ 最终汇总的提示词 token（输出为 0 时）。"""
+        """尾段基础成本：裁判/汇总提示词 J0+S0 + 两者输出保底（避免 JSON 被截断）。
+
+        无辩手时裁判短路（j0=0）。输出保底来自 JUDGE_MIN_OUTPUT / SUMMARY_MIN_OUTPUT，
+        确保规划阶段就为裁判与最终汇总预留足够的输出空间。
+        """
         j0 = 0 if not self.collaborators else self._judge_prompt_tokens_now()  # 无辩手时裁判短路
         s0 = self._summary_prompt_tokens()
-        return max(settings.BUDGET_TAIL_RESERVE, j0 + s0)
+        return max(settings.BUDGET_TAIL_RESERVE,
+                   j0 + s0 + settings.JUDGE_MIN_OUTPUT + settings.SUMMARY_MIN_OUTPUT)
 
     def _compute_plan(self, phase: str = "debate", remaining_rounds: int = 0) -> dict:
         """纯数学规划：求解 E（effective_max_tokens），使剩余工作 + 尾段落在预算内。
 
+        采用历史增长模型（app/budget.py）：剩余 R 轮提示词按算术级数递增
+        （prompt_growth_sum，增长比 g 由 EMA 自适应校准），并预留安全余量
+        （BUDGET_SAFETY_MARGIN，只压低 E、不参与超支判定）。
         不修改任何状态。phase in {"debate","judge","summary"}。
         """
         if not self.agents:
             return {"effective_max_tokens": self.max_tokens, "overshoot": False,
                     "degraded": False, "feasible_rounds": 0,
-                    "projected_total": self.spent, "tail_reserve": 0}
+                    "projected_total": self.spent, "tail_reserve": 0,
+                    "growth_ratio": 0.0, "safety_margin": 0.0, "prompt_forecast": 0}
         floor = min(settings.BUDGET_OUTPUT_FLOOR, self.max_tokens)  # 永不高于用户设定上限
         remaining = max(0, self.budget - self.spent)
         base = self._tail_base_tokens()
@@ -818,51 +866,117 @@ class Orchestrator:
         P = self._estimate_round_prompt_tokens() if phase == "debate" else 0
         N = self._calls_per_round() if phase == "debate" else 0
         S = max(1, len(self.collaborators)) if phase == "debate" else 0
+        g = self._growth_ratio if phase == "debate" else 0.0
+        margin = settings.BUDGET_SAFETY_MARGIN
 
         if phase == "debate":
-            # E ≤ (remaining − base − R·P) / (R·N + R·S + 2)
-            #   R·S·E = 剩余轮次导致的裁判记录增长；2E = 裁判输出 + 汇总输出
-            numer, denom = remaining - base - R * P, R * N + R * S + 2
+            E = budget_math.solve_output_cap(
+                remaining, base, P, g, N, S, R, floor, self.max_tokens, margin)
+            overshoot = budget_math.overshoot_at_floor(
+                remaining, base, P, g, N, S, R, floor)
+            projected = budget_math.projected_total(
+                self.spent, remaining, base, P, g, N, S, R, E)
+            feasible = budget_math.feasible_rounds(
+                remaining, base, P, g, N, S, E, R)
+            prompt_forecast = budget_math.prompt_growth_sum(P, g, R)
         elif phase == "judge":
-            numer, denom = remaining - base, 2  # 裁判输出 + 剩余汇总输出
+            # 裁判阶段：仅剩 裁判输出 + 汇总输出（2E），base 已含两者提示词与输出保底
+            E = budget_math.solve_output_cap(
+                remaining, base, 0, 0.0, 0, 0, 0, floor, self.max_tokens, margin)
+            overshoot = budget_math.overshoot_at_floor(
+                remaining, base, 0, 0.0, 0, 0, 0, floor)
+            projected = budget_math.projected_total(
+                self.spent, remaining, base, 0, 0.0, 0, 0, 0, E)
+            feasible, prompt_forecast = 0, 0
         else:  # summary
-            numer, denom = remaining - self._summary_prompt_tokens(), 1
-
-        E = int(numer / denom) if (denom > 0 and numer > 0) else floor
-        E = max(floor, min(E, self.max_tokens))
-
-        # overshoot = 即便用下限输出，规划总成本仍超出剩余预算
-        if phase == "debate":
-            planned = R * P + (R * N + R * S + 2) * floor + base
-        elif phase == "judge":
-            planned = base + 2 * floor
-        else:
-            planned = self._summary_prompt_tokens() + floor
-        overshoot = planned > remaining
-
-        # projected_total = 已花费 + 采用 E 时剩余全程（含尾段）的规划成本
-        if phase == "debate":
-            projected = self.spent + R * P + (R * N + R * S + 2) * E + base
-        elif phase == "judge":
-            projected = self.spent + base + 2 * E
-        else:
-            projected = self.spent + self._summary_prompt_tokens() + E
-
-        # feasible_rounds：当前 E 下，剩余预算（扣除尾段）还能支撑几轮
-        den = max(1, P + (N + S) * E)
-        feasible = max(0, int((remaining - base - 2 * E) // den)) if phase == "debate" else 0
+            s0 = self._summary_prompt_tokens()
+            usable = max(0, int(remaining * (1.0 - margin)))
+            E = max(floor, min(usable - s0, self.max_tokens)) if usable > s0 else floor
+            overshoot = s0 + floor > remaining
+            projected = self.spent + s0 + E
+            feasible, prompt_forecast = 0, 0
 
         return {
             "effective_max_tokens": E, "overshoot": overshoot,
             "degraded": E < self.max_tokens, "feasible_rounds": feasible,
             "projected_total": int(projected), "tail_reserve": int(base),
             "phase": phase, "remaining_rounds": R,
+            "growth_ratio": round(g, 3), "safety_margin": margin,
+            "prompt_forecast": int(prompt_forecast),
         }
 
     def budget_preview(self, phase: str = "debate", remaining_rounds: int = 0) -> dict:
         """当前规划（若有），否则即时同步估算（无副作用）。"""
         return self._budget_plan or self._compute_plan(
             phase, remaining_rounds or self.max_rounds)
+
+    # ---------------- 跨场次校准档案（持久化） ----------------
+    def _load_profile(self) -> None:
+        """载入跨场次校准档案（BUDGET_PROFILE_PATH，默认 data/budget_profile.json）。
+
+        无档案时使用保守先验：EST_FACTOR_INIT（中文 len//2 启发式偏乐观，实测 3~5×）。
+        载入时 est_factor 钳制 ≥1.0，防止历史乐观校准在新场次放大超支。
+        IO 失败仅告警，绝不影响辩论进行。
+        """
+        def _defaults():
+            self._est_factor = settings.EST_FACTOR_INIT
+            self._est_factor_samples = 0
+            self._call_factor = 1.0
+            self._call_factor_samples = 0
+            self._growth_ratio = settings.BUDGET_GROWTH_RATIO_INIT
+            self._growth_ratio_samples = 0
+
+        try:
+            with open(settings.BUDGET_PROFILE_PATH, encoding="utf-8") as f:
+                prof = json.load(f)
+            self._est_factor = max(1.0, float(prof.get("est_factor", settings.EST_FACTOR_INIT)))
+            self._est_factor_samples = int(prof.get("est_samples", 0))
+            self._call_factor = max(0.5, float(prof.get("call_factor", 1.0)))
+            self._call_factor_samples = int(prof.get("call_samples", 0))
+            self._growth_ratio = min(
+                settings.BUDGET_GROWTH_RATIO_MAX,
+                max(settings.BUDGET_GROWTH_RATIO_MIN,
+                    float(prof.get("growth_ratio", settings.BUDGET_GROWTH_RATIO_INIT))))
+            self._growth_ratio_samples = int(prof.get("growth_samples", 0))
+            self._log(
+                f"[预算档案] 载入校准：est={self._est_factor:.2f}×({self._est_factor_samples}) "
+                f"call={self._call_factor:.2f}×({self._call_factor_samples}) "
+                f"growth={self._growth_ratio:.2f}({self._growth_ratio_samples})",
+                level="info", event="budget.profile_load")
+        except FileNotFoundError:
+            _defaults()
+            self._log(
+                f"[预算档案] 无历史档案，使用保守先验 est_factor={self._est_factor:.2f}",
+                level="info", event="budget.profile_load")
+        except Exception as e:
+            _defaults()
+            self._log(f"[预算档案] 载入失败（{e}），使用保守先验",
+                      level="warning", event="budget.profile_load")
+
+    def _save_profile(self) -> None:
+        """把本场校准结果持久化，供后续场次开局载入（跨场次记忆）。
+
+        写失败仅告警（data/ 目录通常存在且 gitignore），绝不影响辩论结果。
+        """
+        try:
+            path = settings.BUDGET_PROFILE_PATH
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            prof = {
+                "est_factor": round(self._est_factor, 4),
+                "est_samples": self._est_factor_samples,
+                "call_factor": round(self._call_factor, 4),
+                "call_samples": self._call_factor_samples,
+                "growth_ratio": round(self._growth_ratio, 4),
+                "growth_samples": self._growth_ratio_samples,
+                "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            }
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(prof, f, ensure_ascii=False, indent=2)
+            self._log(f"[预算档案] 已保存校准到 {path}", level="info",
+                      event="budget.profile_save")
+        except Exception as e:
+            self._log(f"[预算档案] 保存失败（{e}）", level="warning",
+                      event="budget.profile_save")
 
     async def _force_compress_all(self) -> None:
         """预算吃紧：强制压缩所有 Agent 历史以缩小后续输入。"""
@@ -892,6 +1006,8 @@ class Orchestrator:
         """为即将到来的辩论轮次计算 effective_max_tokens（降级阶梯）。
 
         优先降输出上限；不足则强制压缩历史；仍不足则允许小幅超支完成，绝不中断。
+        若开启 BUDGET_AUTO_TRIM_ROUNDS，预算仍不足以支撑全部剩余轮次时，
+        自动削减剩余轮次（本轮跑完即进裁决），保证后续裁判/汇总有预算可用。
         """
         plan = self._compute_plan("debate", remaining_rounds)
         if plan["overshoot"] and remaining_rounds > 0:
@@ -902,16 +1018,39 @@ class Orchestrator:
                 # 降级第 3 步：允许小幅超支，跑完辩论
                 self._log("预算不足以完成剩余轮次，允许小幅超支完成辩论",
                           level="warning", event="budget.overshoot")
+        # 降级第 4 步：预算在质量下限仍不足 → 自动削减剩余轮次（用户可配开关）
+        if settings.BUDGET_AUTO_TRIM_ROUNDS and plan["overshoot"] and remaining_rounds > 0:
+            feasible = plan.get("feasible_rounds", 0)
+            trim_to = self.round + feasible - 1  # feasible 含本轮，→ 最后一轮可跑的轮号
+            if trim_to < self.max_rounds:
+                old_rounds = self.max_rounds
+                self.max_rounds = max(1, max(self.round, trim_to))
+                self._log(
+                    f"预算不足，自动削减轮次：剩余仅可支撑 {feasible} 轮，"
+                    f"max_rounds {old_rounds} → {self.max_rounds}（本轮跑完即进裁决）",
+                    level="warning", event="budget.round_trim")
         self.effective_max_tokens = plan["effective_max_tokens"]
         self._budget_plan = plan
         return plan
 
     async def _plan_for_phase(self, phase: str) -> dict:
-        """裁判 / 汇总阶段的单次规划（压缩无法缩小记录，跳过降级阶梯）。"""
+        """裁判 / 汇总阶段的单次规划（压缩无法缩小记录，跳过降级阶梯）。
+
+        预算不足时，若计算出的 E 低于该阶段输出保底（裁判 JSON / 汇总可读性），
+        抬到保底值（JUDGE_MIN_OUTPUT / SUMMARY_MIN_OUTPUT），允许小额超支以保质量。
+        """
         plan = self._compute_plan(phase=phase, remaining_rounds=0)
         if plan["overshoot"]:
-            self._log(f"预算不足，{phase} 阶段允许小幅超支完成",
-                      level="warning", event="budget.overshoot")
+            min_out = (settings.JUDGE_MIN_OUTPUT if phase == "judge"
+                       else settings.SUMMARY_MIN_OUTPUT)
+            if plan["effective_max_tokens"] < min_out:
+                plan["effective_max_tokens"] = min_out
+                self._log(
+                    f"预算不足，{phase} 阶段输出上限抬至保底 {min_out}（允许小幅超支）",
+                    level="warning", event="budget.phase_min_output")
+            else:
+                self._log(f"预算不足，{phase} 阶段允许小幅超支完成",
+                          level="warning", event="budget.overshoot")
         self.effective_max_tokens = plan["effective_max_tokens"]
         self._budget_plan = plan
         return plan
@@ -944,13 +1083,12 @@ class Orchestrator:
         self.run_stats = {"compressions": 0, "started_at": time.time()}
         self.agent_metrics = {}
         # 预算规划器状态：开局即做一次全量可行性预估
+        self._load_profile()  # 跨场次持久化校准载入（无档案用 EST_FACTOR_INIT 等保守先验）
+        self._round_real_calls = 0
+        self._round_prompt_real = 0
+        self._prev_round_prompt_real = 0
         self.effective_max_tokens = self.max_tokens
         self._budget_plan = self._compute_plan("debate", self.max_rounds) if self.agents else None
-        self._est_factor = 1.0
-        self._est_factor_samples = 0
-        self._call_factor = 1.0
-        self._call_factor_samples = 0
-        self._round_real_calls = 0
         self.status = "running"
         self._pause_event.set()
         await self.event_bus.publish({
@@ -976,6 +1114,7 @@ class Orchestrator:
                 self.phase = "debating"
                 is_last = (self.round >= self.max_rounds)
                 self._round_real_calls = 0  # 本轮真实 LLM 调用计数清零（自适应 N）
+                self._round_prompt_real = 0  # 本轮真实提示词用量清零（自适应增长比 g）
                 # 预算规划：为「剩余轮次 + 裁判 + 汇总」算出本轮生效输出上限（降级阶梯）
                 await self._plan_for_round(self.max_rounds - self.round + 1)
                 await self.event_bus.publish({
@@ -1042,6 +1181,9 @@ class Orchestrator:
                 # 5.5) 自适应 N 校准：用本轮真实调用次数更新工具调用乘数（影响下轮规划）
                 self._update_call_factor(self._round_real_calls)
 
+                # 5.6) 自适应历史增长比 g 校准：用本轮真实提示词用量更新（影响下轮规划）
+                self._update_growth_ratio(self._round_prompt_real)
+
                 # 6) 预算熔断（最后防线——预算规划器已尽量保证剩余轮次可完成）
                 remaining = self.budget - self.spent
                 plan = self._budget_plan or {}
@@ -1098,6 +1240,7 @@ class Orchestrator:
                 self.status = "done"
                 await self.event_bus.publish({"type": "status", "status": "done", "phase": self.phase})
                 await self.event_bus.publish(self._status_sync())
+                self._save_profile()  # 正常完成：把本场校准结果持久化供后续场次载入
         except Exception as e:
             self._log(f"[编排器错误] {e}", level="error", event="orchestrator.error")
             self.status = "stopped"
@@ -1401,6 +1544,7 @@ class Orchestrator:
             "budget_degraded": bool(plan.get("degraded")),
             "est_factor": round(self._est_factor, 2),  # 自适应校准因子（调试/观测用）
             "call_factor": round(self._call_factor, 2),  # 自适应 N 因子（工具调用乘数校准）
+            "growth_ratio": round(self._growth_ratio, 2),  # 自适应历史增长比（输入成本建模）
             "elapsed_time_ms": int((time.time() - self._started_at) * 1000)
             if self._started_at else 0,
         }

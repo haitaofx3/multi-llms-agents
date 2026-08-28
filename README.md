@@ -102,6 +102,7 @@ pip install -r requirements.txt
 | `CONTEXT_MAX_CHARS` | 单 Agent 上下文字符硬上限，超出时丢弃最旧轮次（默认 8000） |
 | `CONTEXT_COMPRESS_THRESHOLD` | 触发 LLM 摘要压缩的字符阈值（默认 6000） |
 | `CONTEXT_COMPRESS_KEEP_RECENT` | 摘要压缩后保留的最近轮次条数（默认 8） |
+| `BUDGET_*`（`BUDGET_GROWTH_RATIO_INIT` / `BUDGET_GROWTH_RATIO_MIN` / `BUDGET_GROWTH_RATIO_MAX` / `BUDGET_SAFETY_MARGIN` / `EST_FACTOR_INIT` / `BUDGET_PROFILE_PATH` / `JUDGE_MIN_OUTPUT` / `SUMMARY_MIN_OUTPUT` / `BUDGET_AUTO_TRIM_ROUNDS` / `BUDGET_OUTPUT_FLOOR` / `BUDGET_TAIL_RESERVE` / `BUDGET_TOOL_OVERHEAD`） | token 预算规划器：历史增长比（EMA 校准，默认 0.5）、安全余量（默认 8%）、初始估算因子（默认 2.0 保守先验）、校准档案路径（默认 `data/budget_profile.json`）、裁判/汇总输出保底（默认 512）、预算不足时自动削减轮次（默认开启）。预算吃紧时按「降输出上限 → 强制压缩历史 → 削轮次 → 允许小幅超支」阶梯降级，辩论不中断 |
 
 ### 3. 启动
 

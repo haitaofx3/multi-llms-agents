@@ -124,6 +124,19 @@ class Settings:
     BUDGET_OUTPUT_FLOOR = _int("BUDGET_OUTPUT_FLOOR", 256)        # 单次输出下限；低于此触发压缩/超支
     BUDGET_TAIL_RESERVE = _int("BUDGET_TAIL_RESERVE", 8000)       # 裁判+汇总 尾段保留下限（动态估算的下限）
     BUDGET_TOOL_OVERHEAD = _float("BUDGET_TOOL_OVERHEAD", 1.5)    # 工具调用迭代对 LLM 调用次数的乘数
+    # 历史增长模型：每轮提示词成本随历史累积按算术级数递增（P_r = P·(1 + (r-1)·g)）
+    BUDGET_GROWTH_RATIO_INIT = _float("BUDGET_GROWTH_RATIO_INIT", 0.5)  # 每轮历史增长比初始值（EMA 自适应）
+    BUDGET_GROWTH_RATIO_MIN = _float("BUDGET_GROWTH_RATIO_MIN", 0.05)   # 增长比钳制下限
+    BUDGET_GROWTH_RATIO_MAX = _float("BUDGET_GROWTH_RATIO_MAX", 2.0)    # 增长比钳制上限
+    BUDGET_SAFETY_MARGIN = _float("BUDGET_SAFETY_MARGIN", 0.08)         # 规划预留的安全余量比例（只压低 E，不计入超支判定）
+    # 校准先验与持久化：首场无档案时用保守先验，解决首轮规划无法校准的问题
+    EST_FACTOR_INIT = _float("EST_FACTOR_INIT", 2.0)                    # 中文 len//2 启发式偏乐观（实测 3~5×），先验取 2.0
+    BUDGET_PROFILE_PATH = _get("BUDGET_PROFILE_PATH", "data/budget_profile.json")  # 跨场次校准档案
+    # 尾段输出保底：裁判/汇总即使超支也保留最小输出，避免裁判 JSON 截断 → 空评语确定性回退
+    JUDGE_MIN_OUTPUT = _int("JUDGE_MIN_OUTPUT", 512)
+    SUMMARY_MIN_OUTPUT = _int("SUMMARY_MIN_OUTPUT", 512)
+    # 自动削减轮次：预算不足（即便下限输出也无法跑满）时，把 max_rounds 削减到可行轮次
+    BUDGET_AUTO_TRIM_ROUNDS = _int("BUDGET_AUTO_TRIM_ROUNDS", 1)   # 1=开（推荐）；0=保持现状跑满
 
     # ---- 收敛检测（架构文档 §4.3/4.4） ----
     CONVERGENCE_SIMILARITY = _float("CONVERGENCE_SIMILARITY", 0.85)
