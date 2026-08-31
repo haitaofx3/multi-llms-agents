@@ -19,6 +19,7 @@ import time
 from pathlib import Path
 
 from app.config import PROJECT_ROOT
+from app.logger import log
 
 SESSIONS_DIR = PROJECT_ROOT / "data" / "sessions"
 SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
@@ -134,7 +135,10 @@ class DebateManager:
         for path in SESSIONS_DIR.glob("*.json"):
             try:
                 meta = json.loads(path.read_text(encoding="utf-8"))
-            except Exception:
+            except Exception as exc:
+                log("warning", "manager.meta_read",
+                    f"读取会话元数据失败，跳过：{path.name}",
+                    file=str(path), error=str(exc))
                 continue
             if meta.get("status") in ("running", "paused"):
                 meta["status"] = "interrupted"
@@ -146,7 +150,10 @@ class DebateManager:
                         json.dumps(meta, ensure_ascii=False, indent=2),
                         encoding="utf-8")
                     marked.append(meta)
-                except Exception:
+                except Exception as exc:
+                    log("warning", "manager.meta_write",
+                        f"标记中断会话写入失败：{path.name}",
+                        file=str(path), error=str(exc))
                     continue
         return marked
 
@@ -156,7 +163,10 @@ class DebateManager:
         for path in SESSIONS_DIR.glob("*.json"):
             try:
                 meta = json.loads(path.read_text(encoding="utf-8"))
-            except Exception:
+            except Exception as exc:
+                log("warning", "manager.meta_read",
+                    f"读取会话元数据失败，跳过：{path.name}",
+                    file=str(path), error=str(exc))
                 continue
             if meta.get("status") == "interrupted":
                 out.append(meta)

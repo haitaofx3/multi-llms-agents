@@ -21,7 +21,6 @@ embedding 向量维度不同，token 数不是跨模型公平的度量单位，�
 """
 import re
 from dataclasses import dataclass, field
-from typing import Optional
 
 from app.config import settings
 
@@ -203,7 +202,7 @@ class FairnessGovernor:
     # ---- L1：输出上限 ------------------------------------------------------
 
     def ceiling_for(self, stance: str, round_no: int,
-                    opponent_recent_chars: Optional[int] = None) -> int:
+                    opponent_recent_chars: int | None = None) -> int:
         """计算某次发言允许的字符上限（rounding 到整数）。
 
         - 立论（round_no == 1）或无对手参照时：使用 opening_char_limit。
@@ -216,7 +215,7 @@ class FairnessGovernor:
             base = max(opponent_recent_chars * self.output_ratio, self.floor_char_limit)
         return min(int(base), self.hard_char_ceiling)
 
-    def recent_opponent_chars(self, stance: str) -> Optional[int]:
+    def recent_opponent_chars(self, stance: str) -> int | None:
         """对手最近 reference_rounds 轮有效输出字符的均值（无则 None）。"""
         opponent = OPPONENT_STANCE.get(stance)
         if opponent is None:

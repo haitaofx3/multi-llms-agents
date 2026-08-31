@@ -16,7 +16,6 @@ orchestrator.py — 多 Agent 辩论系统编排器（Supervisor Agent 实现）
 """
 import asyncio
 import json
-import os
 import re
 import threading
 import time
@@ -1736,5 +1735,5 @@ orchestrator = Orchestrator(session_id="default")
 
 # 把默认会话注册进全局会话管理器，保证 main.py / 现有测试引用的模块级单例
 # 与 manager.get_or_create("default") 返回同一实例（多会话隔离的向后兼容层）
-from app.manager import manager  # noqa: E402  （惰性导入 Orchestrator，无循环依赖）
+from app.manager import manager  # noqa: E402, I001  （惰性导入 Orchestrator，无循环依赖）
 manager.register(orchestrator)

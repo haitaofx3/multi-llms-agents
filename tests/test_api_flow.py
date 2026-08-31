@@ -175,7 +175,7 @@ class ApiFlowTest(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(fair)
         self.assertIn("ok", fair)
         self.assertIsInstance(fair["layers"], list)
-        self.assertEqual({l["layer"] for l in fair["layers"]},
+        self.assertEqual({layer["layer"] for layer in fair["layers"]},
                          {"L1", "L2", "L3", "L4", "L5", "L6"})
         # total_tokens 预算限制已删除：不再返回 budget / max_tokens / feasibility
         for key in ("budget", "max_tokens", "feasibility",
@@ -194,7 +194,7 @@ class ApiFlowTest(unittest.IsolatedAsyncioTestCase):
         s = r.json()
         self.assertIn("fairness", s)
         self.assertIsInstance(s["fairness"]["ok"], bool)
-        self.assertEqual({l["layer"] for l in s["fairness"]["layers"]},
+        self.assertEqual({layer["layer"] for layer in s["fairness"]["layers"]},
                          {"L1", "L2", "L3", "L4", "L5", "L6"})
         # 只读遥测：累计输出 token / 累计用量 / 耗时（前端实时显示）
         for key in ("spent_tokens", "output_tokens", "elapsed_time_ms"):

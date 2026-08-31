@@ -14,7 +14,6 @@ test_ci_fast.py — 快速确定性单元测试（CI 用，无需真实 LLM API�
     python -m unittest tests.test_ci_fast -v
 """
 import asyncio
-import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -206,9 +205,9 @@ class FairnessGovernorTest(unittest.IsolatedAsyncioTestCase):
 
     @staticmethod
     def _layer(rep: dict, layer_id: str) -> dict:
-        for l in rep["layers"]:
-            if l["layer"] == layer_id:
-                return l
+        for layer in rep["layers"]:
+            if layer["layer"] == layer_id:
+                return layer
         raise AssertionError(f"报告缺少 {layer_id} 层")
 
     # ---------------- L1 输出上限 ----------------
