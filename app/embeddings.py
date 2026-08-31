@@ -89,6 +89,21 @@ def start_background_warmup():
     t.start()
 
 
+def is_fallback() -> bool:
+    """当前是否处于哈希降级向量模式（本地嵌入模型不可用）。
+
+    调用方（如收敛检测）在决定是否使用语义相似度前先检查该标志：
+    降级模式下哈希向量无法表达语义，应改用文本级相似度。
+    """
+    _load_model()
+    return _model is None
+
+
+def embedding_backend() -> str:
+    """返回当前嵌入后端标识：'sentence-transformers' 或 'hash-fallback'。"""
+    return "hash-fallback" if is_fallback() else "sentence-transformers"
+
+
 def dim() -> int:
     _load_model()
     return _dim

@@ -118,6 +118,9 @@ class Settings:
     # ---- 收敛检测（架构文档 §4.3/4.4） ----
     CONVERGENCE_SIMILARITY = _float("CONVERGENCE_SIMILARITY", 0.85)
     CONVERGENCE_ROUNDS = _int("CONVERGENCE_ROUNDS", 2)        # 连续 N 轮高度相似即收敛
+    # 降级阈值：嵌入模型不可用时（哈希向量无语义），改用 difflib 字符级文本相似度，
+    # 其数值分布低于向量余弦相似度，故单独设置较低阈值（P0-3）。
+    CONVERGENCE_TEXT_SIMILARITY = _float("CONVERGENCE_TEXT_SIMILARITY", 0.6)
 
     # ---- LLM 重试（架构文档 §4.5：最多重试 2 次，间隔 1s、3s） ----
     LLM_RETRY_ATTEMPTS = _int("LLM_RETRY_ATTEMPTS", 3)
