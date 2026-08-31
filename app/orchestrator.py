@@ -104,8 +104,23 @@ def _spawn_task(coro):
     return task
 
 
+def _text_similarity(a: str, b: str) -> float:
+    """字符级文本相似度（difflib），用于嵌入模型不可用时的收敛检测降级（P0-3）。
+
+    去除全部空白后比较，避免换行/空格等排版差异干扰；返回 [0, 1]。
+    """
+    import difflib
+
+    a = "".join(a.split())
+    b = "".join(b.split())
+    if not a or not b:
+        return 0.0
+    return difflib.SequenceMatcher(None, a, b).ratio()
+
+
 class Orchestrator:
-    def __init__(self):
+    def __init__(self, session_id: str | None = None):
+        self.session_id = session_id or "default"
         self.agents = []
         self.main = None
         self.judge = None
@@ -134,6 +149,8 @@ class Orchestrator:
         # ---- 辩论状态 ----
         self._started_at = None
         self.convergence_streak = 0
+        # 收敛检测模式：embedding（向量余弦） / text-similarity（嵌入不可用时的降级，P0-3）
+        self.convergence_mode = "embedding"
         self.round_arguments = {}     # round -> {speaker: text}
         self.latest_arguments = {}    # speaker -> {"text","round"}
         self.round_evidence = {}      # round -> {speaker: [EvidenceItem]}
@@ -167,6 +184,7 @@ class Orchestrator:
         self.governor = FairnessGovernor()  # 公平性治理器（每场全新）
         self.phase = "idle"
         self.convergence_streak = 0
+        self.convergence_mode = "embedding"
         self.round_arguments = {}
         self.latest_arguments = {}
         self.round_evidence = {}
@@ -207,6 +225,7 @@ class Orchestrator:
         # 独立裁判 Agent（不占席位、不参与辩论，仅裁决阶段调用）
         self.judge = self._build_judge(judge_config or {})
         self.status = "idle"
+        self._persist_meta()
         self._log(f"配置完成，席位 {len(self.agents)} 个"
                   + (f"，独立裁判：{self.judge.name}" if self.judge else "，裁判回退使用主 Agent 模型"),
                   event="configure", level="info")
@@ -248,23 +267,47 @@ class Orchestrator:
                 return a
         return None
 
+    # ---------------- 会话元数据持久化 ----------------
+    def _persist_meta(self):
+        """把当前会话关键状态写入 data/sessions/{session_id}.json（轻量快照）。
+
+        用于多会话场景下：UI 中断横幅展示、进程重启后的中断标记。
+        惰性导入 app.manager，避免循环依赖。
+        """
+        try:
+            from app.manager import manager
+            manager.save_meta(self)
+        except Exception:
+            pass  # 元数据持久化失败不影响辩论主流程
+
+    def _notify_done(self):
+        """通知全局 DebateManager「本会话讨论完成」（触发自动落盘等回调）。"""
+        try:
+            from app.manager import manager
+            manager.notify_done(self)
+        except Exception:
+            pass
+
     # ---------------- 控制 ----------------
     def pause(self):
         if self.status == "running":
             self.status = "paused"
             self._pause_event.clear()
+            self._persist_meta()
             _spawn_task(self.event_bus.publish(self._status_event()))
 
     def resume(self):
         if self.status == "paused":
             self.status = "running"
             self._pause_event.set()
+            self._persist_meta()
             _spawn_task(self.event_bus.publish(self._status_event()))
 
     def end(self):
         if self.status in ("running", "paused"):
             self.status = "stopped"
             self._pause_event.set()
+            self._persist_meta()
             _spawn_task(self.event_bus.publish(self._status_event()))
 
     # ---------------- 任务状态文本 ----------------
@@ -788,7 +831,7 @@ class Orchestrator:
             self._log(f"[RAG] 第{self.round}轮事实核查返回 {len(evidence)} 条证据",
                       level="info", event="rag.check")
 
-    # ---------------- 收敛检测（架构文档 §4.4） ----------------
+    # ---------------- 收敛检测（架构文档 §4.4；P0-3 支持降级模式） ----------------
     async def _check_convergence(self) -> bool:
         if self.round < 2:
             return False
@@ -797,21 +840,34 @@ class Orchestrator:
         if not cur or not prev:
             return False
         try:
-            import numpy as np
-
-            from app.embeddings import embed_query
-            v_cur = np.array(embed_query(cur))
-            v_prev = np.array(embed_query(prev))
-            sim = float(np.dot(v_cur, v_prev) /
-                        (np.linalg.norm(v_cur) * np.linalg.norm(v_prev) + 1e-9))
+            from app.embeddings import embed_query, is_fallback
+            if is_fallback():
+                # 降级：哈希向量不表达语义（余弦值近随机），改用字符级文本相似度
+                mode = "text-similarity"
+                if self.convergence_mode != mode:
+                    self.convergence_mode = mode
+                    self._log("嵌入模型不可用，收敛检测降级为文本相似度 "
+                              f"（difflib 字符级，阈值 {settings.CONVERGENCE_TEXT_SIMILARITY}）",
+                              level="warning", event="convergence.degraded")
+                sim = _text_similarity(cur, prev)
+            else:
+                self.convergence_mode = "embedding"
+                import numpy as np
+                v_cur = np.array(embed_query(cur))
+                v_prev = np.array(embed_query(prev))
+                sim = float(np.dot(v_cur, v_prev) /
+                            (np.linalg.norm(v_cur) * np.linalg.norm(v_prev) + 1e-9))
         except Exception:
             return False
         # 新证据检测：本轮 RAG 若返回了新证据，则不视为无效循环
         has_new_evidence = bool(self.round_evidence.get(self.round))
-        if sim >= settings.CONVERGENCE_SIMILARITY and not has_new_evidence:
+        threshold = (settings.CONVERGENCE_TEXT_SIMILARITY
+                     if self.convergence_mode == "text-similarity"
+                     else settings.CONVERGENCE_SIMILARITY)
+        if sim >= threshold and not has_new_evidence:
             self.convergence_streak += 1
             self._log(f"[收敛检测] 第{self.round}轮与上一轮相似度={sim:.3f} "
-                      f"（连续{self.convergence_streak}轮）",
+                      f"（连续{self.convergence_streak}轮，模式={self.convergence_mode}）",
                       level="info", event="convergence.check")
         else:
             self.convergence_streak = 0
@@ -859,6 +915,7 @@ class Orchestrator:
         self.governor = FairnessGovernor()
         self.status = "running"
         self._pause_event.set()
+        self._persist_meta()
         await self.event_bus.publish({
             "type": "status", "status": "running", "phase": self.phase,
             "topic": self.topic, "max_rounds": self.max_rounds,
@@ -985,10 +1042,13 @@ class Orchestrator:
                 self.status = "done"
                 await self.event_bus.publish({"type": "status", "status": "done", "phase": self.phase})
                 await self.event_bus.publish(self._status_sync())
+                self._persist_meta()
+                self._notify_done()
         except Exception as e:
             self._log(f"[编排器错误] {e}", level="error", event="orchestrator.error")
             self.status = "stopped"
             self.phase = "idle"  # 异常熔断回到 Idle（架构文档 §4.1）
+            self._persist_meta()
             await self.event_bus.publish({"type": "status", "status": "stopped", "phase": self.phase})
 
     # ---------------- Judge 裁决（架构文档 §2.4） ----------------
@@ -1322,6 +1382,9 @@ class Orchestrator:
             # 只读遥测：token 用量不再做任何约束，仅保留观测（实时显示）
             "spent_tokens": self.spent,            # 累计 token 用量（输入+输出）
             "output_tokens": self.output_tokens,   # 累计输出 token（实时）
+            # 收敛检测（P0-3）：模式与连续相似轮数
+            "convergence_mode": self.convergence_mode,
+            "convergence_streak": self.convergence_streak,
             # 公平性治理报告（替代旧的 budget_plan 视图）
             "fairness": fair,
             "elapsed_time_ms": int((time.time() - self._started_at) * 1000)
@@ -1429,9 +1492,13 @@ class Orchestrator:
         conv_flag = self.convergence_streak >= settings.CONVERGENCE_ROUNDS
         done_tasks = sum(1 for t in self.tasks if t["completed"])
         conv_text = f"是（连续{self.convergence_streak}轮相似）" if conv_flag else "否"
+        conv_mode_text = ("文本相似度（降级，嵌入模型不可用）"
+                          if self.convergence_mode == "text-similarity"
+                          else "向量余弦相似度（嵌入模型）")
         lines.append(f"- 持续时间：{elapsed:.1f} 秒")
         lines.append(f"- 实际轮次：{self.round}/{self.max_rounds}")
         lines.append(f"- 收敛触发：{conv_text}")
+        lines.append(f"- 收敛检测模式：{conv_mode_text}")
         lines.append(f"- RAG 证据轮数：{len(self.round_evidence)}")
         lines.append(f"- 任务：{len(self.tasks)}（完成 {done_tasks}）")
         lines.append(f"- 历史压缩次数：{self.run_stats.get('compressions', 0)}")
@@ -1491,5 +1558,10 @@ class Orchestrator:
         return "\n".join(lines)
 
 
-# 全局编排器实例
-orchestrator = Orchestrator()
+# 默认会话编排器实例（session_id="default"，向后兼容现有调用方与测试）
+orchestrator = Orchestrator(session_id="default")
+
+# 把默认会话注册进全局会话管理器，保证 main.py / 现有测试引用的模块级单例
+# 与 manager.get_or_create("default") 返回同一实例（多会话隔离的向后兼容层）
+from app.manager import manager  # noqa: E402  （惰性导入 Orchestrator，无循环依赖）
+manager.register(orchestrator)

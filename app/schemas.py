@@ -30,6 +30,7 @@ class AgentConfig(BaseModel):
 
 class ConfigureRequest(BaseModel):
     """POST /api/configure 请求体。"""
+    session_id: str | None = None
     agents: list[AgentConfig] = Field(default_factory=list)
     topic: str = ""
     max_rounds: int = 8
@@ -38,8 +39,14 @@ class ConfigureRequest(BaseModel):
 
 class StartRequest(BaseModel):
     """POST /api/start 请求体（字段可省略，省略时沿用 configure 时的值）。"""
+    session_id: str | None = None
     topic: str = ""
     max_rounds: int | None = None
+
+
+class SessionRequest(BaseModel):
+    """POST /api/pause、/api/resume、/api/end 请求体（仅需 session_id，可省略）。"""
+    session_id: str | None = None
 
 
 class IngestRequest(BaseModel):
@@ -50,4 +57,5 @@ class IngestRequest(BaseModel):
 
 class SaveMarkdownRequest(BaseModel):
     """POST /api/save_markdown 请求体（filename 可省略，省略时自动生成）。"""
+    session_id: str | None = None
     filename: str = ""

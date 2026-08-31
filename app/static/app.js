@@ -4,6 +4,7 @@ const $ = (id) => document.getElementById(id);
 
 const state = {
   defaults: null,
+  sessionId: null,      // 当前客户端会话（localStorage 持久化，稳定绑定多会话后端）
   agentConfigs: [],   // 配置阶段
   agents: [],         // 运行阶段（含角色/是否主/立场）
   tasks: [],          // {id,to,content,expected,var,completed,value}
@@ -21,7 +22,8 @@ const state = {
 };
 
 const STATUS_TEXT = {
-  idle: "空闲", running: "讨论中", paused: "已暂停", done: "已完成", stopped: "已结束",
+  idle: "空闲", running: "讨论中", paused: "已暂停", done: "已完成",
+  stopped: "已结束", interrupted: "已中断",
 };
 
 const PHASE_TEXT = {
@@ -34,6 +36,25 @@ const STANCE_TEXT = { HOST: "主持人", PRO: "正方", CON: "反方", NEUTRAL: 
 const STANCE_AV = { HOST: "av-host", PRO: "av-pro", CON: "av-con", NEUTRAL: "av-neutral" };
 
 // ---------------- 初始化 ----------------
+// 会话 ID：每个浏览器客户端在 localStorage 中持久化一个稳定 session_id，
+// 后端据此把配置/状态/事件隔离到独立 Orchestrator（多会话，P1-7）。
+function getSessionId() {
+  if (state.sessionId) return state.sessionId;
+  let sid = localStorage.getItem("debate.session_id");
+  if (!sid) {
+    sid = (window.crypto && crypto.randomUUID)
+      ? crypto.randomUUID()
+      : ("sess_" + Date.now() + "_" + Math.random().toString(36).slice(2, 8));
+    localStorage.setItem("debate.session_id", sid);
+  }
+  state.sessionId = sid;
+  return sid;
+}
+
+function sidQuery() {
+  return "?session_id=" + encodeURIComponent(getSessionId());
+}
+
 async function init() {
   const res = await fetch("/api/defaults").then(r => r.json());
   state.defaults = res;
@@ -43,12 +64,26 @@ async function init() {
   connectWS();
   // 检测服务器是否已有可继续的讨论（刷新页面 / 之前暂停未结束），此时"进入圆桌"应回到旧讨论
   try {
-    const st = await fetch("/api/status").then(r => r.json());
+    const st = await fetch("/api/status" + sidQuery()).then(r => r.json());
+    if (st.status === "interrupted") {
+      // 上一进程遗留的中断会话：展示横幅，需重新配置后开启
+      showInterruptedBanner(st);
+    }
     if ((st.agents || []).length && (st.status === "paused" || st.status === "running")) {
       state.liveDiscussion = true;
       $("btn-start").textContent = "↩ 回到圆桌（继续讨论）";
     }
   } catch (e) { /* 状态查询失败时忽略 */ }
+}
+
+function showInterruptedBanner(st) {
+  const box = $("interrupted-banner");
+  if (!box) return;
+  const topic = (st.topic || "").trim();
+  box.classList.remove("hidden");
+  box.textContent = topic
+    ? `上一次讨论（“${topic}”）因服务重启而中断，请重新配置后开启新讨论。`
+    : "上一次讨论因服务重启而中断，请重新配置后开启新讨论。";
 }
 
 function bindEvents() {
@@ -269,6 +304,7 @@ async function startDiscussion() {
     }
   }
   const payload = {
+    session_id: getSessionId(),
     agents: state.agentConfigs.map((c, i) => ({
       agent_id: `agent_${i + 1}`,
       name: c.name || `Agent_${i + 1}`,
@@ -319,6 +355,7 @@ async function startDiscussion() {
   const st = await fetch("/api/start", {
     method: "POST", headers: {"Content-Type": "application/json"},
     body: JSON.stringify({
+      session_id: getSessionId(),
       topic: payload.topic,
       max_rounds: payload.max_rounds,
     }),
@@ -366,7 +403,7 @@ function highlightSeat(name) {
 
 // ---------------- 控制 ----------------
 async function ctrl(action) {
-  return await fetch("/api/" + action, { method: "POST" }).then(r => r.json());
+  return await fetch("/api/" + action + sidQuery(), { method: "POST" }).then(r => r.json());
 }
 
 async function backToSetup() {
@@ -396,7 +433,7 @@ function setPill(status) {
 // ---------------- WebSocket ----------------
 function connectWS() {
   const proto = location.protocol === "https:" ? "wss" : "ws";
-  const ws = new WebSocket(`${proto}://${location.host}/ws`);
+  const ws = new WebSocket(`${proto}://${location.host}/ws${sidQuery()}`);
   state.ws = ws;
   ws.onmessage = (e) => {
     const ev = JSON.parse(e.data);
@@ -411,6 +448,11 @@ function handleEvent(ev) {
   switch (ev.type) {
     case "status":
       setPill(ev.status);
+      // 中断 / 正常状态时收起中断横幅（重新配置并启动后会自动隐藏）
+      if (ev.status !== "interrupted") {
+        const banner = $("interrupted-banner");
+        if (banner) banner.classList.add("hidden");
+      }
       if (ev.agents && ev.agents.length) {
         state.agents = ev.agents;
         renderSeats(ev.agents);
@@ -619,7 +661,7 @@ function startElapsedTick() {
   stopElapsedTick();
   state.elapsedTimer = setInterval(async () => {
     try {
-      const s = await fetch("/api/status").then(r => r.json());
+      const s = await fetch("/api/status" + sidQuery()).then(r => r.json());
       renderRunStatus({
         phase: s.phase,
         current_round: s.round,
@@ -795,12 +837,12 @@ function downloadHistoryMarkdown() {
 
 // ---------------- Markdown 导出 ----------------
 async function exportMarkdown() {
-  const md = await fetch("/api/export").then(r => r.json()).then(r => r.markdown);
+  const md = await fetch("/api/export" + sidQuery()).then(r => r.json()).then(r => r.markdown);
   $("md-text").innerHTML = renderMarkdown(md);
   $("md-modal").classList.remove("hidden");
 }
 async function downloadMarkdown() {
-  const md = await fetch("/api/export").then(r => r.json()).then(r => r.markdown);
+  const md = await fetch("/api/export" + sidQuery()).then(r => r.json()).then(r => r.markdown);
   const blob = new Blob([md], { type: "text/markdown" });
   const a = document.createElement("a");
   a.href = URL.createObjectURL(blob);
@@ -808,7 +850,7 @@ async function downloadMarkdown() {
   a.click();
   URL.revokeObjectURL(a.href);
   // 同时保存到服务器（服务端会同步写入历史记忆索引）
-  fetch("/api/save_markdown", { method: "POST", headers: {"Content-Type": "application/json"} });
+  fetch("/api/save_markdown" + sidQuery(), { method: "POST", headers: {"Content-Type": "application/json"} });
 }
 
 // ---------------- Markdown 渲染（marked 预览 + XSS 防护） ----------------
