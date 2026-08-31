@@ -87,6 +87,21 @@
         <span class="hint">裁判为独立 Agent，仅对各辩手的辩论表现按辩手逐一评分，不参与辩论、不看主持人任务分派内容。</span>
       </div>
 
+      <div class="config-sub">
+        <div class="config-sub-title">讨论模板（本地保存）</div>
+        <div class="row">
+          <label>模板名称</label>
+          <input id="template-name" placeholder="如：产品方案辩论" />
+        </div>
+        <div class="row">
+          <button id="btn-template-save">保存当前配置</button>
+          <select id="template-select"></select>
+          <button id="btn-template-load">载入</button>
+          <button id="btn-template-delete" class="ghost-btn">删除</button>
+        </div>
+        <span class="hint" id="template-hint">模板保存在浏览器本地（localStorage），含席位 / 立场 / 模型 / 主题 / 轮次 / 知识库等配置。</span>
+      </div>
+
       <div class="actions">
         <button id="btn-start" class="primary">进入圆桌并开始讨论</button>
       </div>

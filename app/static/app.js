@@ -60,6 +60,7 @@ async function init() {
   state.defaults = res;
   $("backend-hint").textContent = `向量库后端：${res.vector_backend}`;
   generateAgentCards(parseInt($("agent-count").value, 10));
+  refreshTemplateSelect();
   bindEvents();
   connectWS();
   // 检测服务器是否已有可继续的讨论（刷新页面 / 之前暂停未结束），此时"进入圆桌"应回到旧讨论
@@ -95,6 +96,13 @@ function bindEvents() {
   $("btn-gen-agents").addEventListener("click", () =>
     generateAgentCards(parseInt($("agent-count").value, 10)));
   $("judge-provider").addEventListener("change", onJudgeProviderChange);
+  $("btn-template-save").addEventListener("click", saveTemplate);
+  $("btn-template-load").addEventListener("click", () => {
+    const name = $("template-select").value;
+    if (!name) { $("template-hint").textContent = "请先选择要载入的模板"; return; }
+    applyTemplate(name);
+  });
+  $("btn-template-delete").addEventListener("click", deleteTemplate);
   $("btn-ingest").addEventListener("click", ingest);
   $("btn-upload").addEventListener("click", uploadFile);
   $("btn-start").addEventListener("click", startDiscussion);
@@ -143,19 +151,20 @@ function avatarClass(stance, idx) {
 }
 
 // ---------------- Agent 配置卡片 ----------------
-function generateAgentCards(n) {
+function generateAgentCards(n, prefill) {
   const wrap = $("agent-cards");
   wrap.innerHTML = "";
   state.agentConfigs = [];
   for (let i = 0; i < n; i++) {
     const isMain = i === 0;
+    const src = (prefill && prefill[i]) || {};
     const cfg = {
-      name: `Agent_${i + 1}`,
-      role: isMain ? "主持人 / 主 Agent" : "",
-      personality: "",
-      provider: "default",
-      base_url: "", api_key: "", model_id: "",
-      stance: isMain ? "HOST" : (i % 2 === 1 ? "PRO" : "CON"),
+      name: src.name || `Agent_${i + 1}`,
+      role: src.role ?? (isMain ? "主持人 / 主 Agent" : ""),
+      personality: src.personality || "",
+      provider: src.provider || "default",
+      base_url: src.base_url || "", api_key: src.api_key || "", model_id: src.model_id || "",
+      stance: src.stance || (isMain ? "HOST" : (i % 2 === 1 ? "PRO" : "CON")),
     };
     state.agentConfigs.push(cfg);
 
@@ -185,9 +194,9 @@ function generateAgentCards(n) {
         </select>
       </div>
       <div class="custom-fields hidden">
-        <div class="field"><label>Base URL</label><input data-k="base_url" placeholder="https://..."></div>
-        <div class="field"><label>API Key</label><input data-k="api_key" type="password" placeholder="sk-..."></div>
-        <div class="field"><label>Model ID</label><input data-k="model_id" placeholder="model-name"></div>
+        <div class="field"><label>Base URL</label><input data-k="base_url" value="${cfg.base_url}" placeholder="https://..."></div>
+        <div class="field"><label>API Key</label><input data-k="api_key" type="password" value="${cfg.api_key}" placeholder="sk-..."></div>
+        <div class="field"><label>Model ID</label><input data-k="model_id" value="${cfg.model_id}" placeholder="model-name"></div>
       </div>
     `;
     // 绑定输入
@@ -198,6 +207,8 @@ function generateAgentCards(n) {
       });
     });
     wrap.appendChild(card);
+    // 按 provider 归一化：非 custom 时用预设回填 base_url / api_key / model_id
+    onProviderChange(card, cfg);
   }
 }
 
@@ -240,6 +251,90 @@ function collectJudgeConfig() {
     api_key: $("judge-api-key").value,
     model_id: $("judge-model-id").value,
   };
+}
+
+// ---------------- 讨论模板（P1-5：localStorage 持久化） ----------------
+const TEMPLATE_KEY = "debate.templates.v1";
+
+function readTemplates() {
+  try { return JSON.parse(localStorage.getItem(TEMPLATE_KEY)) || {}; }
+  catch (e) { return {}; }
+}
+
+function writeTemplates(obj) {
+  localStorage.setItem(TEMPLATE_KEY, JSON.stringify(obj));
+}
+
+function refreshTemplateSelect(selectedName) {
+  const sel = $("template-select");
+  const names = Object.keys(readTemplates()).sort();
+  sel.innerHTML = '<option value="">选择模板…</option>' +
+    names.map(n => `<option value="${n}" ${n === selectedName ? "selected" : ""}>${n}</option>`).join("");
+}
+
+// 直接从 DOM 收集当前席位配置（保证包含未触发事件的最新输入）
+function collectAgentConfigsFromDOM() {
+  return Array.from(document.querySelectorAll("#agent-cards .acard")).map(card => {
+    const cfg = {};
+    card.querySelectorAll("[data-k]").forEach(el => { cfg[el.dataset.k] = el.value; });
+    return cfg;
+  });
+}
+
+function collectSetupConfig() {
+  return {
+    topic: $("topic").value,
+    max_rounds: parseInt($("max-rounds").value, 10) || 8,
+    kb_text: $("kb-text").value,
+    agents: collectAgentConfigsFromDOM(),
+    judge: collectJudgeConfig(),
+  };
+}
+
+function saveTemplate() {
+  const name = ($("template-name").value || "").trim();
+  if (!name) { $("template-hint").textContent = "请先填写模板名称"; return; }
+  const tpl = collectSetupConfig();
+  tpl.name = name;
+  tpl.saved_at = new Date().toISOString();
+  const all = readTemplates();
+  all[name] = tpl;
+  writeTemplates(all);
+  refreshTemplateSelect(name);
+  $("template-hint").textContent = `已保存模板「${name}」`;
+}
+
+function applyTemplate(name) {
+  const tpl = readTemplates()[name];
+  if (!tpl) return;
+  const n = clamp(tpl.agents ? tpl.agents.length : 3, 2, 6);
+  $("agent-count").value = n;
+  $("topic").value = tpl.topic || "";
+  $("max-rounds").value = clamp(tpl.max_rounds || 8, 1, 30);
+  $("kb-text").value = tpl.kb_text || "";
+  $("template-name").value = name;
+  // 独立裁判
+  const j = tpl.judge || {};
+  if (j.name) $("judge-name").value = j.name;
+  $("judge-provider").value = j.provider || "default";
+  onJudgeProviderChange();
+  if (j.base_url) $("judge-base-url").value = j.base_url;
+  if (j.api_key) $("judge-api-key").value = j.api_key;
+  if (j.model_id) $("judge-model-id").value = j.model_id;
+  // 席位卡片：重建后由 generateAgentCards 用模板值回填
+  generateAgentCards(n, tpl.agents || []);
+  $("template-hint").textContent = `已载入模板「${name}」`;
+}
+
+function deleteTemplate() {
+  const name = $("template-select").value;
+  if (!name) return;
+  if (!confirm(`删除模板「${name}」？`)) return;
+  const all = readTemplates();
+  delete all[name];
+  writeTemplates(all);
+  refreshTemplateSelect();
+  $("template-hint").textContent = `已删除模板「${name}」`;
 }
 
 // ---------------- 注入知识 ----------------
