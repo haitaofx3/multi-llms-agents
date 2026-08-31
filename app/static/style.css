@@ -377,6 +377,22 @@ button.ghost-btn:hover { color: var(--gold); border-color: rgba(184,134,45,.5); 
   display: inline-block; width: 2px; height: 1em; background: var(--gold);
   margin-left: 2px; vertical-align: -2px; animation: blink 1s steps(2) infinite;
 }
+
+/* P1-4 工具调用可视化：发言气泡内的工具指示条 */
+.tool-calls { margin-top: 6px; display: flex; flex-direction: column; gap: 4px; }
+.tool-chip {
+  display: inline-block; align-self: flex-start; max-width: 100%;
+  font-size: 12px; line-height: 1.5; word-break: break-all;
+  padding: 4px 10px; border-radius: 999px;
+}
+.tool-chip.live {
+  color: var(--gold); background: rgba(184,134,45,.08);
+  border: 1px dashed rgba(184,134,45,.45); animation: bubbleIn .25s ease;
+}
+.tool-chip.done {
+  color: var(--muted); background: rgba(63,122,88,.06);
+  border: 1px solid rgba(63,122,88,.28);
+}
 @keyframes blink { 50% { opacity: 0; } }
 
 /* ---------------- 结束栏 ---------------- */

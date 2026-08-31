@@ -73,6 +73,21 @@ STANCE_LABEL = {"PRO": "正方", "CON": "反方", "NEUTRAL": "中立", "HOST": "
 # 架构状态机（对齐架构文档 §4.1）
 PHASES = ("idle", "preparing", "debating", "judging", "finished")
 
+def _shorten(text, limit=120):
+    """截断工具调用摘要到 limit 字符（用于前端 tool_call_end 展示，避免刷屏）。"""
+    if text is None:
+        return ""
+    if not isinstance(text, str):
+        try:
+            text = json.dumps(text, ensure_ascii=False)
+        except Exception:
+            text = str(text)
+    text = text.strip()
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "…"
+
+
 # P0-1 结构化结论：最终报告固定四段式模板（主持人 LLM 必须保留每个一级标题）
 CONCLUSION_TEMPLATE = (
     "## 核心结论\n"
@@ -347,18 +362,21 @@ class Orchestrator:
 
     # ---------------- 单次 Agent 回合（含工具调用循环） ----------------
     async def _consume_stream(self, messages, model_config, tools, on_delta=None,
-                              temperature=0.7, top_p=None):
+                              on_tool_start=None, temperature=0.7, top_p=None):
         """
         在后台线程运行流式生成，把增量事件桥接回事件循环。
 
-        返回完整结果 dict（与 chat() 一致：content / tool_calls / assistant_message / usage）。
+        返回完整结果 dict（与 chat() 一致：content / tool_calls / assistant_message / usage），
+        额外附带 "tool_starts"：流式中已发出 tool_call_start 的工具索引列表（供调用方补齐展示）。
         on_delta(delta: str) 为可选回调，每次收到文本增量时调用。
+        on_tool_start(name: str, index: int) 为可选回调，模型首次产出工具名时调用（P1-4 工具可视化）。
         整体超时受 settings.STREAM_TIMEOUT 约束（架构文档 §4.5 单步超时）。
         """
         q = asyncio.Queue()
         loop = asyncio.get_running_loop()
         t_start = time.time()
         metrics = {"ttft_s": None, "gen_s": 0.0, "chars": 0}
+        started = set()  # 已发出 tool_call_start 的工具 index
 
         def _run():
             try:
@@ -380,9 +398,15 @@ class Orchestrator:
                     if metrics["ttft_s"] is not None:
                         metrics["gen_s"] = max(0.0, time.time() - t_start - metrics["ttft_s"])
                         ev["result"]["metrics"] = dict(metrics)
+                    ev["result"]["tool_starts"] = sorted(started)
                     return ev["result"]
                 if t == "error":
                     raise RuntimeError(ev["error"])
+                if t == "tool_call_start":
+                    started.add(ev.get("index", 0))
+                    if on_tool_start is not None:
+                        await on_tool_start(ev["name"], ev.get("index", 0))
+                    continue
                 if t == "content":
                     if first and metrics["ttft_s"] is None:
                         metrics["ttft_s"] = time.time() - t_start
@@ -471,12 +495,43 @@ class Orchestrator:
                 "delta": delta,
             })
 
+        # P1-4 工具调用可视化：流式中首次产出工具名 / 工具执行结束时推送到前端。
+        # tool_call_start 同样先补发 speech_start，保证气泡在纯工具回合（无文本）时也存在。
+        async def _emit_tool_start(name: str, index: int = 0):
+            nonlocal emitting
+            if not emitting:
+                emitting = True
+                await self.event_bus.publish({
+                    "type": "speech_start",
+                    "speaker": agent.name,
+                    "round": self.round,
+                    "is_main": agent.is_main,
+                })
+            await self.event_bus.publish({
+                "type": "tool_call_start",
+                "speaker": agent.name,
+                "round": self.round,
+                "is_main": agent.is_main,
+                "name": name,
+                "index": index,
+            })
+
+        async def _emit_tool_end(name: str, summary: str = ""):
+            await self.event_bus.publish({
+                "type": "tool_call_end",
+                "speaker": agent.name,
+                "round": self.round,
+                "name": name,
+                "summary": _shorten(summary, 120),
+            })
+
         for _ in range(5):
             try:
                 if stream:
                     try:
                         result = await self._consume_stream(
                             messages, agent.model_config, tools, _emit_delta,
+                            on_tool_start=_emit_tool_start,
                             temperature=samp["temperature"], top_p=samp["top_p"])
                     except Exception as e:
                         self._log(f"[LLM流式失败:{agent.name}] {e}，回退非流式",
@@ -521,22 +576,31 @@ class Orchestrator:
             if raw_msg is not None:
                 messages.append(raw_msg)
 
+            # P1-4：流式中已展示过的工具索引（非流式/流式回退时为空 → 全部在执行前补发 start）
+            streamed = set(result.get("tool_starts") or [])
             special = False
-            for tc in tcs:
+            for i, tc in enumerate(tcs):
+                if i not in streamed:
+                    await _emit_tool_start(tc["name"], i)
                 if agent.is_main and tc["name"] == "delegate_task":
                     delegate.append(tc["arguments"])
                     special = True
+                    await _emit_tool_end(
+                        tc["name"],
+                        f"分派任务 → {tc['arguments'].get('recipient', '?')}")
                 elif (not agent.is_main) and tc["name"] == "report_result":
                     report = tc["arguments"]
                     special = True
+                    await _emit_tool_end(tc["name"], "回报任务结果")
                 else:
-                    result = await asyncio.to_thread(
+                    tool_result = await asyncio.to_thread(
                         agent.mcp.call, tc["name"], tc["arguments"])
                     messages.append({
                         "role": "tool",
                         "tool_call_id": tc["id"],
-                        "content": result,
+                        "content": tool_result,
                     })
+                    await _emit_tool_end(tc["name"], tool_result)
             if special:
                 break
             if not tcs:
@@ -567,8 +631,10 @@ class Orchestrator:
                 think_chars=think,
                 truncated=was_truncated)
 
-        # 流式收尾：补发 speech_end（前端用完整文本替换），并记录 transcript
-        if emitting and content:
+        # 流式收尾：补发 speech_end（前端用完整文本替换），并记录 transcript。
+        # P1-4：纯工具回合（仅调用工具未产出文本）也以 emitting=True 触发 speech_end，
+        # 避免气泡悬空（工具调用摘要已通过 tool_call_start/end 展示）。
+        if emitting:
             await self.event_bus.publish({
                 "type": "speech_end",
                 "speaker": agent.name,
@@ -577,10 +643,11 @@ class Orchestrator:
                 "tokens": token_cost,          # 本次发言累计 token 用量（实时显示）
                 "output_tokens": self.output_tokens,  # 全局累计输出 token（实时显示）
             })
-            self.transcript.append({
-                "type": "speech", "round": self.round, "speaker": agent.name,
-                "is_main": agent.is_main, "text": content,
-            })
+            if content:
+                self.transcript.append({
+                    "type": "speech", "round": self.round, "speaker": agent.name,
+                    "is_main": agent.is_main, "text": content,
+                })
 
         agent.append_history("user", user_msg, round_no=self.round)
         if content:

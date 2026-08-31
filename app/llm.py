@@ -231,6 +231,7 @@ def chat_stream(messages, model_config: dict, tools=None, tool_choice="auto",
 
     yield 事件（dict）：
       {"type": "content",        "delta": str}   增量文本（已剥离 think 片段）
+      {"type": "tool_call_start", "index": int, "name": str}  工具调用开始（名称首次出现时）
       {"type": "tool_call_args", "index": int, "delta": str}  工具参数增量
       {"type": "final", "result": {...}}           流结束，携带完整结果
 
@@ -282,7 +283,12 @@ def chat_stream(messages, model_config: dict, tools=None, tool_choice="auto",
             if tc.id:
                 acc["id"] = tc.id
             if tc.function and tc.function.name:
-                acc["name"] = tc.function.name
+                if not acc["name"]:
+                    acc["name"] = tc.function.name
+                    yield {"type": "tool_call_start", "index": idx,
+                           "name": tc.function.name}
+                else:
+                    acc["name"] = tc.function.name
             if tc.function and tc.function.arguments:
                 acc["arguments"] += tc.function.arguments
                 yield {"type": "tool_call_args", "index": idx,

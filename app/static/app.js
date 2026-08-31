@@ -522,6 +522,47 @@ function handleEvent(ev) {
       }
       break;
     }
+    case "tool_call_start": {
+      // P1-4 工具可视化：在发言气泡内追加「正在调用工具 …」指示条。
+      // 纯工具回合可能先于任何文本增量到达，需在气泡不存在时自行创建。
+      let box = state.streamBoxes[ev.speaker];
+      if (!box) {
+        box = addMsgStart(ev.speaker, ev.is_main ? "main" : "", ev.round);
+        state.streamBoxes[ev.speaker] = box;
+        highlightSeat(ev.speaker);
+      }
+      const chips = box.querySelector(".tool-calls");
+      const chip = document.createElement("div");
+      chip.className = "tool-chip live";
+      chip.dataset.name = ev.name;
+      chip.textContent = "🔧 正在调用 " + ev.name + " …";
+      chips.appendChild(chip);
+      $("transcript").scrollTop = $("transcript").scrollHeight;
+      break;
+    }
+    case "tool_call_end": {
+      // 工具执行完成：把「正在调用」条更新为「✅ 完成 + 摘要」；找不到则直接补一条
+      const box = state.streamBoxes[ev.speaker];
+      if (box) {
+        const chips = box.querySelector(".tool-calls");
+        const live = Array.from(chips.querySelectorAll(".tool-chip.live"))
+          .find(c => c.dataset.name === ev.name)
+          || chips.querySelector(".tool-chip.live");
+        const label = ev.summary ? ev.name + "：" + ev.summary : ev.name + " 完成";
+        if (live) {
+          live.classList.remove("live");
+          live.classList.add("done");
+          live.textContent = "✅ " + label;
+        } else {
+          const chip = document.createElement("div");
+          chip.className = "tool-chip done";
+          chip.textContent = "✅ " + label;
+          chips.appendChild(chip);
+        }
+        $("transcript").scrollTop = $("transcript").scrollHeight;
+      }
+      break;
+    }
     case "task_assigned": {
       addMsg(ev.from, `分派任务给 ${ev.to}：\n内容：${ev.content}\n期望：${ev.expected}\n变量：${ev.var}`, "task", null, ev.from);
       state.tasks.push({ id: Date.now() + Math.random(), to: ev.to, content: ev.content, expected: ev.expected, var: ev.var, completed: false, value: "" });
@@ -603,6 +644,7 @@ function addMsgStart(who, cls, round) {
     <div class="bubble-main">
       <div class="bubble-meta"><span class="bubble-name">${who}</span>${tag}</div>
       <div class="bubble"><span class="body"><span class="caret"></span></span></div>
+      <div class="tool-calls"></div>
     </div>
   `;
   box.appendChild(el);
