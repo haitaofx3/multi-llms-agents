@@ -330,6 +330,7 @@ async function startDiscussion() {
   state.ctx = {};
   renderSeats(state.agents);
   $("transcript").innerHTML = "";
+  $("conclusion-panel").classList.add("hidden");  // 新讨论开始时隐藏旧结论
   $("topic-display") && ($("topic-display").textContent = payload.topic);
   $("center-topic").textContent = payload.topic || "圆桌讨论";
   $("center-round").textContent = `第 0 / ${cfg.max_rounds || payload.max_rounds} 轮`;
@@ -540,6 +541,18 @@ function handleEvent(ev) {
     case "summary":
       addMsg(ev.speaker, ev.text, "summary", ev.round, "最终总结");
       break;
+    case "conclusion": {
+      // P0-1 结构化结论：讨论结束后展示「核心结论」面板
+      $("conclusion-core").textContent = ev.core || "";
+      const parts = [];
+      if (ev.winner) parts.push("胜方：" + (STANCE_TEXT[ev.winner] || ev.winner));
+      if (ev.positions) parts.push("【各方立场与论点摘要】\n" + ev.positions);
+      if (ev.judge_ruling) parts.push("【裁判裁决】\n" + ev.judge_ruling);
+      if (ev.pending) parts.push("【分歧与待办】\n" + ev.pending);
+      $("conclusion-detail").textContent = parts.join("\n\n");
+      $("conclusion-panel").classList.remove("hidden");
+      break;
+    }
     case "status_sync":
       renderRunStatus(ev);
       renderBudgetPanel(ev);

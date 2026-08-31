@@ -73,6 +73,18 @@ STANCE_LABEL = {"PRO": "正方", "CON": "反方", "NEUTRAL": "中立", "HOST": "
 # 架构状态机（对齐架构文档 §4.1）
 PHASES = ("idle", "preparing", "debating", "judging", "finished")
 
+# P0-1 结构化结论：最终报告固定四段式模板（主持人 LLM 必须保留每个一级标题）
+CONCLUSION_TEMPLATE = (
+    "## 核心结论\n"
+    "（用 1-3 句话概括整场讨论最重要的结论，必须为独立段落）\n\n"
+    "## 各方立场与论点摘要\n"
+    "（按立场/辩手分别列出核心论点，每人 1-3 条）\n\n"
+    "## 裁判裁决\n"
+    "（引用裁判给出的胜方、评分与评语）\n\n"
+    "## 分歧与待办\n"
+    "（列出仍未解决的分歧点与可选的后续待办；若无则写“无”）\n"
+)
+
 
 class EventBus:
     def __init__(self):
@@ -155,6 +167,7 @@ class Orchestrator:
         self.latest_arguments = {}    # speaker -> {"text","round"}
         self.round_evidence = {}      # round -> {speaker: [EvidenceItem]}
         self.judgment = None
+        self.conclusion = None        # P0-1 结构化结论（core/positions/judge_ruling/pending）
         self.last_main_message = ""
         self.last_debate_speaker = None  # 上一轮/上一位实际发言的辩手（用于针对性反驳）
         self.run_stats = {"compressions": 0}  # 运行摘要统计（优化 A4）
@@ -189,6 +202,7 @@ class Orchestrator:
         self.latest_arguments = {}
         self.round_evidence = {}
         self.judgment = None
+        self.conclusion = None        # P0-1 结构化结论
         self.last_debate_speaker = None
         self._opponent_prep = {}            # 对手定向反驳上下文（需求 2/3）
         self._opponent_summary_cache = {}   # (对手,轮次) -> 摘要，防同轮重复调用
@@ -904,6 +918,7 @@ class Orchestrator:
         self.latest_arguments = {}
         self.round_evidence = {}
         self.judgment = None
+        self.conclusion = None        # P0-1 结构化结论
         self.last_debate_speaker = None
         # 对手定向反驳（需求 2/3）：collab.name -> {speaker, stance, round, text}；
         # 摘要按 (对手,轮次) 缓存，避免同轮多个辩手引用同一对手重复调用 LLM
@@ -1413,57 +1428,132 @@ class Orchestrator:
             "type": "summary", "round": self.round, "speaker": self.main.name, "text": text,
         })
 
+    # ---------------- P0-1 结构化结论：四段式最终报告 ----------------
+    @staticmethod
+    def _split_sections(text: str) -> dict:
+        """按一级/二级 Markdown 标题把文本切分为 {标题: 正文}。"""
+        import re
+        sections = {}
+        cur = None
+        for line in (text or "").splitlines():
+            m = re.match(r"^#{1,2}\s+(.+)$", line.strip())
+            if m:
+                cur = m.group(1).strip()
+                sections.setdefault(cur, [])
+            elif cur is not None:
+                sections[cur].append(line)
+        return {k: "\n".join(v).strip() for k, v in sections.items()}
+
+    def _fallback_core_conclusion(self, judgment) -> str:
+        """确定性兜底：核心结论（优先引用裁判裁决）。"""
+        if judgment:
+            winner = "平局" if judgment.winner == "DRAW" else f"「{judgment.winner}」"
+            base = f"整场讨论已结束，裁判裁决胜方为 {winner}。"
+            if judgment.critique:
+                base += f"\n裁判评语：{judgment.critique}"
+            return base
+        return "整场讨论已完成，各方完成多轮发言与交锋；未配置独立裁判，未产生裁决。"
+
+    def _fallback_positions(self) -> str:
+        """确定性兜底：各方立场与论点摘要（基于发言记录截取）。"""
+        lines = []
+        for e in self.transcript:
+            if e["type"] == "speech":
+                snippet = e["text"][:120] + ("…" if len(e["text"]) > 120 else "")
+                lines.append(f"- **{e['speaker']}**（第{e['round']}轮）：{snippet}")
+        return "\n".join(lines) or "（无发言记录）"
+
+    @staticmethod
+    def _judge_ruling_text(judgment) -> str:
+        """权威裁判裁决文本（基于 judgment 数据，防止主持人转述失真/编造）。"""
+        if not judgment:
+            return "（无裁判裁决）"
+        parts = [f"- 胜方：{judgment.winner}"]
+        parts.append(f"- 综合得分：{json.dumps(judgment.scores, ensure_ascii=False)}")
+        if judgment.agent_scores:
+            parts.append(
+                f"- 辩手评分：{json.dumps(judgment.agent_scores, ensure_ascii=False)}")
+        if judgment.composite_scores:
+            parts.append(
+                f"- 综合评分（内容×{settings.JUDGE_CONTENT_WEIGHT} + "
+                f"模型质量×{settings.JUDGE_PERFORMANCE_WEIGHT}）："
+                f"{json.dumps(judgment.composite_scores, ensure_ascii=False)}")
+        parts.append(f"- 收敛终止：{'是' if judgment.convergence_flag else '否'}")
+        parts.append(f"- 评语：{judgment.critique or ''}")
+        return "\n".join(parts)
+
+    def _normalize_conclusion(self, text: str, judgment) -> str:
+        """把主持人 LLM 输出规整为固定四段式最终报告（P0-1）。
+
+        - 按一级标题切分，尽量保留模型生成内容；
+        - 「裁判裁决」段一律用权威 judgment 数据重写，避免模型转述失真；
+        - 缺失的段落用确定性数据回填，保证报告结构完整、可扫读。
+        结果同步写入 self.conclusion 供前端结构化展示。
+        """
+        parts = self._split_sections(text)
+
+        def pick(*titles):
+            for t in titles:
+                for k, v in parts.items():
+                    if t in k:
+                        return v
+            return ""
+
+        core = pick("核心结论", "结论", "总结", "摘要")
+        positions = pick("各方立场", "立场与论点", "论点摘要", "观点摘要", "各方论点")
+        pending = pick("分歧与待办", "分歧", "待办")
+        core = core or self._fallback_core_conclusion(judgment)
+        positions = positions or self._fallback_positions()
+        judge_ruling = self._judge_ruling_text(judgment)
+        pending = pending or "（无明确列出的分歧或待办事项）"
+        self.conclusion = {
+            "core": core,
+            "positions": positions,
+            "judge_ruling": judge_ruling,
+            "pending": pending,
+        }
+        return (
+            f"## 核心结论\n\n{core}\n\n"
+            f"## 各方立场与论点摘要\n\n{positions}\n\n"
+            f"## 裁判裁决\n\n{judge_ruling}\n\n"
+            f"## 分歧与待办\n\n{pending}\n")
+
     async def _final_summary(self, judgment=None):
         judge_section = ""
         if judgment:
             judge_section = (
-                "\n\n【裁判裁决】\n"
-                f"- 综合得分：{json.dumps(judgment.scores, ensure_ascii=False)}\n"
-                f"- 辩手评分：{json.dumps(judgment.agent_scores, ensure_ascii=False)}\n")
-            if judgment.composite_scores:
-                judge_section += (
-                    f"- 综合评分（内容×{settings.JUDGE_CONTENT_WEIGHT} + "
-                    f"模型质量×{settings.JUDGE_PERFORMANCE_WEIGHT}）："
-                    f"{json.dumps(judgment.composite_scores, ensure_ascii=False)}\n")
-            judge_section += (
-                f"- 胜方：{judgment.winner}\n"
-                f"- 评语：{judgment.critique}")
+                "\n\n裁判给出的裁决数据（权威，供你在「裁判裁决」段引用）：\n"
+                + self._judge_ruling_text(judgment))
         directive = ("所有 Agent 的任务已结束或已达最大轮次。请作为主持人，"
-                     "综合各方发言、任务结果与裁判裁决，输出一份结构化的最终讨论报告"
-                     "（使用 markdown，含：核心结论、各方立场与论点摘要、裁判裁决、待办/分歧）。"
-                     "请直接输出总结文本，不要再次分派任务。") + judge_section
+                     "综合各方发言、任务结果与裁判裁决，输出最终讨论报告。"
+                     "请严格按下面的 Markdown 模板组织内容，四个一级标题（##）必须全部保留"
+                     "且顺序不变：\n\n"
+                     + CONCLUSION_TEMPLATE
+                     + "\n请直接输出报告文本，不要再次分派任务。") + judge_section
         out = await self._agent_turn(self.main, directive, mode="discussion", allow_delegate=False)
-        return out["content"] or "（主 Agent 未生成总结）"
+        content = out["content"] or ""
+        if not content.strip():
+            # 模型未生成任何内容：走确定性兜底汇总
+            report = self._fallback_summary(judgment)
+        else:
+            report = self._normalize_conclusion(content, judgment)
+        # 发布结构化结论事件，供前端「核心结论」面板展示
+        await self.event_bus.publish({
+            "type": "conclusion",
+            "core": self.conclusion["core"],
+            "positions": self.conclusion["positions"],
+            "judge_ruling": self.conclusion["judge_ruling"],
+            "pending": self.conclusion["pending"],
+            "winner": judgment.winner if judgment else None,
+            "round": self.round,
+        })
+        return report
 
     def _fallback_summary(self, judgment=None) -> str:
-        """确定性汇总：不调用 LLM，直接基于发言记录与裁决拼装报告（作为系统兜底）。"""
-        lines = []
-        lines.append("## 最终讨论报告（系统确定性汇总）\n")
-        lines.append(f"- 主题：{self.topic}")
-        lines.append(f"- 实际轮次：{self.round}/{self.max_rounds}")
-        lines.append(f"- Token 用量（只读遥测）：累计 {self.spent} / 输出 {self.output_tokens}")
-        lines.append("")
-        lines.append("### 核心观点摘要\n")
-        for e in self.transcript:
-            if e["type"] == "speech":
-                snippet = e["text"][:200] + ("…" if len(e["text"]) > 200 else "")
-                lines.append(f"**{e['speaker']}**（第{e['round']}轮）：{snippet}\n")
-        if judgment:
-            lines.append("### 裁判裁决\n")
-            lines.append(f"- 胜方：{judgment.winner}")
-            lines.append(f"- 得分：{json.dumps(judgment.scores, ensure_ascii=False)}")
-            if judgment.agent_scores:
-                lines.append(f"- 辩手评分：{json.dumps(judgment.agent_scores, ensure_ascii=False)}")
-            if judgment.composite_scores:
-                lines.append(f"- 综合评分（内容×{settings.JUDGE_CONTENT_WEIGHT} + "
-                             f"模型质量×{settings.JUDGE_PERFORMANCE_WEIGHT}）："
-                             f"{json.dumps(judgment.composite_scores, ensure_ascii=False)}")
-            if judgment.critique:
-                lines.append(f"- 评语：{judgment.critique}")
-            lines.append("")
-        lines.append("> 注：本报告由系统按发言记录确定性生成（未调用主持人 LLM 汇总），"
-                     "作为公平性治理下的兜底路径保留。")
-        return "\n".join(lines)
+        """确定性汇总：不调用 LLM，直接基于发言记录与裁决拼装四段式报告（系统兜底）。"""
+        report = self._normalize_conclusion("", judgment)
+        return ("> 注：本报告由系统按发言记录确定性生成（未调用主持人 LLM 汇总），"
+                "作为公平性治理下的兜底路径保留。\n\n" + report)
 
     # ---------------- 导出 Markdown ----------------
     def export_markdown(self) -> str:
