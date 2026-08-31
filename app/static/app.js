@@ -517,8 +517,12 @@ function handleEvent(ev) {
       }
       // 实时输出 token 统计：发言结束时立即刷新（无需等待下一次秒级轮询）
       if (ev.output_tokens != null) {
-        renderRunStatus(Object.assign({}, state.telemetry, { output_tokens: ev.output_tokens }));
-        renderBudgetPanel(Object.assign({}, state.telemetry, { output_tokens: ev.output_tokens }));
+        renderRunStatus(Object.assign({}, state.telemetry, {
+          output_tokens: ev.output_tokens, cost_rmb: ev.cost_rmb,
+        }));
+        renderBudgetPanel(Object.assign({}, state.telemetry, {
+          output_tokens: ev.output_tokens, cost_rmb: ev.cost_rmb,
+        }));
       }
       break;
     }
@@ -743,15 +747,18 @@ function renderRunStatus(data) {
   state.telemetry = Object.assign({}, state.telemetry, data, {
     spent_tokens: data.spent_tokens != null ? data.spent_tokens : state.telemetry.spent_tokens,
     output_tokens: data.output_tokens != null ? data.output_tokens : state.telemetry.output_tokens,
+    cost_rmb: data.cost_rmb != null ? data.cost_rmb : state.telemetry.cost_rmb,
   });
   const box = $("run-status");
   if (!box) return;
   const phase = PHASE_TEXT[data.phase] || data.phase || "-";
   const round = data.current_round != null ? `第 ${data.current_round} 轮` : "-";
-  // 实时 token 统计（只读遥测）：累计输出 token + 累计总用量
+  // 实时 token 统计（只读遥测）：累计输出 token + 累计总用量 + 预估费用（¥）
   const outT = data.output_tokens != null ? data.output_tokens : 0;
   const spentT = data.spent_tokens != null ? data.spent_tokens : 0;
-  const tokens = `输出 ${outT.toLocaleString()} / 累计 ${spentT.toLocaleString()}`;
+  const cost = data.cost_rmb != null ? data.cost_rmb : 0;
+  const tokens = `输出 ${outT.toLocaleString()} / 累计 ${spentT.toLocaleString()}`
+    + ` / 费用 ≈ ¥${cost.toFixed(4)}`;
   const elapsed = data.elapsed_time_ms != null
     ? `用时 ${(data.elapsed_time_ms / 1000).toFixed(1)}s` : "";
   // 公平性治理摘要（L1-L6 各层状态；替代旧「预算可支撑轮数」）
@@ -762,7 +769,7 @@ function renderRunStatus(data) {
   box.innerHTML = `
     <div class="kv"><b>阶段</b>：${phase}</div>
     <div class="kv"><b>轮次</b>：${round}</div>
-    <div class="kv"><b>Token 输出 / 累计（遥测）</b>：${tokens}</div>
+    <div class="kv"><b>Token 输出 / 累计 / 费用（遥测）</b>：${tokens}</div>
     ${fairLine}
     ${elapsed ? `<div class="kv"><b>${elapsed}</b></div>` : ""}
     ${data.trace_id ? `<div class="kv muted" style="font-size:11px">Trace: ${data.trace_id}</div>` : ""}
@@ -794,6 +801,7 @@ function renderBudgetPanel(data) {
   const rows = [];
   if (outT != null) rows.push(`<div class="kv"><b>实时输出 Token（遥测）</b>：${fmtTokens(outT)}</div>`);
   if (spent != null) rows.push(`<div class="kv"><b>累计用量 Token（遥测）</b>：${fmtTokens(spent)}</div>`);
+  if (data.cost_rmb != null) rows.push(`<div class="kv"><b>预估费用（遥测，¥）</b>：≈ ¥${data.cost_rmb.toFixed(4)}</div>`);
   // 公平性治理各层状态（替代旧「输出上限 / 可支撑轮数 / 校准因子」约束视图）
   if (data.fairness && data.fairness.layers) {
     data.fairness.layers.forEach(l => {

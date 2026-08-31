@@ -58,6 +58,13 @@ def _float(name: str, default: float) -> float:
 
 
 class Settings:
+    # ---- 费用估算（P1-6，人民币 ¥）----
+    # 按「每百万 token 单价」估算整场讨论费用，输入/输出分开计价。
+    # 默认参考 DeepSeek-chat 官方定价（输入 ¥2/百万、输出 ¥8/百万），
+    # 若使用 MiMo / Qwen 等可按实际供应商价格在 .env 覆盖（COST_INPUT_PER_1M / COST_OUTPUT_PER_1M）。
+    COST_INPUT_PER_1M = _float("COST_INPUT_PER_1M", 2.0)
+    COST_OUTPUT_PER_1M = _float("COST_OUTPUT_PER_1M", 8.0)
+
     # ---- LLM 默认配置 (来自 .env，所有 agent 的兜底模型；当前默认 MiMo) ----
     LLM_MODEL_ID = _get("LLM_MODEL_ID", "mimo-v2.5")
     LLM_API_KEY = _get("LLM_API_KEY", "")

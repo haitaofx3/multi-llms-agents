@@ -88,6 +88,19 @@ def _shorten(text, limit=120):
     return text[:limit] + "…"
 
 
+def _estimate_cost_rmb(total_tokens, output_tokens):
+    """按配置单价估算整场讨论费用（人民币 ¥）。
+
+    输入 token = 累计用量 - 输出 token；输入/输出分别按每百万单价计价。
+    仅用于展示估算，不参与任何约束（与预算系统移除后的只读遥测一致）。
+    """
+    total = max(0, int(total_tokens or 0))
+    output = max(0, int(output_tokens or 0))
+    input_t = max(0, total - output)
+    return (input_t / 1e6 * settings.COST_INPUT_PER_1M
+            + output / 1e6 * settings.COST_OUTPUT_PER_1M)
+
+
 # P0-1 结构化结论：最终报告固定四段式模板（主持人 LLM 必须保留每个一级标题）
 CONCLUSION_TEMPLATE = (
     "## 核心结论\n"
@@ -642,6 +655,7 @@ class Orchestrator:
                 "text": content,
                 "tokens": token_cost,          # 本次发言累计 token 用量（实时显示）
                 "output_tokens": self.output_tokens,  # 全局累计输出 token（实时显示）
+                "cost_rmb": _estimate_cost_rmb(self.spent, self.output_tokens),  # P1-6 预估费用（¥）
             })
             if content:
                 self.transcript.append({
@@ -1464,6 +1478,7 @@ class Orchestrator:
             # 只读遥测：token 用量不再做任何约束，仅保留观测（实时显示）
             "spent_tokens": self.spent,            # 累计 token 用量（输入+输出）
             "output_tokens": self.output_tokens,   # 累计输出 token（实时）
+            "cost_rmb": _estimate_cost_rmb(self.spent, self.output_tokens),  # P1-6 预估费用（¥）
             # 收敛检测（P0-3）：模式与连续相似轮数
             "convergence_mode": self.convergence_mode,
             "convergence_streak": self.convergence_streak,
@@ -1661,6 +1676,7 @@ class Orchestrator:
         lines.append(f"- 历史压缩次数：{self.run_stats.get('compressions', 0)}")
         lines.append(f"- Token 用量（只读遥测）：累计 {self.spent} / 输出 {self.output_tokens}"
                      f"（不再作为约束）")
+        lines.append(f"- 预估费用（P1-6）：≈ ¥{_estimate_cost_rmb(self.spent, self.output_tokens):.4f}")
         # 公平性治理报告（替代旧的预算规划摘要）
         fair = self.governor.report()
         lines.append(f"- 公平性治理：{'全部通过' if fair['ok'] else '存在违约'}"
