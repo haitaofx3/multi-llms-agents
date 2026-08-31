@@ -158,12 +158,15 @@ class ThinkFilter:
     def __init__(self):
         self._buf = ""
         self._in_think = False
+        self._raw_chars = 0
+        self._think_chars = 0
 
     def feed(self, delta: str) -> str:
         """输入一段增量文本，返回可以安全展示的部分（思考片段已剥离）。"""
         if not delta:
             return ""
         self._buf += delta
+        self._raw_chars += len(delta)
         out = ""
         while self._buf:
             if self._in_think:
@@ -172,8 +175,12 @@ class ThinkFilter:
                     # 只保留可能包含 `</think>` 起点的尾部，等待跨 chunk 闭合
                     if len(self._buf) <= self._MAX_KEEP:
                         break  # 已是最小缓冲，等下一个 chunk
+                    dropped = len(self._buf) - self._MAX_KEEP
+                    self._think_chars += dropped  # 被裁剪掉的部分均属思考内容
                     self._buf = self._buf[-self._MAX_KEEP:]
                     continue
+                # 从缓冲起点到 `</think>` 结束全部属于思考内容（含标签本身）
+                self._think_chars += idx + len(self._CLOSE)
                 self._buf = self._buf[idx + len(self._CLOSE):]
                 self._in_think = False
                 continue
@@ -197,16 +204,28 @@ class ThinkFilter:
                 continue
             out += self._buf[:idx]
             self._buf = self._buf[idx + len(self._OPEN):]
+            self._think_chars += len(self._OPEN)  # `<think>` 标签计入思考内容
             self._in_think = True
         return out
 
     def flush(self) -> str:
         """流结束后调用，返回尚未放行的残留文本（思考中则丢弃）。"""
-        return "" if self._in_think else self._buf
+        if self._in_think:
+            self._think_chars += len(self._buf)  # 未闭合的思考残留一并计入
+            return ""
+        return self._buf
+
+    def stats(self) -> dict:
+        """统计原始字符数 / 思考字符数（供公平性 L2 有效回答比例测量）。"""
+        return {
+            "raw_chars": self._raw_chars,
+            "think_chars": self._think_chars,
+            "visible_chars": max(0, self._raw_chars - self._think_chars),
+        }
 
 
 def chat_stream(messages, model_config: dict, tools=None, tool_choice="auto",
-                temperature=0.7, max_tokens=None):
+                temperature=0.7, max_tokens=None, top_p=None):
     """
     流式调用 chat completion（生成器）。
 
@@ -216,6 +235,7 @@ def chat_stream(messages, model_config: dict, tools=None, tool_choice="auto",
       {"type": "final", "result": {...}}           流结束，携带完整结果
 
     完整结果结构与 `chat()` 一致：{content, tool_calls, assistant_message}。
+    result 额外附带 think_chars / raw_chars（思考字符统计，供公平性 L2 测量）。
     """
     client = _client(model_config)
     kwargs = {
@@ -226,6 +246,8 @@ def chat_stream(messages, model_config: dict, tools=None, tool_choice="auto",
     }
     if max_tokens:
         kwargs["max_tokens"] = max_tokens
+    if top_p is not None:
+        kwargs["top_p"] = top_p
     if tools:
         kwargs["tools"] = tools
         kwargs["tool_choice"] = tool_choice
@@ -272,6 +294,8 @@ def chat_stream(messages, model_config: dict, tools=None, tool_choice="auto",
         content_parts.append(tail)
         yield {"type": "content", "delta": tail}
 
+    stats = filter_.stats()
+
     # 组装完整结果（与非流式 chat() 返回结构一致）
     content = "".join(content_parts).strip()
     tool_calls = []
@@ -301,11 +325,13 @@ def chat_stream(messages, model_config: dict, tools=None, tool_choice="auto",
         "tool_calls": tool_calls,
         "assistant_message": assistant_message,
         "usage": usage,
+        "think_chars": stats["think_chars"],
+        "raw_chars": stats["raw_chars"],
     }}
 
 
 def chat(messages, model_config: dict, tools=None, tool_choice="auto", temperature=0.7,
-         max_tokens=None):
+         max_tokens=None, top_p=None):
     """
     调用 chat completion。
 
@@ -318,6 +344,8 @@ def chat(messages, model_config: dict, tools=None, tool_choice="auto", temperatu
         ],
         "raw": 原始 message 对象
       }
+
+    另附 think_chars / raw_chars（思考字符统计，供公平性 L2 测量）。
     """
     client = _client(model_config)
     kwargs = {
@@ -327,6 +355,8 @@ def chat(messages, model_config: dict, tools=None, tool_choice="auto", temperatu
     }
     if max_tokens:
         kwargs["max_tokens"] = max_tokens
+    if top_p is not None:
+        kwargs["top_p"] = top_p
     if tools:
         kwargs["tools"] = tools
         kwargs["tool_choice"] = tool_choice
@@ -334,7 +364,10 @@ def chat(messages, model_config: dict, tools=None, tool_choice="auto", temperatu
     resp = client.chat.completions.create(**kwargs)
     msg = resp.choices[0].message
 
-    content = _strip_think(msg.content or "")
+    raw = msg.content or ""
+    think_chars = sum(len(m.group(0)) for m in
+                      re.finditer(r"<think>.*?</think>", raw, flags=re.DOTALL))
+    content = _strip_think(raw)
     tool_calls = []
     assistant_tool_calls = None
     if getattr(msg, "tool_calls", None):
@@ -359,7 +392,8 @@ def chat(messages, model_config: dict, tools=None, tool_choice="auto", temperatu
     usage = _usage_from_response(resp) or _estimate_usage(messages, content)
 
     return {"content": content, "tool_calls": tool_calls,
-            "assistant_message": assistant_message, "usage": usage}
+            "assistant_message": assistant_message, "usage": usage,
+            "think_chars": think_chars, "raw_chars": len(raw)}
 
 
 def _fallback_truncate(text: str, max_chars: int) -> str:

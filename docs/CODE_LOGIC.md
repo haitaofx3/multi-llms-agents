@@ -1,7 +1,7 @@
 # 多 Agent 圆桌辩论系统 — 代码逻辑文档
 
 > 本文档系统梳理当前项目的全部代码逻辑，按"模块职责 → 关键函数 → 数据流"组织，便于理解与二次开发。
-> 内容对齐《多Agent辩论系统架构设计文档》（Supervisor 编排 + 立场辩手 + Judge 裁决 + RAG 核查 + Token 预算 + 收敛检测 + 状态机 + 协议层）与当前实现。
+> 内容对齐《多Agent辩论系统架构设计文档》（Supervisor 编排 + 立场辩手 + Judge 裁决 + RAG 核查 + 公平性治理 + 收敛检测 + 状态机 + 协议层）与当前实现。
 
 ---
 
@@ -10,8 +10,8 @@
 一个支持多个 LLM Agent 围绕"圆桌"进行**辩论式多轮协作讨论**的 Web 应用。核心特征：
 
 - 每个 Agent 拥有**独立的基础模型**（Qwen / DeepSeek / MiMo / 自定义，默认取 `.env` 的 `LLM_*`，当前为 MiMo）、**立场**（主持人 HOST / 正方 PRO / 反方 CON / 中立 NEUTRAL）、**记忆系统**（短期 / 长期 / 情境 + 遗忘）、**MCP 工具集**（知识检索 / 联网搜索 / 记忆回忆）。
-- 首个 Agent 为**辩论主持人（Supervisor 视角）**：分派任务、逐轮追问、最终汇总；辩论结束后由**裁判（Judge）**单次裁决，并按「内容分 × 0.8 + 模型质量分 × 0.2」输出**综合评分**（`composite_scores`）推导胜方。
-- 辩论流程：第 1 轮**并行立论**（`asyncio.gather`），后续轮次**串行反驳/辩护**；达到终止条件（最大轮次 / Token 预算熔断 / 语义收敛 / 手动结束）后进入裁决与汇总。
+- 首个 Agent 为**辩论主持人（Supervisor 视角）**：分派任务、逐轮追问、最终汇总；辩论结束后由**裁判（Judge）**单次裁决，按内容四维（logic / evidence / rebuttal / clarity）对**每位辩手**独立评分，**胜方由内容四维均分决定（纯内容判定）**；系统实测的模型质量分（TTFT / 生成速率）与内容分合成综合评分（`composite_scores`）**仅作展示、不参与胜负**。
+- 辩论流程：第 1 轮**并行立论**（`asyncio.gather`），后续轮次**串行反驳/辩护**；达到终止条件（最大轮次 / 语义收敛 / 手动结束）后进入裁决与汇总。全局 Token 预算已移除，改为 **FairnessGovernor L1–L6** 公平性治理（以字符数 + 相对比例为度量），token 用量仅作只读遥测。
 - 提供**简约大气**的圆桌 UI（席位按数量等分）、**聊天气泡式发言**（并发流式按 speaker 独立气泡）、**首字母文字头像**（按立场配色）、暂停 / 继续 / 结束、Markdown 结果导出。
 - **历史记忆化检索**：每场讨论完成或保存时，题目 + 元信息自动写入 `data/discussions/index.json`，前端历史面板支持关键词搜索与一键查看 / 下载。
 - **可观测性**：每次讨论生成 `trace_id`，贯穿事件流、状态同步与导出的 Markdown。
@@ -28,7 +28,7 @@ mini_test/
 ├── pyproject.toml        工程化配置（ruff / mypy / coverage）
 ├── .env                  环境变量配置（不提交到版本库）
 ├── app/                  核心应用包
-│   ├── config.py         环境变量与配置（Settings 单例、Token 预算/收敛/重试参数）
+│   ├── config.py         环境变量与配置（Settings 单例、公平性/收敛/重试参数）
 │   ├── protocol.py       消息协议（TaskDispatch / ArgumentSubmit / Rebuttal / Judgment / StatusSync / EvidenceItem，pydantic 模型 + trace_id/uuid/毫秒时间戳）
 │   ├── schemas.py        REST 请求体 pydantic 模型（ConfigureRequest / StartRequest / IngestRequest / SaveMarkdownRequest）
 │   ├── llm.py            LLM 统一接入（OpenAI 兼容 + function calling + 流式 + usage 统计 + ThinkFilter）
@@ -38,7 +38,8 @@ mini_test/
 │   ├── tools.py          每个 Agent 的 MCP 工具注册表 + 内置工具
 │   ├── rag.py            独立 RAG 事实核查服务（断言提取 / 带置信度检索 / 24h 缓存）
 │   ├── agent.py          Agent 定义（角色/性格/立场/模型/记忆/MCP/上下文构建）
-│   ├── orchestrator.py   编排器（Supervisor：状态机、并行立论、收敛/预算终止、Judge、任务分派/回报）
+│   ├── fairness.py       公平性治理（FairnessGovernor L1–L6：输出上限/有效比例/输入对称/轮次对称/采样对齐/长度中性）
+│   ├── orchestrator.py   编排器（Supervisor：状态机、并行立论、收敛终止、Judge、任务分派/回报）
 │   ├── history.py        历史讨论记忆索引（data/discussions/index.json + 检索 + Markdown 读取，防路径穿越）
 │   ├── file_parser.py    上传文件文本提取（txt/md/docx/xlsx/pdf/图片 OCR，懒加载依赖 + 大小/字符上限）
 │   ├── main.py           FastAPI 应用（REST + WebSocket + 静态服务，lifespan 自动落盘 + 重试）
@@ -47,8 +48,8 @@ mini_test/
 │       ├── style.css     设计变量 / 圆桌席位 / 聊天气泡 / 首字母头像 / 历史面板
 │       └── app.js        前端逻辑（配置、席位等分、WebSocket 事件、并发流式气泡、历史检索）
 ├── tests/
-│   ├── test_e2e.py       端到端集成测试（需先启动服务器；校验状态机/预算/裁判/流式）
-│   ├── test_ci_fast.py   快速单元测试（状态机/预算/裁决，无需服务器）
+│   ├── test_e2e.py       端到端集成测试（需先启动服务器；校验状态机/公平性/裁判/流式）
+│   ├── test_ci_fast.py   快速单元测试（状态机/公平性/裁决，无需服务器）
 │   └── test_api_flow.py  HTTP 接口级测试（ASGITransport + LLM 打桩，无需服务器/真实模型）
 ├── docs/
 │   └── CODE_LOGIC.md     本文档
@@ -101,11 +102,11 @@ HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 python start.py
 | Qdrant | `QDRANT_URL`、`QDRANT_API_KEY`、`QDRANT_COLLECTION`、`QDRANT_VECTOR_SIZE`、`QDRANT_TIMEOUT`（短超时快速失败）等 |
 | 嵌入 | `EMBED_MODEL_TYPE`、`EMBED_MODEL_NAME`、`EMBED_API_KEY` |
 | Neo4j | `NEO4J_*`（保留，当前未在核心链路使用） |
-| **Token 预算** | `TOKEN_BUDGET`（默认 100000）、`MIN_TOKEN_THRESHOLD`（默认 1000） |
+| **公平性治理** | `FAIR_OUTPUT_RATIO`（相对上限比例，默认 1.5）、`FAIR_HARD_CHAR_CEILING`（单次发言硬性字符上限，默认 3000）、`FAIR_FLOOR_CHAR_LIMIT`（相对基准下限，默认 400）、`FAIR_OPENING_CHAR_LIMIT`（立论上限，默认 1200）、`FAIR_REFERENCE_ROUNDS`（参照对手最近 N 轮，默认 2）、`FAIR_THINK_RATIO_MAX`（思考占比上限，默认 0.5）、`FAIR_MAX_SEEN_DIFF`（可见对手轮数最大差值，默认 1）、`FAIR_TEMPERATURE`/`FAIR_TOP_P`（辩论采样参数，默认 0.7/1.0）、`FAIR_JUDGE_TEMPERATURE`/`FAIR_JUDGE_TOP_P`（辅助采样参数，默认 0.3/1.0） |
 | **收敛检测** | `CONVERGENCE_SIMILARITY`（默认 0.85）、`CONVERGENCE_ROUNDS`（默认 2） |
 | **LLM 重试** | `LLM_RETRY_ATTEMPTS`（默认 3）、`LLM_RETRY_DELAYS`（(1.0, 3.0)） |
 | **流式超时** | `STREAM_TIMEOUT`（默认 300s，对齐 `LLM_TIMEOUT`） |
-| **辩论对手/输出约束** | `OPPONENT_SNIPPET_MAX_CHARS`（第 2 轮对手发言原文截断上限，默认 500 字）、`OPPONENT_SUMMARY_MAX_CHARS`（第 3 轮起对手发言 LLM 摘要上限，默认 200 字）、`OUTPUT_CHAR_PER_TOKEN`（每 token 换算字数，中文约 2 字/token，默认 2）、`BUDGET_KEEP_LAST_ROUNDS`（预算吃紧强压缩时保留的最近轮次，默认 2） |
+| **辩论对手/输出约束** | `OPPONENT_SNIPPET_MAX_CHARS`（第 2 轮对手发言原文截断上限，默认 500 字）、`OPPONENT_SUMMARY_MAX_CHARS`（第 3 轮起对手发言 LLM 摘要上限，默认 200 字）；输出长度约束走公平性 L1 字符上限（见上） |
 | **记忆压缩** | `MEMORY_SUMMARY_MAX_CHARS`（短期 → 情境的 LLM 聚合摘要上限，默认 200 字） |
 
 > `PROJECT_ROOT = Path(__file__).resolve().parent.parent`（`app/` 的上一级）供其余模块定位项目根目录与资源目录。
@@ -150,7 +151,7 @@ HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 python start.py
 
 ### 5.5 摘要工具 `summarize_text(model_config, text, max_chars)`
 共享的 LLM 压缩工具，供**对手发言摘要**与**历史强压缩**复用：
-- `asyncio.to_thread` 调用同步 `chat()`，要求输出 ≤ `max_chars` 字的浓缩摘要，返回 `(summary, usage|None)`。
+- `asyncio.to_thread` 调用同步 `chat()`，要求输出 ≤ `max_chars` 字的浓缩摘要，返回 `(summary, usage|None)`（usage 由编排器计入**只读遥测** `spent`）。
 - 调用失败 / 返回为空 / 超长时回退 `_fallback_truncate(text, max_chars)`：确定性保留**头部 + 尾部**片段（以 `…` 相连），保证绝不超过 `max_chars`、不因摘要失败抛异常。
 - 短文本（≤ max_chars）原样返回，不做无谓调用。
 
@@ -193,7 +194,7 @@ HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 python start.py
 ### 7.2 转化（互相转化）
 - `_promote_or_drop_short()`：短期溢出时，最不重要者移除，重要者（`≥promote_importance*0.6`）提升为长期。
 - `promote_short_to_long(min_importance=0.75)`：**短期 → 长期** 的显式提升。
-- `summarize_short_to_context(summarizer=None)`：**短期 → 情境** 的压缩（`async`；支持同步/异步 `summarizer(texts)->str`，失败回退拼接），压缩后清空短期缓冲。编排器在记忆管家（§12.6 第 4 步）偶数轮传入 LLM 摘要器（`summarize_text` + `MEMORY_SUMMARY_MAX_CHARS`），摘要 usage 计入预算。
+- `summarize_short_to_context(summarizer=None)`：**短期 → 情境** 的压缩（`async`；支持同步/异步 `summarizer(texts)->str`，失败回退拼接），压缩后清空短期缓冲。编排器在记忆管家（§12.6 第 4 步）偶数轮传入 LLM 摘要器（`summarize_text` + `MEMORY_SUMMARY_MAX_CHARS`），摘要 usage 计入只读遥测。
 - 长期 ⇄ 情境：检索时合并长期事实与情境摘要，互相补充。
 
 ### 7.3 遗忘体系（每 Agent 可独立配置 `forget_config`）
@@ -237,11 +238,11 @@ HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 python start.py
 
 | 模型 | 对应消息 | 关键字段 |
 | --- | --- | --- |
-| `TaskDispatch` | 任务分发（Supervisor → 辩手） | `task_id`(UUID)、`topic`、`stance`、`round`、`budget_token`、`timestamp`(Unix 毫秒) |
+| `TaskDispatch` | 任务分发（Supervisor → 辩手） | `task_id`(UUID)、`topic`、`stance`、`round`、`budget_token`(协议保留字段，仅审计/遥测)、`timestamp`(Unix 毫秒) |
 | `ArgumentSubmit` | 论点提交（辩手 → Supervisor） | `arg_id`、`agent_id`、`content`、`evidence_refs`、`confidence`、`round`、`token_cost` |
 | `Rebuttal` | 反驳消息 | `target_arg_id`、`rebuttal_content`、`logic_flaws`、`counter_evidence` |
-| `Judgment` | 裁决消息（Judge → Supervisor） | `scores`(logic/evidence/rebuttal/clarity)、`agent_scores`(按辩手)、`model_performance`(TTFT/速率/质量分)、`composite_scores`(综合评分)、`winner`(PRO/CON/DRAW)、`critique`、`convergence_flag` |
-| `StatusSync` | 状态同步（心跳/轮次广播） | `trace_id`、`phase`(idle/preparing/debating/judging/finished)、`current_round`、`agent_states`、`remaining_budget`、`spent_budget`、`elapsed_time_ms` |
+| `Judgment` | 裁决消息（Judge → Supervisor） | `scores`(后端逐维均值，确定性计算)、`agent_scores`(按辩手)、`model_performance`(TTFT/速率/质量分)、`composite_scores`(综合评分，仅展示)、`winner`(PRO/CON/DRAW，纯内容判定)、`critique`、`convergence_flag` |
+| `StatusSync` | 状态同步（心跳/轮次广播） | `trace_id`、`phase`(idle/preparing/debating/judging/finished)、`current_round`、`agent_states`、`spent_tokens`(只读遥测)、`output_tokens`(只读遥测)、`fairness`(治理报告)、`elapsed_time_ms` |
 | `EvidenceItem` | RAG 证据片段 | `evidence_id`、`source`、`content`、`confidence`、`url` |
 
 辅助函数：`new_trace_id()`（12 位十六进制）、`new_uuid()`、`now_ms()`。
@@ -280,11 +281,11 @@ Agent(agent_id, name, role, personality, model_config, is_main, forget_config, s
    - 协作 Agent（task 模式）：只通过 `report_result` 返回**最终结果 + 是否完成**；
    - 协作 Agent（discussion 模式）：针对他人观点辩护/反驳，可调用 `knowledge_search` 检索论据。
 
-### 10.2 历史轮次标记与按轮强压缩（辩论机制）
+### 10.2 历史轮次标记与按轮强压缩（长对话管理）
 `history` 的**平行列表** `history_rounds`：每条历史消息记录所属辩论轮次（`append_history(role, content, round_no)`，缺省取当前最大轮次）。
 
 - **三处裁剪必须同步**：① 条数上限（`max_history` 滚动窗口）；② 字符硬上限（`CONTEXT_MAX_CHARS`，超限丢最旧轮次）；③ 压缩截断。三处均同时裁剪 `history` 与 `history_rounds`，否则「按轮保留」会错位。
-- `compress_history(force, keep_rounds=None)`：`keep_rounds=None` 走优化 A9 原逻辑（保留最近 `CONTEXT_COMPRESS_KEEP_RECENT` 条）；`keep_rounds=N` 委托 `_compress_keep_rounds(N)`（需求 6）。
+- `compress_history(force, keep_rounds=None)`：`keep_rounds=None` 走优化 A9 原逻辑（保留最近 `CONTEXT_COMPRESS_KEEP_RECENT` 条，`CONTEXT_COMPRESS_THRESHOLD` 触发，由 `_memory_housekeeping` 每轮边界调用）；`keep_rounds=N` 委托 `_compress_keep_rounds(N)`（按轮强压缩，能力保留，不再由预算触发）。
 - `_compress_keep_rounds(keep_rounds)`：**从尾部扫描最近 N 个不同轮次**的起始下标 `cut`，`history[:cut]` 全部经 `_summarize`（`summarize_text`，失败回退确定性截断）压入 `compressed_summary`（与既有摘要拼接），保留 `history[cut:]` 原文；不同轮次数 ≤ N 时无需压缩返回 `None`。
 - `reset_history()` 同时清空 `history_rounds`。
 
@@ -324,7 +325,7 @@ Agent(agent_id, name, role, personality, model_config, is_main, forget_config, s
 - `Orchestrator` 单例 `orchestrator`，关键状态：
   - `agents / main / collaborators`、`shared_context`、`tasks`、`round / max_rounds`、`topic`；
   - `status`（idle/running/paused/done/stopped，UI 状态）与 `phase`（idle/preparing/debating/judging/finished，**架构状态机**）；
-  - `trace_id`、`budget / spent`（Token 预算）、`convergence_streak`、`round_arguments / latest_arguments / round_evidence`、`judgment`、`_pause_event`。
+  - `trace_id`、`spent / output_tokens`（token 用量，**只读遥测**，不再做约束）、`governor`（FairnessGovernor 公平性治理器，每场全新）、`convergence_streak`、`round_arguments / latest_arguments / round_evidence`、`judgment`、`_pause_event`。
 
 ### 12.2 配置 `configure()`
 - 校验 status 非 running；重置全部状态并生成新 `trace_id`。
@@ -341,10 +342,10 @@ Agent(agent_id, name, role, personality, model_config, is_main, forget_config, s
 3. **流式**：`_consume_stream()` 在后台线程运行 `chat_stream`，通过 `asyncio.Queue` + `loop.call_soon_threadsafe` 把增量桥接回事件循环；整体受 `settings.STREAM_TIMEOUT` 约束；流式异常时**回退非流式重试调用**；
 4. **性能实测**：流式结果携带 `metrics = {ttft_s, gen_s, chars}`（在 `_consume_stream` 的 `_drain` 内实测首 token 延迟与生成耗时），回合末尾按辩手聚合进 `agent_metrics`（calls / ttft_sum / gen_sum / chars），供裁判**模型质量评分**使用；**非流式回退不计入**；
 5. **非流式**：`_run_llm_retry()` 对 429/5xx/超时做指数退避重试（`LLM_RETRY_DELAYS` = 1s、3s）；
-6. 每次调用 `_apply_usage(result)` 累加 `spent`；
+6. 每次调用 `_apply_usage(result)` 累加 `spent` / `output_tokens`（只读遥测）；
 7. 收到首个文本增量即推送 `speech_start`，随后逐个 `speech_delta`；
 8. 工具调用循环：主 Agent `delegate_task` → 收集 `delegate`；协作 Agent `report_result` → 收集 `report`；普通工具 → `mcp.call` 并把 tool 消息回传，继续循环；
-9. **输出字数约束（需求 5）**：`mode=="discussion"` 时按 `limit = max(1, int(effective_max_tokens × OUTPUT_CHAR_PER_TOKEN))` 截断超长发言（`content[:limit].rstrip()`，事件 `debate.output_truncate`）——提示词字数要求失效时仍受硬截断兜底；
+9. **输出字数约束（需求 5，公平性 L1）**：`mode=="discussion"` 时按 `ceiling = self.governor.ceiling_for(stance, round, 对手近N轮有效输出均值)` 得到字符上限（立论/无参照用 `opening_char_limit`），超限保留头尾截断（`truncate_output`，事件 `fairness.output_truncate`）——提示词字数要求失效时仍受事后硬截断兜底；不再把 `max_tokens` 下发给 API；
 10. 回合结束若发生过流式发言，补发 `speech_end`（携带完整文本）并写入 transcript；
 11. 把 user/assistant 写入 `history`（带 `round_no=self.round`，与 `history_rounds` 平行），返回 `{content, delegate, report, streamed, token_cost}`。
 
@@ -362,47 +363,37 @@ phase = preparing → status = running（发布 status 事件 + StatusSync）
 while round < max_rounds:
     等待暂停/结束信号; 若 stopped 退出
     round += 1; phase = debating; 发布 round 事件 + StatusSync
-    # 0) 预算规划：_plan_for_round(剩余轮数) 计算本轮生效的 effective_max_tokens（降级阶梯）
-    #    降级阶梯：① 降低输出上限 E → ② 强制压缩全部历史 → ③ 允许小幅超支跑完，绝不中断
-    #    本轮真实 LLM 调用计数 _round_real_calls 清零（自适应 N 校准用）
+    # 0) 公平性治理：发布 governor.report()（L1-L6 各层状态）作为日志（替代旧的预算规划）
     # 1) 主持人回合（分派 / 追问）→ _create_task + task_assigned 事件
     # 2) 协作 Agent 回合：
     #    第 1 轮 → asyncio.gather 并行立论（架构文档 §4.2/§6.2）
     #    后续轮 → 串行反驳/辩护（_prepare_opponent_context 注入对手上轮发言：
     #              第 2 轮原文截断 / 第 3 轮起 LLM 摘要）
     # 3) RAG 事实核查（_rag_check_round，异步注入下一轮上下文）
-    # 4) 记忆管家（_memory_housekeeping：提升/压缩/遗忘）
+    # 4) 记忆管家（_memory_housekeeping：提升/压缩/遗忘；调用 compress_history 按轮强压缩）
     # 5) 收敛检测（_check_convergence）→ 连续 N 轮相似且无新证据则 break
-    # 5.5) 自适应 N 校准：_update_call_factor(本轮实测调用数) EMA 更新工具调用乘数因子
-    # 6) 预算熔断（最后防线，remaining < MIN_TOKEN_THRESHOLD）→ break
-    # 7) 达到最大轮次 → break
+    # 6) 达到最大轮次 → break（公平性治理下无预算熔断；轮次对称性由 L4 保证）
 # Judging：phase = judging；单次调用 Judge（_judge_round）
-#   规划器已预留裁判/汇总输出预算；E 降至下限或调用失败时回退确定性 Judgment（DRAW + 说明）
-# Finished：phase = finished；主持人汇总（_final_summary；预算不足走 _fallback_summary）
+#   调用失败或无辩手可评时回退确定性 Judgment（DRAW + 说明，score 后端按内容均分计算）
+# Finished：phase = finished；主持人汇总（_final_summary，一律用 LLM；_fallback_summary 作系统兜底）
 #   status = done；发布 status + StatusSync
 # 异常熔断：status = stopped，phase = idle
 ```
 
 **并行立论**（架构文档 §6.2）：第 1 轮协作 Agent 无相互依赖，用 `asyncio.gather(..., return_exceptions=True)` 并发立论；流式事件带 `speaker`，前端按 speaker 独立气泡，天然支持并发流式。
 
-### 12.7 预算规划与降级（budget planner）
-每轮开始前用纯数学规划求解本轮生效的输出上限 E = `effective_max_tokens`，目标是「剩余轮次 + 裁判 + 汇总」的总成本落在预算内；任何情况下不因预算中断辩论。数学核心独立在 `app/budget.py`（无外部依赖，可单测）。
+### 12.7 公平性治理 `FairnessGovernor`（`app/fairness.py`，替代旧 budget planner）
 
-- **规划函数 `_compute_plan(phase, remaining_rounds)`**（无副作用）：`E ≤ (usable − base − prompt_cost(R)) / (R·N + R·S + 2)`，其中
-  - `usable = remaining × (1 − safety_margin)`（`BUDGET_SAFETY_MARGIN`，默认 8%，只压低 E，不参与超支判定）；
-  - `base` = 裁判/汇总提示词尾段保底，`_tail_base_tokens()` = `max(BUDGET_TAIL_RESERVE, judge_prompt + summary_prompt + JUDGE_MIN_OUTPUT + SUMMARY_MIN_OUTPUT)`（输出保底计入尾段，避免裁决/汇总被截断）；
-  - `R` = 剩余轮次；`P` = 每轮提示词 token 估算（见下）；`N` = 每轮 LLM 调用次数（含工具循环）；`S` = 辩手数（裁判记录随轮次增长）；`2E` = 裁判输出 + 汇总输出；
-  - **历史增长模型**：`prompt_cost(R) = R·P + g·P·R·(R−1)/2`（算术级数）——后续轮次历史变长、输入递增，不再按常数 R·P 低估；
-  - 同时计算 `overshoot`（即便用下限输出仍超支）、`projected_total`、`feasible_rounds`、`degraded`。
-- **降级阶梯**（`_plan_for_round`）：① 优先降 `effective_max_tokens` 上限（不低于阶段输出保底，见下）；② 仍超支则 `_force_compress_all()` 强制压缩全部 Agent 历史后重新规划（**需求 6：按轮强压缩，只保留最近 `BUDGET_KEEP_LAST_ROUNDS` 轮原文，更早轮次压入 `compressed_summary`**）；③ 仍不足且 `BUDGET_AUTO_TRIM_ROUNDS=1` 时**自动削减轮次**（`feasible_rounds` 反解最大可行轮次，`max_rounds` 裁剪到该值，本轮跑完即进裁决，事件 `budget.round_trim`）；④ 仍不足则允许小幅超支跑完（`budget.overshoot`），**辩论绝不中断**。预算熔断 `budget.circuit_break` 仅作最后防线（剩余 < `MIN_TOKEN_THRESHOLD`）。
-- **阶段输出保底**：裁判/汇总的 `effective_max_tokens` 不低于 `JUDGE_MIN_OUTPUT` / `SUMMARY_MIN_OUTPUT`（默认 512）——当反解 E 低于保底时提升到保底并记 `budget.phase_min_output`（即使超支也保证裁决 JSON 完整，避免空 JSON 确定性回退）。
-- **每轮 N 次调用建模**：`_calls_per_round()` = `ceil((1+C)×BUDGET_TOOL_OVERHEAD)`（C=协作辩手数，默认乘数 1.5，即同一辩手可能多次工具调用）；`_estimate_round_prompt_tokens()` 按 N 次调用折算每轮提示词成本（而非每位辩手一次）。**第 3 轮起**每轮为每个 PRO/CON 辩手额外计入对手发言摘要的输入成本（`OPPONENT_SUMMARY_MAX_CHARS // 2 + 200` token），摘要本身由预算记账（`self.spent`）但规划时已折算。
-- **自适应校准（三路 EMA，只放大"尚未发生的预测"，已发生费用永远按真实 usage 记账）**：
-  - `_est_factor`（提示词尺寸偏差）：每次真实 LLM 调用后，用 `实测 total_tokens / 启发式估算` 的比值 EMA 更新（α=0.2，钳制 [0.5, 10]），作用于提示词估算。真实冒烟中首轮样例会达 2.68×，收敛后稳定在 ~1.3×。
-  - `_call_factor`（工具调用次数偏差）：每轮结束用 `本轮实测 LLM 调用次数 / 基数 ceil((1+C)×1.5)` 的比值 EMA 更新（α=0.2，钳制 [0.5, 5]），作用于 `_calls_per_round()`。真实冒烟实测每轮真实调用约为基数的 1.2–3.2×。
-  - `_growth_ratio`（每轮历史增长比 g，新增）：每轮结束用 `本轮实测提示词 / 上轮实测提示词 − 1` 的环比 EMA 更新（α=0.2，负增长钳为 0，钳制 [0.05, 2.0]，跳过首轮样本），作用于 `prompt_cost(R)` 的 g。
-  - **档案持久化**：三因子在正常结束时写入 `data/budget_profile.json`（`_save_profile`，IO 失败仅警告），启动时 `_load_profile()` 载入；无档案时用保守先验 `EST_FACTOR_INIT=2.0`（历史乐观档案的 est_factor 钳制 ≥1.0）。不再每轮重置为 1.0——首轮规划即基于历史校准，而非盲目乐观的 1.0。
-- **观测**：`_status_sync` 暴露 `feasible_rounds / projected_total / budget_overshoot / budget_degraded / est_factor / call_factor / growth_ratio / prompt_forecast / safety_margin`；降级事件以 `budget.force_compress`（日志如实报告"实际压缩 X 个 / 历史过短跳过 Y 个"，短历史压缩为空转）、`budget.round_trim`、`budget.overshoot`、`budget.circuit_break` 记录。
+旧的全局 Token 预算系统（`app/budget.py` + 三路自适应校准 + `budget_profile.json` 档案）已整体移除：不再按预算推算每轮 `effective_max_tokens`、不再有预算熔断。`FairnessGovernor` 每场讨论全新实例（`run_discussion` 中创建），以 **L1–L6 六层公平性**替代"成本预算"约束，全程只保证模型间公平、不干预辩论进程：
+
+- **L1 输出字数上限（需求 5）**：`ceiling_for(stance, round, opponent_recent_chars)` 计算相对上限（`对手近N轮有效输出均值 × FAIR_OUTPUT_RATIO` 与硬上限 `FAIR_HARD_CHAR_CEILING` 取 min）；立论/无参照用 `opening_char_limit`。上限仅写入提示词（`_debate_prompt` 的 `【输出要求】`），超限由 `_agent_turn` 事后 `truncate_output` 头尾截断兜底（事件 `fairness.output_truncate`）；**不再把 `max_tokens` 下发给 API**。
+- **L2 有效回答占比**：剥离 `<think>` 推理后统计有效输出占比（`effective_ratio`），低于 `FAIR_THINK_RATIO_MAX` 阈值记告警。
+- **L3 输入对称**：记录各方被注入的上下文规模（`context_chars`），超差 `FAIR_MAX_SEEN_DIFF` 记违约。
+- **L4 轮次对称**：`record_turn` / `record_speech` 保证每模型每轮至多发言一次、发言次数均衡（`speech_counts`）。
+- **L5 采样对齐**：`sampling_params()`（temperature/top_p）统一来自 `FAIR_TEMPERATURE` / `FAIR_TOP_P`；裁判侧 `judge_params()` 用 `FAIR_JUDGE_TEMPERATURE` / `FAIR_JUDGE_TOP_P`——所有模型同一套采样参数，消除随机性差异。
+- **L6 长度中立裁判**：`judge_guidance()` 注入裁判 system prompt，要求"评分只依据内容质量，不受发言长短影响"。
+
+**观测**：`governor.report()` 返回 `{ok, warnings, violations, layers:[{layer, name, status, detail}]}`，经 `_status_sync` 暴露为 `fairness` 字段；export_markdown 亦逐层打印。Token 用量（`spent` / `output_tokens`）仅由 `_apply_usage` 累加为**只读遥测**，不参与任何约束。
 
 ### 12.8 协作 Agent 回合与对手定向反驳（需求 1–5）
 **`_collab_turn(collab)`**：
@@ -411,8 +402,8 @@ while round < max_rounds:
 
 **对手定向（需求 2/3）**：
 - `_find_opponent(collab)`：`OPPONENT_STANCE = {"PRO": "CON", "CON": "PRO"}`（编排器类常量，`ClassVar` 标注）。先在上一轮 `round_arguments[round-1]` 找对立场**最近发言人**（`reversed` 扫描）；上一轮无对立场发言者时回退 `latest_arguments` 全局最近对立场发言者；`NEUTRAL`/`HOST` 无固定对手返回 `None`。
-- `_prepare_opponent_context(collab)`：第 1 轮不准备；**第 2 轮**取对手上轮发言原文截断到 `OPPONENT_SNIPPET_MAX_CHARS` 字；**第 3 轮起**调用 `summarize_text`（`llm.py`）压缩到 `OPPONENT_SUMMARY_MAX_CHARS` 字，按 `(对手名, 轮次)` 缓存进 `_opponent_summary_cache` 防同轮重复调用，usage 计入 `self.spent` **但不计入** `_round_real_calls`（避免污染 N 次调用校准），事件 `debate.opponent_summary`；结果写入 `_opponent_prep`（每轮开始清空，`configure()` 重置）。
-- `_debate_prompt(collab)`：第 1 轮基于角色/性格立论（需求 1，PRO/CON 分立场措辞）；第 2 轮起优先注入 `_opponent_prep`（标注"发言"（第 2 轮原文）/ "摘要"（第 3 轮起））；`NEUTRAL`/无立场对手回退旧 `last_debate_speaker` 逻辑；**全轮**追加 `【输出要求】... {limit} 字以内 ...`（需求 5），`limit = max(1, int(self.effective_max_tokens × settings.OUTPUT_CHAR_PER_TOKEN))`。
+- `_prepare_opponent_context(collab)`：第 1 轮不准备；**第 2 轮**取对手上轮发言原文截断到 `OPPONENT_SNIPPET_MAX_CHARS` 字；**第 3 轮起**调用 `summarize_text`（`llm.py`）压缩到 `OPPONENT_SUMMARY_MAX_CHARS` 字，按 `(对手名, 轮次)` 缓存进 `_opponent_summary_cache` 防同轮重复调用，usage 计入 `self.spent`（只读遥测），事件 `debate.opponent_summary`；结果写入 `_opponent_prep`（每轮开始清空，`configure()` 重置）。
+- `_debate_prompt(collab)`：第 1 轮基于角色/性格立论（需求 1，PRO/CON 分立场措辞）；第 2 轮起优先注入 `_opponent_prep`（标注"发言"（第 2 轮原文）/ "摘要"（第 3 轮起））；`NEUTRAL`/无立场对手回退旧 `last_debate_speaker` 逻辑；**全轮**追加 `【输出要求】... {limit} 字以内 ...`（需求 5），`limit = self.governor.ceiling_for(stance, round, 对手近N轮有效输出均值)`（公平性 L1 相对上限，与硬上限取 min；仅作提示约束，超限由 `_agent_turn` 事后截断兜底，不再把 `max_tokens` 下发 API）。
 
 ### 12.9 任务与变量
 - `_create_task(d)`：**校验 recipient 存在**（P15 修复，非法则忽略并记日志）；生成任务 `{id, task_id(UUID), recipient, content, expected_outcome, var_name, completed, rounds_waiting, timestamp(ms), token_cost}`，并在 `shared_context[var_name]` 登记。
@@ -428,20 +419,23 @@ while round < max_rounds:
 
 ### 12.12 Judge 裁决 `_judge_round()`（架构文档 §2.4）
 - **输入范围**：`_build_judge_debate_text()` 只保留 `type=="speech" and not is_main` 的**辩手发言**（剔除主持人开场 / 任务分派 / 追问 / 总结）。
-- 构建完整辩论历史 + 各方立场，调用裁判（温度 0.3），要求输出 JSON（含 `scores` 与**按辩手**的 `agent_scores`，键必须与辩手名一致）；
+- 构建完整辩论历史 + 各方立场，调用裁判（采样参数来自 `governor.judge_params()`，公平性 L5），要求输出 JSON（**按辩手**的 `agent_scores` + `winner` + `critique` + `convergence_flag`，键必须与辩手名一致）；
+- **few-shot 锚定修复**：`_example_pool` 内置 3 组互不相同的示例分数（如 `{logic:8,evidence:7,rebuttal:9,clarity:8}` / `{7,6,8,7}` / `{9,8,7,8}`），按辩手轮换生成 `agent_scores_example` 仅供格式展示，并显式要求"禁止照抄，不同辩手分数可以（也应当）不同"——根除旧版"全场照抄同一组分数"的锚定问题；
 - `_extract_json` 容忍代码块/前后缀，`Judgment(**data)` 校验；
-- **模型质量分（系统确定性，非 LLM）**：`_model_performance()` 把 `agent_metrics` 聚合为 `{avg_ttft_ms, avg_gen_rate, performance_score}`；`_score_ttft`（≤1s→10 / ≤5s→8 / ≤15s→6 / ≤30s→4 / 否则 2）与 `_score_rate`（≥80字/s→10 / ≥40→8 / ≥20→6 / ≥10→4 / 否则 2）取均值，无实测取中性 5.0；
-- **综合评分**：`_compute_composite()` 按 `内容均分(agent_scores 四维) × JUDGE_CONTENT_WEIGHT + 模型质量分 × JUDGE_PERFORMANCE_WEIGHT`（默认 0.8/0.2）合成 `composite_scores`，`agent_scores` 缺失时退化为模型质量分；**胜方由综合分最高辩手所在 stance 推导**（PRO/CON），两端并列最高取 DRAW；
-- 失败降级为 `Judgment(winner="DRAW", critique="裁判调用失败…")`，同样走 `_compute_composite`。
-- **预算兜底**：规划器已在尾段预算中预留裁判输出；当 `effective_max_tokens` 降到下限 `BUDGET_OUTPUT_FLOOR` 时裁判可能输出为空 → 同样走确定性回退（按已记录发言 + 模型质量分裁决，`critique` 极短）。
+- **全局综合得分 `scores`（后端确定性计算，不再依赖 LLM 输出）**：`_compute_composite()` 按各辩手 `agent_scores` 逐维（logic/evidence/rebuttal/clarity）取均值得到 `scores`——修复"综合得分 == 某辩手得分"的照抄 bug；
+- **模型质量分（系统确定性，非 LLM，仅展示）**：`_model_performance()` 把 `agent_metrics` 聚合为 `{avg_ttft_ms, avg_gen_rate, performance_score}`；`_score_ttft`（≤1s→10 / ≤5s→8 / ≤15s→6 / ≤30s→4 / 否则 2）与 `_score_rate`（≥80字/s→10 / ≥40→8 / ≥20→6 / ≥10→4 / 否则 2）取均值，无实测取中性 5.0；
+- **综合评分（仅展示，不参与胜负）**：`composite_scores = 内容均分 × JUDGE_CONTENT_WEIGHT + 模型质量分 × JUDGE_PERFORMANCE_WEIGHT`（默认 0.8/0.2）；`agent_scores` 缺失（如裁判调用失败回退）时退化为模型质量分；
+- **胜方 = 纯内容判定**：取 `agent_scores` 四维均分最高的辩手所在方（PRO/CON）；并列最高或两端并列取 `DRAW`。**模型质量分 / composite 不参与胜负**（修复旧版按 composite 推导胜方、被 API 延迟左右结果的问题）；
+- 失败降级为 `Judgment(winner="DRAW", critique="裁判调用失败…")`，同样走 `_compute_composite`（内容缺失 → composite 退化、胜方 DRAW）。
+- **公平性 L6（长度中立）**：`governor.judge_guidance()` 追加到裁判 system prompt，要求评分只依据内容质量、不受发言长短影响。
 
 ### 12.13 汇总与导出
 - `_final_summary(judgment)`：主持人输出结构化最终报告（含裁判裁决段，`allow_delegate=False`）；
-- `_fallback_summary(judgment)`：预算硬熔断时的**确定性汇总**（不调用 LLM，按发言记录 + 裁决拼装；含 `agent_scores` 与 `composite_scores` 综合评分输出行）；
-- `export_markdown()`：主题/轮次/时间/Trace ID/Token/Agent → 发言记录 → 裁判裁决（`scores` + `agent_scores` + 胜方）→ **「模型性能与综合评分」表**（辩手/平均TTFT/平均生成速率/模型质量分/综合评分）→ 任务结果表 → 各 Agent 记忆快照。
+- `_fallback_summary(judgment)`：**确定性汇总**（不调用 LLM，按发言记录 + 裁决拼装；含 `agent_scores` 与 `composite_scores` 综合评分输出行）——公平性治理下无预算熔断，作为系统兜底路径保留；
+- `export_markdown()`：主题/轮次/时间/Trace ID/**Token 用量（只读遥测：累计 + 输出，不再作为约束）**/**公平性治理报告（`ok` + 各层 L1–L6 状态与详情）**/Agent → 发言记录 → 裁判裁决（`scores` + `agent_scores` + 胜方）→ **「模型性能与综合评分」表**（辩手/平均TTFT/平均生成速率/模型质量分/综合评分）→ 任务结果表 → 各 Agent 记忆快照。
 
 ### 12.14 状态同步 `_status_sync()`（架构文档 §3.5）
-发布 `status_sync` 事件：`trace_id / phase / current_round / agent_states / remaining_budget / spent_budget / effective_max_tokens / feasible_rounds / projected_total / budget_overshoot / budget_degraded / est_factor / call_factor / elapsed_time_ms`。
+发布 `status_sync` 事件：`trace_id / phase / current_round / agent_states / spent_tokens / output_tokens / fairness / elapsed_time_ms`。其中 `spent_tokens`（累计 token 用量）与 `output_tokens`（累计输出 token）为**只读遥测**；`fairness` 为 `governor.report()`（L1–L6 各层状态），替代旧的 `budget_plan` 视图。
 
 ---
 
@@ -459,11 +453,11 @@ FastAPI 应用，挂载 `/static`，提供 REST + WebSocket。
 | --- | --- | --- |
 | GET | `/` | 返回 `index.html` |
 | GET | `/api/defaults` | 返回供应商预设（**已剥离 api_key**）、向量库后端、最大 Agent 数 |
-| POST | `/api/configure` | 配置 Agent（1–6）、主题、最大轮次、预算；**请求体 `ConfigureRequest`（pydantic 校验，非法 422）**；返回 `agents/stance/phase/trace_id/budget/max_rounds` + `feasibility`（生效上限 / 可达轮数 / 预估总耗 / **`safety_margin` / `prompt_forecast`**） |
+| POST | `/api/configure` | 配置 Agent（1–6）、主题、最大轮次；**请求体 `ConfigureRequest`（pydantic 校验，非法 422）**；返回 `agents/stance/phase/trace_id/max_rounds` + **`fairness`（L1–L6 各层状态报告，替代旧可行性/预算视图）** |
 | POST | `/api/ingest` | 向共享向量库注入知识（**请求体 `IngestRequest` 校验**，按段落切分） |
 | POST | `/api/start` | 启动讨论（**请求体 `StartRequest` 可省略**，`_spawn_task(run_discussion)` 登记后台任务） |
 | POST | `/api/pause` `/api/resume` `/api/end` | 暂停/继续/结束 |
-| GET | `/api/status` | 状态、阶段、轮次、Agent、任务、共享上下文、预算、裁判结果、**校准因子（`est_factor` / `call_factor` / `growth_ratio` / `safety_margin` / `prompt_forecast`）** |
+| GET | `/api/status` | 状态、阶段、轮次、Agent、任务、共享上下文、裁判结果、**Token 遥测（`spent_tokens` / `output_tokens`）与公平性报告（`fairness`）** |
 | GET | `/api/export` | 返回 Markdown 文本 |
 | POST | `/api/save_markdown` | 保存 Markdown 到服务器（**请求体 `SaveMarkdownRequest`；`filename` 经 `_safe_discussion_filename` 清洗防路径穿越**，空请求体回退默认名；同时写入历史记忆索引） |
 | GET | `/api/history?q=` | 历史讨论列表（`items` 按时间倒序；`q` 非空时按题目 / trace_id 关键词过滤） |
@@ -474,14 +468,14 @@ FastAPI 应用，挂载 `/static`，提供 REST + WebSocket。
 > **`_safe_discussion_filename(fname)`（P0-1，`app/main.py:284`）**：`filename` 只保留 `Path(fname).name`（丢弃目录 / 绝对路径 / `..`），清洗后为空回退 `discussion_{_ts()}.md`，未以 `.md` 结尾则补后缀；与读取侧 `history.get_markdown` 的 `resolve()` + `relative_to()` 防护（§13.4）构成读写两侧的路径穿越防线。
 
 ### 13.3 WebSocket `/ws`
-- 连接即推送当前 `status`（含 agents/topic/max_rounds/budget/spent/phase + **`remaining_budget` / `spent_budget` / `est_factor` / `call_factor` / `growth_ratio`**），便于前端初始化席位与预算面板；
+- 连接即推送当前 `status`（含 agents/topic/max_rounds/phase + **`spent_tokens` / `output_tokens` / `fairness` / `elapsed_time_ms`**），便于前端初始化席位与状态面板；
 - 订阅 `event_bus`，把每个事件 `send_json` 给前端；
 - 断开/异常时在 `finally` 中退订，避免订阅队列泄漏。
 
 ### 13.4 历史讨论记忆索引 — `app/history.py`
 把每场讨论的「题目 + 元信息」持久化到 `data/discussions/index.json`（按 filename 去重 upsert，头部插入，保留最近 200 条），作为历史讨论的记忆化保存，支撑后续检索：
 
-- `record_discussion(topic, trace_id, filename, status, phase, round_no, max_rounds, token_spent, token_budget, agents)`：写入 / 更新一条索引（内部 `threading.Lock` 保证并发安全）。
+- `record_discussion(topic, trace_id, filename, status, phase, round_no, max_rounds, token_spent, agents)`：写入 / 更新一条索引（内部 `threading.Lock` 保证并发安全）；`token_spent` 来自只读遥测，仅作展示。
 - `list_discussions(q)`：按题目 / trace_id 做不区分大小写关键词过滤，按时间倒序返回。
 - `get_markdown(filename)`：读取 `data/discussions/` 下的 Markdown 内容；`resolve()` + `relative_to()` 做**路径穿越防护**，仅允许该目录内 `.md` 文件。
 
@@ -508,8 +502,8 @@ FastAPI 应用，挂载 `/static`，提供 REST + WebSocket。
 | 模型 | 对应接口 | 关键字段 |
 | --- | --- | --- |
 | `AgentConfig` | `/api/configure` 中单个 Agent | `name / role / personality / provider / base_url / api_key / model_id / stance / agent_id / forget_config` |
-| `ConfigureRequest` | `POST /api/configure` | `agents: list[AgentConfig]`、`topic`、`max_rounds=8`、`budget`、`judge` |
-| `StartRequest` | `POST /api/start` | `topic / max_rounds / budget`（全可省略，省略沿用 configure 值） |
+| `ConfigureRequest` | `POST /api/configure` | `agents: list[AgentConfig]`、`topic`、`max_rounds=8`、`judge` |
+| `StartRequest` | `POST /api/start` | `topic / max_rounds`（全可省略，省略沿用 configure 值） |
 | `IngestRequest` | `POST /api/ingest` | `text`、`source`（默认"用户注入"） |
 | `SaveMarkdownRequest` | `POST /api/save_markdown` | `filename`（可省略，省略自动生成） |
 
@@ -519,7 +513,7 @@ FastAPI 应用，挂载 `/static`，提供 REST + WebSocket。
 
 - **`pyproject.toml`**：声明 `requires-python = ">=3.10"`；`[tool.ruff]` 启用 `E4/E7/E9/F/I/UP/RUF/B/S` 规则（`line-length=110`，忽略 `BLE001/S110/RUF001/002/003` 中文标点误报；`tests/*` per-file-ignores `S101/S310`）；`[tool.mypy]` strict 模式仅覆盖 `app/protocol.py`（全量开启为后续工作）；`[tool.coverage]` 以 `app/` 为源码、`branch=true`。
 - **`requirements-dev.txt`**：`-r requirements.txt` + `ruff>=0.5` / `mypy>=1.10` / `coverage>=7.0`，与运行依赖分离。
-- **接口级测试 `tests/test_api_flow.py`**：`httpx.AsyncClient(transport=ASGITransport(app))` 直接驱动 FastAPI 应用，monkeypatch `_judge_round / _final_summary / _consume_stream / _run_llm_retry` 四个 LLM 调用点实现确定性输出，**无需启动服务器、无需真实模型**。7 个用例：HTTP 全链路（configure→start→done→export→save_markdown→history）、`../../evil.md` 路径穿越被清洗为 `evil.md`、空请求体 save_markdown 回退默认文件名、空 Agent 列表保持 `400` 契约、configure 返回 feasibility、**status 携带预算规划 + 校准因子字段（含 `est_factor` 钳制 ≥1.0 断言）**。运行：`python -m unittest tests.test_api_flow -v`。
+- **接口级测试 `tests/test_api_flow.py`**：`httpx.AsyncClient(transport=ASGITransport(app))` 直接驱动 FastAPI 应用，monkeypatch `_judge_round / _final_summary / _consume_stream / _run_llm_retry` 四个 LLM 调用点实现确定性输出，**无需启动服务器、无需真实模型**。7 个用例：HTTP 全链路（configure→start→done→export→save_markdown→history）、`../../evil.md` 路径穿越被清洗为 `evil.md`、空请求体 save_markdown 回退默认文件名、空 Agent 列表保持 `400` 契约、configure 返回 fairness 报告、**status 携带 Token 遥测 + 公平性字段（`spent_tokens` / `output_tokens` / `fairness` 各层状态）**。运行：`python -m unittest tests.test_api_flow -v`。
 - **CI 门禁**（`.github/workflows/ci.yml`）：安装步骤含 `fastapi httpx ruff mypy`，在 fast 单测之后新增 `Lint (ruff)`、`Type check (mypy)`、`API flow tests` 三步。
 - **RUF006 后台任务强引用**：`main.py` / `orchestrator.py` 均以模块级 `_background_tasks: set[asyncio.Task]` 持有后台任务引用（`_spawn_task` helper 登记 + 完成回调自动 discard），防止任务被 GC 提前回收。
 
@@ -529,8 +523,8 @@ FastAPI 应用，挂载 `/static`，提供 REST + WebSocket。
 
 ### 14.1 页面结构 `index.html`
 - **顶栏 `.topbar`**：Logo + "历史记录"按钮 + 状态胶囊。
-- **配置区 `#setup`**（双栏：`.setup-col` + `.side-col`）：Agent 数量（2–6）、每个 Agent 卡片（名称/角色/性格/**立场**/模型供应商 + 自定义字段）、主题、最大轮次、Token 预算、知识注入、开始按钮。
-- **讨论区 `#discussion`**：左侧圆桌（`#round-table`）含等分席位与中心信息（主题/轮次/任务进度）；右侧控制（暂停/继续/结束/返回）+ 运行状态（阶段/轮次/预算/Trace ID）+ **预算状态面板（进度条 / 校准因子 / 预算告警事件）** + 任务面板 + 变量面板；下方**聊天气泡**发言流；结束栏（预览 / 一键导出 Markdown）。
+- **配置区 `#setup`**（双栏：`.setup-col` + `.side-col`）：Agent 数量（2–6）、每个 Agent 卡片（名称/角色/性格/**立场**/模型供应商 + 自定义字段）、主题、最大轮次、知识注入、开始按钮（已移除 Token 预算配置）。
+- **讨论区 `#discussion`**：左侧圆桌（`#round-table`）含等分席位与中心信息（主题/轮次/任务进度）；右侧控制（暂停/继续/结束/返回）+ 运行状态（阶段/轮次/Token 遥测/Trace ID）+ **状态面板（Token 统计 + 公平性事件）** + 任务面板 + 变量面板；下方**聊天气泡**发言流；结束栏（预览 / 一键导出 Markdown）。
 - **历史弹窗 `#history-modal`**：左侧搜索框 + 记录列表（题目 / 时间 / 状态 / 轮次 / 人数），右侧 Markdown 预览 + 一键导出。
 
 ### 14.2 样式 `style.css`
@@ -540,7 +534,7 @@ FastAPI 应用，挂载 `/static`，提供 REST + WebSocket。
 - **聊天气泡**：`.bubble-row`（flex 行 + `bubbleIn` 弹出动画）内含 `.bubble-avatar` + `.bubble-main`（`.bubble-meta` 名字/轮次标签 + `.bubble` 气泡）；任务/总结/裁决/日志/错误各有专属气泡风格；`.bubble-row.speaking` 高亮金边。
 - **流式光标**：`.caret`（金色竖线 + `blink` 闪烁动画），流式增量时保持在文本末尾。
 - 历史面板 `.history-modal` / `.history-layout` / `.h-item`。
-- **预算状态面板**：`.budget-bar`（8px 圆角进度条，`.over` 超预算时填充变 err 红）+ `.budget-bar-fill`（accent 蓝，宽度过渡 .3s）；`.budget-sub` 虚线分隔「预算事件」；`.budget-events`（max-height 96px 滚动）；`.budget-event`（12px 行）+ `.ev-tag`（10px 圆角小标签，`ev-warn` 金 / `ev-err` 红 / `ev-ok` 绿）。
+- **状态面板（Token 统计 + 公平性事件）**：`.budget-bar` 样式保留但仅承载只读遥测（无预算总量/进度概念）；`.budget-sub` 虚线分隔「公平性事件」；`.budget-events`（max-height 96px 滚动）；`.budget-event`（12px 行）+ `.ev-tag`（10px 圆角小标签，`ev-warn` 金 / `ev-err` 红 / `ev-ok` 绿）。
 
 ### 14.3 逻辑 `app.js`
 - `init()`：拉取 `/api/defaults`、生成卡片、绑定事件、连接 WS；探测服务器是否存在可继续的讨论（`/api/status`）。
@@ -550,8 +544,8 @@ FastAPI 应用，挂载 `/static`，提供 REST + WebSocket。
 - `avatarClass(stance, idx)`：立场 → 头像配色类映射（含 `av-seatN` 兜底）；`stanceOf(name)` 从 `state.agents` 反查立场。
 - `connectWS()` / `handleEvent(ev)`：按事件类型更新 UI（见 §15 事件协议）。
 - **并发流式气泡**：`state.streamBoxes = {}`（speaker → el），`speech_start` 按 speaker 建独立气泡（`.bubble-row` + 空 `.body` + `.caret`），`speech_delta` 把增量插入到光标前，`speech_end` 用完整文本替换（移除光标）并删除该 key——第 1 轮并行立论时多个 Agent 可同时流式发言而不互相覆盖；**每次气泡只承载当前发言内容，不拼接历史**。
-- `renderRunStatus(data)`：展示阶段/轮次/预算（剩余+已用）/用时/Trace ID。
-- **预算状态面板**：`renderBudgetPanel(data)` 渲染进度条（已用/总量百分比，`budget_overshoot` 或已用超总量时标红）+ 预算剩余/已用/总量 + 生效输出上限（`budget_degraded` 标注"降级"）+ 预计总耗（超预算显示百分比）+ 可支撑轮数（含 `safety_margin` 安全余量）+ 校准因子（提示词 `est_factor` / 调用 `call_factor` / 增长 `growth_ratio`）；`case "status"`（含 WS 连接快照）、`case "status_sync"`、每秒 `/api/status` 轮询、配置后可行性预览共四处接线；`addBudgetEvent(ev)` 命中 `BUDGET_EVENT_TEXT`（6 类 `budget.*` 告警：强制压缩历史/允许小幅超支/自动削减轮次/输出抬至保底/预算熔断/硬熔断回退）时以彩色标签入「预算事件」列表（保留 6 条，全量文本 `textContent` 填充防 XSS）。
+- `renderRunStatus(data)`：展示阶段/轮次/**Token 遥测（输出 / 累计）**/用时/Trace ID；缓存完整快照供 `speech_end` 按最新 `output_tokens` 立即刷新。
+- **状态面板**：`renderBudgetPanel(data)`（HTML id 沿用 `budget-panel`，语义已改为 Token 统计 + 公平性）渲染只读遥测（`spent_tokens` 累计用量 / `output_tokens` 累计输出，无预算总量与进度条）+ **公平性 L1–L6 各层状态**（`data.fairness.layers` 逐层 `L{n} {name}: {status} — {detail}`，`ok` 绿 / 告警金 / 违约红）；`case "status"`（含 WS 连接快照）、`case "status_sync"`、每秒 `/api/status` 轮询、配置后 fairness 预览共四处接线；`addBudgetEvent(ev)` 命中 `FAIR_EVENT_TEXT`（`fairness.output_truncate`「L1 输出截断」warn / `fairness.report`「公平性报告」ok）时以彩色标签入「公平性事件」列表（保留 6 条，全量文本 `textContent` 填充防 XSS）。
 - `exportMarkdown()` / `downloadMarkdown()`：拉取 `/api/export` 弹出/下载 Markdown（下载同时调用 `/api/save_markdown` 落盘并写入历史索引）。
 - **历史面板**：`openHistory()` 打开弹窗并 `loadHistory()` 拉取 `/api/history`；搜索框 300ms 防抖后带 `?q=` 重新检索；点击列表项 `viewHistory(filename)` 拉取 `/api/history/{filename}` 预览；`downloadHistoryMarkdown()` 把当前查看内容下载为 Markdown 文件。
 
@@ -561,19 +555,19 @@ FastAPI 应用，挂载 `/static`，提供 REST + WebSocket。
 
 | `type` | 关键字段 | 含义 |
 | --- | --- | --- |
-| `status` | `status, phase, topic, max_rounds, trace_id, agents, budget, spent, remaining_budget, spent_budget, est_factor, call_factor, growth_ratio, safety_margin, prompt_forecast` | 状态变化/初始化（含预算面板所需校准因子） |
+| `status` | `status, phase, topic, max_rounds, trace_id, agents, spent_tokens, output_tokens, fairness, elapsed_time_ms` | 状态变化/初始化（含 Token 遥测与公平性报告） |
 | `round` | `round, max` | 进入新一轮 |
 | `speech` | `speaker, text, is_main, round` | 发言（非流式回退时使用） |
 | `speech_start` | `speaker, round, is_main` | 流式发言开始（前端建气泡 + 席位高亮） |
 | `speech_delta` | `speaker, delta` | 流式文本增量（追加到当前气泡） |
-| `speech_end` | `speaker, round, text` | 流式发言结束（以完整文本收尾） |
+| `speech_end` | `speaker, round, text, output_tokens` | 流式发言结束（以完整文本收尾，携带最新输出 token 遥测） |
 | `task_assigned` | `from, to, content, expected, var, task_id, timestamp` | 任务分派 |
 | `task_result` | `from, var, value, completed, message, task_id, timestamp, token_cost` | 任务回报/变量回填 |
-| `status_sync` | `trace_id, phase, current_round, agent_states, remaining_budget, spent_budget, effective_max_tokens, feasible_rounds, projected_total, budget_overshoot, budget_degraded, est_factor, call_factor, growth_ratio, elapsed_time_ms` | 状态同步（架构状态机/预算心跳，驱动预算面板实时刷新） |
-| `judgment` | `judge, scores, agent_scores, model_performance, composite_scores, winner, critique, convergence_flag, round` | 裁判裁决（含按辩手评分、模型质量分与综合评分） |
+| `status_sync` | `trace_id, phase, current_round, agent_states, spent_tokens, output_tokens, fairness, elapsed_time_ms` | 状态同步（架构状态机/遥测心跳，驱动状态面板实时刷新） |
+| `judgment` | `judge, scores, agent_scores, model_performance, composite_scores, winner, critique, convergence_flag, round` | 裁判裁决（`scores` 后端均值；`composite_scores` 仅展示；`winner` 纯内容判定） |
 | `summary` | `speaker, text, round` | 最终总结 |
 | `agent_error` | `agent, error` | 某 Agent LLM 调用失败（前端展示错误气泡） |
-| `log` | `text, event` | 系统日志（带 trace_id）；`event` 为 `budget.*` 时前端同步入「预算事件」告警列表 |
+| `log` | `text, event` | 系统日志（带 trace_id）；`event` 为 `fairness.*` 时前端同步入「公平性事件」告警列表 |
 
 ---
 
@@ -588,10 +582,10 @@ FastAPI 应用，挂载 `/static`，提供 REST + WebSocket。
 | 流式失败 | 回退非流式重试调用，保证发言不丢失 |
 | 流式整体超时（>STREAM_TIMEOUT） | `_consume_stream` 抛超时 → 回退非流式 |
 | LLM 摘要失败 / 返回超长 | `summarize_text` 回退 `_fallback_truncate` 确定性头尾截断（`…` 相连），绝不超过 `max_chars`，摘要流程不抛异常 |
-| 裁判调用失败 / JSON 解析失败 | 确定性 `Judgment`（DRAW + 说明） |
-| 预算规划：降级阶梯（§6.3） | 优先降 `effective_max_tokens` → 强制压缩历史 → 允许小幅超支完成；辩论**绝不因预算中断** |
+| 裁判调用失败 / JSON 解析失败 | 确定性 `Judgment`（DRAW + 说明）；`scores` 由后端按内容均分计算，不因无 LLM 输出而缺失 |
+| 输出超长（公平性 L1） | 提示词字数要求失效时，`_agent_turn` 按 `ceiling_for` 事后 `truncate_output` 头尾截断兜底（事件 `fairness.output_truncate`），绝不超长输出 |
 | 强制压缩历史但历史过短 | 日志如实报告"实际压缩 X 个 / 历史过短跳过 Y 个"（短历史无可压内容，属正常空转） |
-| 预算熔断（最后防线，剩余 < 阈值） | 裁判与主持人汇总均用确定性回退（不调用 LLM） |
+| 主持人汇总失败 | `_final_summary` 失败时可用 `_fallback_summary` 确定性汇总（不调用 LLM，按发言记录 + 裁决拼装；公平性治理下无预算熔断触发路径，作为系统兜底保留） |
 | 协作 Agent 未回报 | 发言记录 + `rounds_waiting` 计数，超 3 轮强制标记完成 |
 | `_create_task` 接收方不存在 | 忽略该任务并记日志（P15 修复） |
 | lifespan 自动落盘失败 | 结构化日志（`lifespan.save_markdown`）+ 幂等重试（1, 2 次），不再静默吞掉（P1-3） |
@@ -607,20 +601,20 @@ FastAPI 应用，挂载 `/static`，提供 REST + WebSocket。
 | --- | --- |
 | Supervisor：总调度、状态机、收敛触发、结果聚合；不亲自生成论点 | `orchestrator.run_discussion`（主持人分派/追问 + Judge 独立裁决 + 汇总） |
 | Pro/Con 立场绑定、禁止倒戈（§2.2/2.3） | `agent._stance_declaration` + `configure` 立场分配 |
-| Judge Agent：多维度评分 + winner + 收敛标记（§2.4） | `orchestrator._judge_round` → `Judgment`（仅辩手发言评分） |
-| Judge 按辩手评分 + 模型质量分 + 综合评分推导胜方 | `_build_judge_debate_text` / `agent_metrics` + `_score_ttft` / `_score_rate` / `_compute_composite` |
+| Judge Agent：多维度评分 + winner + 收敛标记（§2.4） | `orchestrator._judge_round` → `Judgment`（仅辩手发言评分；few-shot 示例池防照抄） |
+| Judge 全局得分后端计算 + 纯内容判定胜方 | `_compute_composite` 逐维均值算 `scores`（不依赖 LLM）；`agent_scores` 内容均分最高方为 winner（并列 DRAW）；模型质量分 / `composite_scores` 仅展示 |
 | RAG Agent：断言提取 + 检索 + 置信度 + 缓存（§2.5） | `app/rag.py`（`rag_service`，24h 缓存） |
 | 消息协议：TaskDispatch / ArgumentSubmit / Rebuttal / Judgment / StatusSync（§3） | `app/protocol.py`（pydantic + task_id UUID + token_cost + 毫秒时间戳） |
 | 状态机：Idle→Preparing→Debating→Judging→Finished（§4.1） | `PHASES` + `self.phase`（异常熔断回 Idle） |
 | 并行立论（§4.2/6.2） | 第 1 轮 `asyncio.gather` 并发 `_collab_turn` |
-| 终止条件：max_rounds + 预算熔断 + 收敛 + 人工（§4.3） | `run_discussion` 终止判断（预算/收敛/轮次/手动 end） |
+| 终止条件：max_rounds + 收敛 + 人工（§4.3） | `run_discussion` 终止判断（收敛/轮次/手动 end；公平性治理下无预算熔断） |
 | 收敛检测：语义相似度 + 新证据增量（§4.4） | `_check_convergence`（embedding 余弦 + RAG 新证据判断） |
 | 超时与重试（§4.5） | `_run_llm_retry`（1s/3s 指数退避）+ `STREAM_TIMEOUT` 单步超时 |
 | 消息队列（§5.1） | 进程内 `EventBus`（单进程部署可接受，未采用 Redis） |
 | 共享黑板（§5.2） | 内存 `shared_context` + `transcript`（未持久化） |
 | 心跳与故障恢复（§5.3） | 未实现（`status_sync` 事件承担部分状态广播） |
-| Token 预算控制（§6.3） | `budget / spent` + 每轮 `_apply_usage` + 预算规划器/降级阶梯（`_compute_plan` + `_plan_for_round`）+ 自适应校准（`_est_factor`/`_call_factor`） + 熔断最后防线 |
-| 对手定向反驳 + 输出字数约束 + 按轮强压缩 | `_find_opponent`（PRO↔CON 立场映射，回退全局最近）/ `_prepare_opponent_context`（第 2 轮原文截断、第 3 轮起 `summarize_text` 摘要 + 缓存）/ `_debate_prompt` 注入与字数提示 / `_agent_turn` 超长截断兜底 / `_compress_keep_rounds`（`BUDGET_KEEP_LAST_ROUNDS` 按轮保留） |
+| 公平性治理（替代旧 Token 预算控制 §6.3） | `FairnessGovernor` L1–L6（`app/fairness.py`）：输出字数上限/有效回答占比/输入对称/轮次对称/采样对齐/长度中立裁判；`spent`/`output_tokens` 只读遥测；不再下发 `max_tokens` |
+| 对手定向反驳 + 输出字数约束 + 按轮强压缩 | `_find_opponent`（PRO↔CON 立场映射，回退全局最近）/ `_prepare_opponent_context`（第 2 轮原文截断、第 3 轮起 `summarize_text` 摘要 + 缓存）/ `_debate_prompt` 注入字数提示（`governor.ceiling_for`）/ `_agent_turn` 超长截断兜底 / `compress_history(keep_rounds=N)` 按轮保留 |
 | 缓存策略（§6.4） | RAG 检索 24h 缓存（`rag.py:_search_cached`） |
 | 可观测性：Trace ID（§7.2） | `trace_id` 贯穿事件/日志/导出 |
 | 审计回溯：快照 + 回放（§7.3） | 未实现（仅最终 Markdown 落盘） |
@@ -639,15 +633,15 @@ FastAPI 应用，挂载 `/static`，提供 REST + WebSocket。
                                 ├─ phase=preparing → 发布 status + status_sync
                                 ├─ 每轮:
                                 │    ├─ phase=debating
-                                │    ├─ 预算规划 _plan_for_round（计算本轮 effective_max_tokens，降级阶梯）
+                                │    ├─ 公平性治理日志（发布 governor.report() L1–L6 状态）
                                 │    ├─ 主持人 _agent_turn（分派 delegate_task → _create_task）
                                 │    ├─ 第1轮: asyncio.gather 并行立论（并发流式）
                                 │    │   后序: 串行 _collab_turn 反驳/辩护
                                 │    ├─ _rag_check_round（证据注入下一轮）
                                 │    ├─ _memory_housekeeping
-                                │    ├─ _check_convergence / _update_call_factor / 预算熔断判断
-                                ├─ phase=judging → _judge_round（E 降下限/调用失败 → 确定性回退）
-                                ├─ phase=finished → _final_summary（或 _fallback_summary）
+                                │    ├─ _check_convergence → 收敛提前 break
+                                ├─ phase=judging → _judge_round（调用失败 → 确定性回退 DRAW）
+                                ├─ phase=finished → _final_summary（失败时 _fallback_summary 兜底）
                                 └─ status=done → 发布 status + status_sync
   WebSocket /ws
   └─ 实时推送 status / round / speech_* / task_* / status_sync / judgment / summary
@@ -658,22 +652,26 @@ FastAPI 应用，挂载 `/static`，提供 REST + WebSocket。
 
 ## 19. 端到端验证记录（E2E）
 
-使用 `tests/test_e2e.py`（配置 → 注入 → 开始 → WebSocket 收事件 → 导出）对真实运行做验证。被测配置：3 个 Agent（主持人=HOST，技术派=PRO，人文派=CON）、**全部使用 qwen**（`qwen3.7-plus`）、独立裁判同样 qwen、`max_rounds=2`、`budget=1000000`。观察到的事实：
+> ⚠️ 历史记录（2026-08-31 之前）：以下实测数据反映**旧规则**——胜方曾由"综合评分（内容×0.8+模型质量×0.2）"推导，且系统仍带 Token 预算规划。当前规则已改为**纯内容判定**（winner 取 `agent_scores` 四维均分最高方，模型质量分仅展示）并移除预算系统（见 §12.7/§12.12）。数据保留作为回归基线参考。
+
+使用 `tests/test_e2e.py`（配置 → 注入 → 开始 → WebSocket 收事件 → 导出）对真实运行做验证。被测配置：3 个 Agent（主持人=HOST，技术派=PRO，人文派=CON）、**全部使用 qwen**（`qwen3.7-plus`）、独立裁判同样 qwen、`max_rounds=2`。观察到的事实：
 
 - **配置与注入**：`/api/configure` 成功创建 3 个 Agent（stance=[HOST, PRO, CON]），`/api/ingest` 写入 2 段知识，返回 `backend=in-memory`。
 - **状态机**：`status_sync` 事件中观察到的 `phase` 集合含 `preparing / debating / judging`，最终 `status=done`、`phase=finished`。
 - **多轮辩论**：实际走满 `max_rounds=2`，`round` 事件集合为 `{1,2}`；第 1 轮并行立论，第 2 轮主持人抛疑、辩手反驳。
-- **预算统计**：预算规划器全程把 `projected_total` 控制在预算附近；预算吃紧时走降级阶梯（降 `effective_max_tokens` / 强制压缩 / 允许小幅超支），辩论不中断。允许超支时 `spent` 可能略超 `budget`（2 轮短辩论真实冒烟实测超支约 4–8%；4 轮长辩论因历史输入成本被低估而超支约 72%，详见 §20）。
-- **裁判裁决**：收到 `judgment` 事件，`winner=CON`；含 `agent_scores`（按辩手四维评分）、`model_performance` 与 `composite_scores`。实测 `model_performance={'技术派': {'avg_ttft_ms': 35169.3, 'avg_gen_rate': 4.0, 'performance_score': 2.0}, '人文派': {'avg_ttft_ms': None, 'avg_gen_rate': None, 'performance_score': 5.0}}`（人文派流式数据缺失取中性 5.0）、`composite_scores={'技术派': 5.6, '人文派': 8.2}`，胜方与综合分最高辩手（人文派=CON）一致。
+- **预算统计（旧规则）**：预算规划器全程把 `projected_total` 控制在预算附近；预算吃紧时走降级阶梯（降 `effective_max_tokens` / 强制压缩 / 允许小幅超支），辩论不中断。允许超支时 `spent` 可能略超 `budget`（2 轮短辩论真实冒烟实测超支约 4–8%；4 轮长辩论因历史输入成本被低估而超支约 72%，详见 §20）。
+- **裁判裁决（旧规则）**：收到 `judgment` 事件，`winner=CON`；含 `agent_scores`（按辩手四维评分）、`model_performance` 与 `composite_scores`。实测 `model_performance={'技术派': {'avg_ttft_ms': 35169.3, 'avg_gen_rate': 4.0, 'performance_score': 2.0}, '人文派': {'avg_ttft_ms': None, 'avg_gen_rate': None, 'performance_score': 5.0}}`（人文派流式数据缺失取中性 5.0）、`composite_scores={'技术派': 5.6, '人文派': 8.2}`，当时胜方与综合分最高辩手（人文派=CON）一致——现规则下胜方改由内容均分决定，不再受模型质量分/综合分影响。
 - **流式输出**：`speech_start == speech_end`，多个 speaker 的 delta 内容累计 > 0，第 1 轮并发流式正常。
 - **导出**：`/api/export` 返回约 19KB Markdown（含发言记录、裁判裁决、**「模型性能与综合评分」表**、任务结果表、记忆快照），落盘 `data/discussions/e2e_export.md`。
-- **校验输出**：`ARCHITECTURE CHECKS PASS (state machine / budget / judge)`、`STREAMING CHECKS PASS`，断言覆盖 `agent_scores / model_performance / composite_scores` 非空且 `winner ∈ (PRO, CON, DRAW)`。
+- **校验输出**：`ARCHITECTURE CHECKS PASS (state machine / budget / judge)`（budget 字样为旧版断言残留）、`STREAMING CHECKS PASS`，断言覆盖 `agent_scores / model_performance / composite_scores` 非空且 `winner ∈ (PRO, CON, DRAW)`。
 
-> 该验证同时覆盖了降级路径（本机无 Qdrant → `in-memory`；无 HF 网络 → 哈希向量）。无需服务器的快速回归见 `tests/test_ci_fast.py`（状态机 / 预算 / 裁决分档 / 综合评分逻辑）与 `tests/test_api_flow.py`（HTTP 接口全链路 + 路径穿越防护，LLM 打桩）。
+> 该验证同时覆盖了降级路径（本机无 Qdrant → `in-memory`；无 HF 网络 → 哈希向量）。无需服务器的快速回归见 `tests/test_ci_fast.py`（状态机 / **公平性治理 L1–L6** / 裁决分档 / 综合评分逻辑 / Token 遥测）与 `tests/test_api_flow.py`（HTTP 接口全链路 + 路径穿越防护，LLM 打桩）。
 
 ---
 
-## 20. 预算校准真实冒烟记录（2026-08-28）
+## 20. 预算校准真实冒烟记录（2026-08-28，历史存档）
+
+> ⚠️ **历史存档**：本章记录旧的「全局 Token 预算 + 自适应校准」系统的真实冒烟验证（2026-08-28 执行）。该系统已于 **2026-08-31 整体移除**，由 `FairnessGovernor` L1–L6 公平性治理替代（见 §12.7）；`app/budget.py`、`data/budget_profile.json`、`_est_factor/_call_factor/_growth_ratio` 三路 EMA 及预算熔断均不复存在。本章保留仅作历史参考，其结论**不再适用于当前代码**。
 
 对自适应校准（`_est_factor` / `_call_factor`）做真实冒烟验证（临时脚本直连本机服务，非测试套件）。固定配置：3 个 Agent（主持=HOST + 正方=PRO + 反方=CON，全部 default=MiMo）、裁判同模型、`max_tokens=4096`。预算与轮次见各场：
 
@@ -689,7 +687,7 @@ FastAPI 应用，挂载 `/static`，提供 REST + WebSocket。
 - **首轮规划基于因子 1.0**：configure 时预测 4 轮全量 `projected_total=248112`，但仅第 1 轮就实耗 241218（占预算 40%），est_factor 首轮样本达 2.68× → 首轮严重低估。
 - **输入成本随轮次累积增长**：规划公式用常数 P（按"当前历史"估算）乘以剩余轮次 R，未建模后续轮次历史变长、每轮输入 token 递增。降级阶梯只压输出上限 E（`effective_max_tokens` 4096→1045→256 下限），而长辩论的成本大头是**输入**（累积历史）——emax 降到下限后第 3/4 轮仍各消耗 ~15–20 万 token。
 - **call_factor 收敛方向正确但节奏太慢**：实测每轮调用 16/15/11 次 vs 基数 5（比值 2.2–3.2×），EMA 只影响"下一轮"规划，3 次样本后因子到 1.84，来不及阻止已发生的超支。
-- **裁判在 E 下限时输出为空** → 确定性回退（winner=CON, `scores={}`, `critique_len=14`），复现已知边界（§12.12 预算兜底）。
+- **裁判在 E 下限时输出为空** → 确定性回退（winner=CON, `scores={}`, `critique_len=14`），复现旧版已知边界（原 §12.12「预算兜底」；现规则下裁判输出为空仅发生在调用失败时，且 `scores` 由后端按内容均分计算不会缺失）。
 
 **结论**：两路 EMA 校准对 2 轮短辩论有效（超支 42%→4.3%），但**规划器对"历史累积输入成本"建模不足**——轮次越多超支越差。
 
@@ -700,7 +698,7 @@ FastAPI 应用，挂载 `/static`，提供 REST + WebSocket。
 
 **已知边界**（尚未覆盖，后续可选）：EMA 收敛仍需数轮样本，极端首轮暴涨仍可能短期超支；`growth_ratio` 校准依赖轮间环比，单轮辩论无样本可循；自动削轮次会改变对话深度，实际生效轮数已由前端预算面板展示（`feasible_rounds` + `budget.round_trim` 告警标签）。
 
-**实现更新（前端展示）**：上述缺口中的"前端展示实际生效轮次"已落地——讨论页新增**预算状态面板**（§14），经 `/api/status` / `/ws` / `status_sync` 实时展示进度条、输出上限降级、预计总耗超支比、可支撑轮数与三路校准因子，并把 `budget.*` 告警事件（削轮次/超支/保底/压缩/熔断）渲染为结构化彩色标签。
+**实现更新（前端展示，已随系统移除）**：当时讨论页曾新增**预算状态面板**（旧 §14），经 `/api/status` / `/ws` / `status_sync` 实时展示进度条、输出上限降级、预计总耗超支比、可支撑轮数与三路校准因子，并把 `budget.*` 告警事件渲染为结构化彩色标签——该面板已随预算系统移除，现前端为「Token 遥测 + 公平性事件」面板（新 §14）。
 
 ---
 

@@ -6,9 +6,11 @@ orchestrator.py — 多 Agent 辩论系统编排器（Supervisor Agent 实现）
   - 状态机：Idle → Preparing → Debating → Judging → Finished
   - 并行立论：第 1 轮所有辩手并发立论（asyncio.gather）
   - 串行反驳：后续轮次辩手基于最新交锋内容逐一反驳/辩护
-  - 终止条件：max_rounds / Token 预算熔断 / 语义收敛检测 / 手动结束
+  - 终止条件：max_rounds / 语义收敛检测 / 手动结束（公平性治理下无 token 预算熔断）
   - RAG 核查：每轮结束后异步事实核查，证据注入下一轮上下文
   - Judge 裁决：终止后单次调用裁判，输出 Judgment（scores/winner/critique/convergence_flag）
+  - 公平性治理：L1 输出上限 / L2 有效回答比例 / L3 输入对称 / L4 轮次对称 /
+    L5 采样参数对齐 / L6 长度中性评审（详见 app.fairness.py）
   - 消息协议：任务分派/回报事件带 task_id(UUID)、timestamp、token_cost
   - 可观测性：trace_id 贯穿事件与导出文件；统一日志
 """
@@ -20,10 +22,10 @@ import threading
 import time
 from typing import ClassVar
 
-from app import budget as budget_math
 from app.agent import Agent
 from app.config import settings
-from app.llm import _estimate_usage, chat, chat_stream, summarize_text
+from app.fairness import FairnessGovernor
+from app.llm import chat, chat_stream, summarize_text
 from app.protocol import Judgment, new_trace_id, new_uuid, now_ms
 from app.rag import rag_service
 
@@ -123,24 +125,11 @@ class Orchestrator:
         self._pause_event.set()
         self._run_task = None
 
-        # ---- 预算（架构文档 §6.3） ----
-        self.budget = settings.TOKEN_BUDGET
-        self.spent = 0
-        self.max_tokens = settings.MAX_TOKENS  # 单次模型输出上限（全局）
-        self.effective_max_tokens = self.max_tokens  # 预算规划器每轮计算的生效输出上限
-        self._budget_plan = None                      # 最近一次预算规划结果 dict
-        # 自适应校准：启发式估算(≈len//2) 与 API 真实 usage 的偏差因子（EMA 平滑）
-        self._est_factor = 1.0
-        self._est_factor_samples = 0
-        # 自适应 N：工具调用循环真实 LLM 调用次数 / 规划 N 的偏差因子（EMA 平滑）
-        self._call_factor = 1.0
-        self._call_factor_samples = 0
-        self._round_real_calls = 0  # 本轮累计真实 LLM 调用次数（_agent_turn 内自增）
-        # 自适应历史增长比 g：每轮提示词成本随历史累积递增（EMA，见 _update_growth_ratio）
-        self._growth_ratio = settings.BUDGET_GROWTH_RATIO_INIT
-        self._growth_ratio_samples = 0
-        self._round_prompt_real = 0      # 本轮累计真实提示词用量（_agent_turn 内自增）
-        self._prev_round_prompt_real = 0  # 上一轮真实提示词用量（增长比基准）
+        # ---- 遥测（只读）：token 用量不再作为硬约束，仅保留观测 ----
+        self.spent = 0                         # 累计 token 用量（含输入/输出，只读遥测）
+        self.output_tokens = 0                 # 累计输出 token（实时显示，只读遥测）
+        # ---- 多层公平性治理（FairnessGovernor，替代旧的 token 预算总控） ----
+        self.governor = FairnessGovernor()
 
         # ---- 辩论状态 ----
         self._started_at = None
@@ -156,7 +145,7 @@ class Orchestrator:
 
     # ---------------- 配置 ----------------
     def configure(self, agent_configs: list, topic: str = "", max_rounds: int = 8,
-                  judge_config: dict | None = None, max_tokens: int | None = None):
+                  judge_config: dict | None = None):
         if self.status == "running":
             raise ValueError("讨论进行中，请先结束或等待后再重新配置")
         self.agents = []
@@ -173,21 +162,9 @@ class Orchestrator:
         self.topic = topic
         self.transcript = []
         self.trace_id = new_trace_id()
-        self.budget = settings.TOKEN_BUDGET
-        self.spent = 0
-        if max_tokens:
-            self.max_tokens = max(1, int(max_tokens))
-        self.effective_max_tokens = self.max_tokens
-        self._budget_plan = None
-        self._est_factor = 1.0
-        self._est_factor_samples = 0
-        self._call_factor = 1.0
-        self._call_factor_samples = 0
-        self._round_real_calls = 0
-        self._growth_ratio = settings.BUDGET_GROWTH_RATIO_INIT
-        self._growth_ratio_samples = 0
-        self._round_prompt_real = 0
-        self._prev_round_prompt_real = 0
+        self.spent = 0                    # 累计 token 用量（只读遥测）
+        self.output_tokens = 0            # 累计输出 token（实时显示，只读遥测）
+        self.governor = FairnessGovernor()  # 公平性治理器（每场全新）
         self.phase = "idle"
         self.convergence_streak = 0
         self.round_arguments = {}
@@ -313,7 +290,7 @@ class Orchestrator:
 
     # ---------------- 单次 Agent 回合（含工具调用循环） ----------------
     async def _consume_stream(self, messages, model_config, tools, on_delta=None,
-                              max_tokens=None):
+                              temperature=0.7, top_p=None):
         """
         在后台线程运行流式生成，把增量事件桥接回事件循环。
 
@@ -328,7 +305,8 @@ class Orchestrator:
 
         def _run():
             try:
-                for ev in chat_stream(messages, model_config, tools, max_tokens=max_tokens):
+                for ev in chat_stream(messages, model_config, tools,
+                                      temperature=temperature, top_p=top_p):
                     loop.call_soon_threadsafe(q.put_nowait, ev)
             except Exception as e:
                 loop.call_soon_threadsafe(q.put_nowait, {"type": "error", "error": str(e)})
@@ -362,7 +340,7 @@ class Orchestrator:
             raise RuntimeError(f"流式响应超时（>{settings.STREAM_TIMEOUT}s）") from None
 
     async def _run_llm_retry(self, messages, model_config, tools=None, temperature=0.7,
-                             max_tokens=None):
+                             top_p=None):
         """带指数退避重试的非流式 LLM 调用（架构文档 §4.5：重试 2 次，间隔 1s/3s）。"""
         delays = list(settings.LLM_RETRY_DELAYS)
         last_exc = None
@@ -370,7 +348,7 @@ class Orchestrator:
             try:
                 return await asyncio.to_thread(
                     chat, messages, model_config, tools, temperature=temperature,
-                    max_tokens=max_tokens)
+                    top_p=top_p)
             except Exception as e:
                 last_exc = e
                 if attempt >= len(delays):
@@ -382,34 +360,17 @@ class Orchestrator:
         raise last_exc or RuntimeError("LLM 调用失败")
 
     def _apply_usage(self, result) -> int:
-        """累加本次调用的 token 用量，返回本次 total_tokens。"""
+        """累加本次调用的 token 用量（只读遥测），返回本次 total_tokens。"""
         usage = result.get("usage") or {}
         total = usage.get("total_tokens")
         if not total:
             total = (usage.get("prompt_tokens") or 0) + (usage.get("completion_tokens") or 0)
         if total:
             self.spent += int(total)
+        completion = usage.get("completion_tokens") or 0
+        if completion:
+            self.output_tokens += int(completion)
         return int(total) if total else 0
-
-    def _update_est_factor(self, real_total: int, heuristic_total: int) -> None:
-        """自适应校准：用 实测/估算 比值平滑更新预算规划的启发式估算因子。
-
-        预算规划器的前置估算基于 len(s)//2，而 spent 记账使用 API 真实 usage，
-        两者存在系统性偏差（中文实测约 3~5×）。本方法用每个真实调用的
-        实测 total / 启发式 total 做 EMA 平滑，规划器据此放大后续估算。
-
-        注意：本因子只放大"尚未发生的预测"，已发生的费用永远按真实 usage 记账。
-        """
-        if real_total <= 0 or heuristic_total <= 0:
-            return
-        ratio = real_total / heuristic_total
-        # EMA（α≈0.2），钳制在 [0.5, 10]，防止单次异常观测（网络波动/内容突增）失控
-        self._est_factor = min(10.0, max(0.5, 0.8 * self._est_factor + 0.2 * ratio))
-        self._est_factor_samples += 1
-        self._log(
-            f"[预算校准] 实测/估算={ratio:.2f}× 因子→{self._est_factor:.2f}"
-            f"（样本#{self._est_factor_samples}）",
-            level="info", event="budget.est_factor")
 
     async def _agent_turn(self, agent: Agent, user_msg: str, mode: str,
                           allow_delegate: bool = True, stream: bool = False):
@@ -432,6 +393,10 @@ class Orchestrator:
         report = None
         token_cost = 0
         emitting = False  # 是否已开始向 UI 流式推送
+        result = None
+        # 公平性 L5：辩论发言统一采样参数（temperature / top_p），非辩论模式用默认
+        samp = self.governor.sampling_params() if mode == "discussion" \
+            else {"temperature": 0.7, "top_p": None}
 
         async def _emit_delta(delta: str):
             nonlocal emitting
@@ -455,17 +420,17 @@ class Orchestrator:
                     try:
                         result = await self._consume_stream(
                             messages, agent.model_config, tools, _emit_delta,
-                            max_tokens=self.effective_max_tokens)
+                            temperature=samp["temperature"], top_p=samp["top_p"])
                     except Exception as e:
                         self._log(f"[LLM流式失败:{agent.name}] {e}，回退非流式",
                                   level="warning", event="llm.stream_fallback")
                         result = await self._run_llm_retry(
                             messages, agent.model_config, tools,
-                            max_tokens=self.effective_max_tokens)
+                            temperature=samp["temperature"], top_p=samp["top_p"])
                 else:
                     result = await self._run_llm_retry(
                         messages, agent.model_config, tools,
-                        max_tokens=self.effective_max_tokens)
+                        temperature=samp["temperature"], top_p=samp["top_p"])
             except Exception as e:
                 msg = f"[LLM错误:{agent.name}] {e}"
                 self._log(msg, level="error", event="llm.error")
@@ -487,15 +452,7 @@ class Orchestrator:
                 acc["gen_sum"] += _m["gen_s"]
                 acc["chars"] += _m["chars"]
 
-            _used = self._apply_usage(result)
-            token_cost += _used
-            self._round_real_calls += 1  # 自适应 N：真实 LLM 调用次数计数（含工具循环迭代）
-            # 自适应历史增长比 g：累计本轮真实提示词用量（跨轮递增 → 输入成本建模）
-            _usage = result.get("usage") or {}
-            self._round_prompt_real += int(_usage.get("prompt_tokens") or 0)
-            # 自适应校准：用本次真实用量与同一批消息的启发式估算更新偏差因子
-            self._update_est_factor(
-                _used, _estimate_usage(messages, result.get("content") or "")["total_tokens"])
+            token_cost += self._apply_usage(result)  # 只读遥测：累计真实 token 用量
             content = result["content"] or content
             raw_msg = result.get("assistant_message")
             tcs = result["tool_calls"]
@@ -528,13 +485,30 @@ class Orchestrator:
             if not tcs:
                 break
 
-        # 需求 5 兜底：discussion 模式下即使 LLM 输出超长也按字数上限截断
+        # 公平性 L1 兜底：discussion 模式下即使 LLM 输出超长也按公平性字符上限截断。
+        # PRO/CON 用相对上限（对手近 N 轮有效输出均值 × 比例，与硬上限取 min）；
+        # HOST/NEUTRAL 无对手参照，用硬性字符上限兜底（同样抑制整体消耗）。
         if mode == "discussion" and content:
-            limit = max(1, int(self.effective_max_tokens * settings.OUTPUT_CHAR_PER_TOKEN))
-            if len(content) > limit:
-                self._log(f"[输出截断] {agent.name} 发言 {len(content)} 字，截断至 {limit} 字",
-                          level="warning", event="debate.output_truncate")
-                content = content[:limit].rstrip()
+            if agent.stance in ("PRO", "CON"):
+                ceiling = self.governor.ceiling_for(
+                    agent.stance, self.round,
+                    self.governor.recent_opponent_chars(agent.stance))
+            else:
+                ceiling = self.governor.hard_char_ceiling
+            truncated_content, was_truncated = self.governor.truncate_output(content, ceiling)
+            if was_truncated:
+                self._log(f"[公平性L1] {agent.name} 发言 {len(content)} 字，"
+                          f"截断至 {len(truncated_content)} 字（上限 {ceiling} 字）",
+                          level="warning", event="fairness.output_truncate")
+            content = truncated_content
+            # 记录输出统计（L1 相对参照基准 / L2 思考占比），仅统计本次最终输出
+            think = result.get("think_chars", 0) if result else 0
+            raw = result.get("raw_chars", len(content) + think) if result else len(content)
+            self.governor.record_turn(
+                agent.stance, self.round,
+                visible_chars=max(0, raw - think),
+                think_chars=think,
+                truncated=was_truncated)
 
         # 流式收尾：补发 speech_end（前端用完整文本替换），并记录 transcript
         if emitting and content:
@@ -543,6 +517,8 @@ class Orchestrator:
                 "speaker": agent.name,
                 "round": self.round,
                 "text": content,
+                "tokens": token_cost,          # 本次发言累计 token 用量（实时显示）
+                "output_tokens": self.output_tokens,  # 全局累计输出 token（实时显示）
             })
             self.transcript.append({
                 "type": "speech", "round": self.round, "speaker": agent.name,
@@ -605,7 +581,7 @@ class Orchestrator:
 
         - 第 2 轮：对手原文截断到 OPPONENT_SNIPPET_MAX_CHARS 字；
         - 第 3 轮起：对手发言 LLM 摘要到 OPPONENT_SUMMARY_MAX_CHARS 字
-          （按 (对手,轮次) 缓存；usage 计入 self.spent 但不计入 _round_real_calls）。
+          （按 (对手,轮次) 缓存；usage 计入 self.spent 只读遥测）。
         """
         self._opponent_prep.pop(collab.name, None)
         if self.round < 2:
@@ -619,6 +595,8 @@ class Orchestrator:
             text = (self.latest_arguments.get(opp.name) or {}).get("text", "")
         if not text:
             return
+        # 公平性 L3：记录本次反驳可见的对手历史轮数（PRO/CON 对称校验）
+        self.governor.record_opponent_seen(collab.stance, round_no)
         if self.round == 2:
             brief = text[: settings.OPPONENT_SNIPPET_MAX_CHARS]
         else:
@@ -631,6 +609,9 @@ class Orchestrator:
                 total = (usage or {}).get("total_tokens") or 0
                 if total:
                     self.spent += int(total)
+                completion = (usage or {}).get("completion_tokens") or 0
+                if completion:
+                    self.output_tokens += int(completion)
                 self._log(
                     f"[对手摘要] {collab.name} 引用 {opp.name} 第{round_no}轮发言"
                     f"（摘要 {len(summary)} 字）",
@@ -714,8 +695,11 @@ class Orchestrator:
         ev = self._evidence_for_round(self.round - 1)
         if ev:
             parts.append(ev)
-        # 需求 5：每轮输出符合 token 约束 —— 全轮追加字数提示（API max_tokens + 截断兜底）
-        limit = max(1, int(self.effective_max_tokens * settings.OUTPUT_CHAR_PER_TOKEN))
+        # 公平性 L1：相对上限（对手近 N 轮有效输出均值 × 比例，与硬上限取 min）。
+        # 仅作提示约束生成，超限由 _agent_turn 事后截断兜底（不再把 max_tokens 下发 API）
+        limit = self.governor.ceiling_for(
+            collab.stance, self.round,
+            self.governor.recent_opponent_chars(collab.stance))
         parts.append(f"【输出要求】你的发言请控制在 {limit} 字以内，输出完即止，不要复述历史。")
         parts.append("请以第一人称输出你的发言，不要输出任何 JSON。")
         return "\n\n".join(parts)
@@ -778,6 +762,7 @@ class Orchestrator:
                             self.shared_context[task["var_name"]]["value"] = "（超时未完成）"
         # 辩论环节（立论 / 反驳）：无论是否处理过任务，辩手每轮都发言，保证严格交替
         await self._prepare_opponent_context(collab)  # 需求 2/3：注入对手上轮发言（截断/摘要）
+        self.governor.record_speech(collab.stance, self.round)  # 公平性 L4：每模型每轮至多发言一次
         umsg = self._debate_prompt(collab)
         out = await self._agent_turn(collab, umsg, mode="discussion", stream=True)
         if out["content"]:
@@ -832,336 +817,18 @@ class Orchestrator:
             self.convergence_streak = 0
         return self.convergence_streak >= settings.CONVERGENCE_ROUNDS
 
-    # ---------------- 预算规划与降级（budget planner） ----------------
-    def _estimate_call_prompt(self, agent: Agent, user_msg: str) -> int:
-        """估算一次 LLM 调用的提示词 token（system_prompt + history + user_msg）。
-
-        用于预算规划的前置估算；仅做保守估计，绝不抛异常。
-        """
-        collaborators_meta = [{"name": c.name} for c in self.collaborators]
-        sys_prompt = agent.system_prompt(collaborators_meta, self.shared_context,
-                                         self._task_status_text(), "discussion", self.topic)
-        messages = [{"role": "system", "content": sys_prompt},
-                    *list(agent.history),
-                    {"role": "user", "content": user_msg}]
-        # 用自适应校准因子放大 len//2 启发式，使其接近该模型/供应商的真实用量
-        return max(1, int(_estimate_usage(messages)["prompt_tokens"] * self._est_factor))
-
-    def _estimate_round_prompt_tokens(self) -> int:
-        """一个完整辩论轮（主持人 + 各协作辩手）的提示词 token 估算。
-
-        每轮实际 LLM 调用约 N = ceil((1+C)×BUDGET_TOOL_OVERHEAD) 次
-        （同一辩手可能多次工具调用），故按 N 次调用折算，而非每位辩手一次。
-        """
-        total = 0
-        try:
-            if self.main:
-                total += self._estimate_call_prompt(
-                    self.main, self._main_directive(self.round, False, False, False))
-            for c in self.collaborators:
-                total += self._estimate_call_prompt(c, self._debate_prompt(c))
-        except Exception:
-            pass  # 规划绝不能因估算失败而中断辩论
-        if total <= 0:
-            return 0
-        # 需求 3/4：第 3 轮起每轮会为每个 PRO/CON 辩手注入对手发言摘要
-        # （OPPONENT_SUMMARY_MAX_CHARS 字 ≈ //2 token，加上引用框架约 200 token）
-        if self.round >= 3:
-            n_opp = sum(1 for c in self.collaborators if c.stance in ("PRO", "CON"))
-            if n_opp:
-                total += n_opp * (settings.OPPONENT_SUMMARY_MAX_CHARS // 2 + 200)
-        base = max(1, 1 + len(self.collaborators))  # 每位辩手一次调用的基准成本
-        return round(total * self._calls_per_round() / base)
-
-    def _calls_per_round(self) -> int:
-        """每轮 LLM 调用次数 = (主持人 + 协作辩手) × 工具调用乘数 × 自适应 N 因子。"""
-        import math
-        base = 1 + len(self.collaborators)
-        return max(1, round(math.ceil(base * settings.BUDGET_TOOL_OVERHEAD) * self._call_factor))
-
-    def _update_call_factor(self, real_calls: int) -> None:
-        """自适应 N：用 本轮真实 LLM 调用次数 / 规划基数 的比值 EMA 平滑工具调用乘数。
-
-        实测值来自 _agent_turn 每完成一次真实 LLM 调用的计数（含工具循环迭代）。
-        基数 = ceil((1+C)×BUDGET_TOOL_OVERHEAD)（不含因子本身，便于日志解读）。
-        钳制在 [0.5, 5.0]，防止单轮异常（任务风暴/输出截断重试）失控。
-        只影响"尚未发生的预测"，已发生的费用永远按真实 usage 记账。
-        """
-        import math
-        base_n = max(1, math.ceil(
-            (1 + len(self.collaborators)) * settings.BUDGET_TOOL_OVERHEAD))
-        if real_calls <= 0 or base_n <= 0:
-            return
-        ratio = real_calls / base_n
-        self._call_factor = min(5.0, max(0.5, 0.8 * self._call_factor + 0.2 * ratio))
-        self._call_factor_samples += 1
-        self._log(
-            f"[预算校准N] 实测调用={real_calls} 基数={base_n} 比值={ratio:.2f}× "
-            f"因子→{self._call_factor:.2f}（样本#{self._call_factor_samples}）",
-            level="info", event="budget.call_factor")
-
-    def _update_growth_ratio(self, real_round_prompt: int) -> None:
-        """自适应历史增长比 g：用「本轮真实提示词 / 上轮真实提示词」的环比 EMA 平滑。
-
-        输入是长辩论成本的大头：每轮历史变长，提示词随轮次递增（中文实测约 1.5~3×/轮）。
-        本比值捕获该递增率，规划器据此把后续轮次输入成本计入预算（prompt_growth_sum）。
-        样本#1 无上轮基准，跳过（仅记录 prev 供下一轮使用）；负增长钳 0（历史只增不减，
-        压缩/遗忘造成的回落不应压低预测）。
-        钳制在 [BUDGET_GROWTH_RATIO_MIN, BUDGET_GROWTH_RATIO_MAX]，防止单轮异常
-        （任务风暴/压缩抖动）失控。只影响"尚未发生的预测"，已发生的费用永远按真实 usage 记账。
-        """
-        prev = self._prev_round_prompt_real
-        if prev > 0 and real_round_prompt > 0:
-            ratio = max(0.0, (real_round_prompt - prev) / prev)
-            self._growth_ratio = min(
-                settings.BUDGET_GROWTH_RATIO_MAX,
-                max(settings.BUDGET_GROWTH_RATIO_MIN,
-                    0.8 * self._growth_ratio + 0.2 * ratio))
-            self._growth_ratio_samples += 1
-            self._log(
-                f"[预算校准g] 本轮提示词={real_round_prompt} 上轮={prev} 环比={ratio:.2f} "
-                f"增长比→{self._growth_ratio:.2f}（样本#{self._growth_ratio_samples}）",
-                level="info", event="budget.growth_ratio")
-        if real_round_prompt > 0:
-            self._prev_round_prompt_real = real_round_prompt
-
-    def _judge_prompt_tokens_now(self) -> int:
-        """裁判当前轮次的提示词 token 估算（完整未截断的辩论记录）。"""
-        judge_text = self._build_judge_debate_text()  # full untruncated transcript
-        return max(1, int(((len(judge_text) + 400) // 2) * self._est_factor))
-
-    def _summary_prompt_tokens(self) -> int:
-        """主持人最终汇总的提示词 token 估算（bounded history ≤ CONTEXT_MAX_CHARS）。"""
-        return max(1, int(((settings.CONTEXT_MAX_CHARS + 2000) // 2) * self._est_factor))
-
-    def _tail_base_tokens(self) -> int:
-        """尾段基础成本：裁判/汇总提示词 J0+S0 + 两者输出保底（避免 JSON 被截断）。
-
-        无辩手时裁判短路（j0=0）。输出保底来自 JUDGE_MIN_OUTPUT / SUMMARY_MIN_OUTPUT，
-        确保规划阶段就为裁判与最终汇总预留足够的输出空间。
-        """
-        j0 = 0 if not self.collaborators else self._judge_prompt_tokens_now()  # 无辩手时裁判短路
-        s0 = self._summary_prompt_tokens()
-        return max(settings.BUDGET_TAIL_RESERVE,
-                   j0 + s0 + settings.JUDGE_MIN_OUTPUT + settings.SUMMARY_MIN_OUTPUT)
-
-    def _compute_plan(self, phase: str = "debate", remaining_rounds: int = 0) -> dict:
-        """纯数学规划：求解 E（effective_max_tokens），使剩余工作 + 尾段落在预算内。
-
-        采用历史增长模型（app/budget.py）：剩余 R 轮提示词按算术级数递增
-        （prompt_growth_sum，增长比 g 由 EMA 自适应校准），并预留安全余量
-        （BUDGET_SAFETY_MARGIN，只压低 E、不参与超支判定）。
-        不修改任何状态。phase in {"debate","judge","summary"}。
-        """
-        if not self.agents:
-            return {"effective_max_tokens": self.max_tokens, "overshoot": False,
-                    "degraded": False, "feasible_rounds": 0,
-                    "projected_total": self.spent, "tail_reserve": 0,
-                    "growth_ratio": 0.0, "safety_margin": 0.0, "prompt_forecast": 0}
-        floor = min(settings.BUDGET_OUTPUT_FLOOR, self.max_tokens)  # 永不高于用户设定上限
-        remaining = max(0, self.budget - self.spent)
-        base = self._tail_base_tokens()
-        R = max(0, remaining_rounds)
-        P = self._estimate_round_prompt_tokens() if phase == "debate" else 0
-        N = self._calls_per_round() if phase == "debate" else 0
-        S = max(1, len(self.collaborators)) if phase == "debate" else 0
-        g = self._growth_ratio if phase == "debate" else 0.0
-        margin = settings.BUDGET_SAFETY_MARGIN
-
-        if phase == "debate":
-            E = budget_math.solve_output_cap(
-                remaining, base, P, g, N, S, R, floor, self.max_tokens, margin)
-            overshoot = budget_math.overshoot_at_floor(
-                remaining, base, P, g, N, S, R, floor)
-            projected = budget_math.projected_total(
-                self.spent, remaining, base, P, g, N, S, R, E)
-            feasible = budget_math.feasible_rounds(
-                remaining, base, P, g, N, S, E, R)
-            prompt_forecast = budget_math.prompt_growth_sum(P, g, R)
-        elif phase == "judge":
-            # 裁判阶段：仅剩 裁判输出 + 汇总输出（2E），base 已含两者提示词与输出保底
-            E = budget_math.solve_output_cap(
-                remaining, base, 0, 0.0, 0, 0, 0, floor, self.max_tokens, margin)
-            overshoot = budget_math.overshoot_at_floor(
-                remaining, base, 0, 0.0, 0, 0, 0, floor)
-            projected = budget_math.projected_total(
-                self.spent, remaining, base, 0, 0.0, 0, 0, 0, E)
-            feasible, prompt_forecast = 0, 0
-        else:  # summary
-            s0 = self._summary_prompt_tokens()
-            usable = max(0, int(remaining * (1.0 - margin)))
-            E = max(floor, min(usable - s0, self.max_tokens)) if usable > s0 else floor
-            overshoot = s0 + floor > remaining
-            projected = self.spent + s0 + E
-            feasible, prompt_forecast = 0, 0
-
-        return {
-            "effective_max_tokens": E, "overshoot": overshoot,
-            "degraded": E < self.max_tokens, "feasible_rounds": feasible,
-            "projected_total": int(projected), "tail_reserve": int(base),
-            "phase": phase, "remaining_rounds": R,
-            "growth_ratio": round(g, 3), "safety_margin": margin,
-            "prompt_forecast": int(prompt_forecast),
-        }
-
-    def budget_preview(self, phase: str = "debate", remaining_rounds: int = 0) -> dict:
-        """当前规划（若有），否则即时同步估算（无副作用）。"""
-        return self._budget_plan or self._compute_plan(
-            phase, remaining_rounds or self.max_rounds)
-
-    # ---------------- 跨场次校准档案（持久化） ----------------
-    def _load_profile(self) -> None:
-        """载入跨场次校准档案（BUDGET_PROFILE_PATH，默认 data/budget_profile.json）。
-
-        无档案时使用保守先验：EST_FACTOR_INIT（中文 len//2 启发式偏乐观，实测 3~5×）。
-        载入时 est_factor 钳制 ≥1.0，防止历史乐观校准在新场次放大超支。
-        IO 失败仅告警，绝不影响辩论进行。
-        """
-        def _defaults():
-            self._est_factor = settings.EST_FACTOR_INIT
-            self._est_factor_samples = 0
-            self._call_factor = 1.0
-            self._call_factor_samples = 0
-            self._growth_ratio = settings.BUDGET_GROWTH_RATIO_INIT
-            self._growth_ratio_samples = 0
-
-        try:
-            with open(settings.BUDGET_PROFILE_PATH, encoding="utf-8") as f:
-                prof = json.load(f)
-            self._est_factor = max(1.0, float(prof.get("est_factor", settings.EST_FACTOR_INIT)))
-            self._est_factor_samples = int(prof.get("est_samples", 0))
-            self._call_factor = max(0.5, float(prof.get("call_factor", 1.0)))
-            self._call_factor_samples = int(prof.get("call_samples", 0))
-            self._growth_ratio = min(
-                settings.BUDGET_GROWTH_RATIO_MAX,
-                max(settings.BUDGET_GROWTH_RATIO_MIN,
-                    float(prof.get("growth_ratio", settings.BUDGET_GROWTH_RATIO_INIT))))
-            self._growth_ratio_samples = int(prof.get("growth_samples", 0))
-            self._log(
-                f"[预算档案] 载入校准：est={self._est_factor:.2f}×({self._est_factor_samples}) "
-                f"call={self._call_factor:.2f}×({self._call_factor_samples}) "
-                f"growth={self._growth_ratio:.2f}({self._growth_ratio_samples})",
-                level="info", event="budget.profile_load")
-        except FileNotFoundError:
-            _defaults()
-            self._log(
-                f"[预算档案] 无历史档案，使用保守先验 est_factor={self._est_factor:.2f}",
-                level="info", event="budget.profile_load")
-        except Exception as e:
-            _defaults()
-            self._log(f"[预算档案] 载入失败（{e}），使用保守先验",
-                      level="warning", event="budget.profile_load")
-
-    def _save_profile(self) -> None:
-        """把本场校准结果持久化，供后续场次开局载入（跨场次记忆）。
-
-        写失败仅告警（data/ 目录通常存在且 gitignore），绝不影响辩论结果。
-        """
-        try:
-            path = settings.BUDGET_PROFILE_PATH
-            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-            prof = {
-                "est_factor": round(self._est_factor, 4),
-                "est_samples": self._est_factor_samples,
-                "call_factor": round(self._call_factor, 4),
-                "call_samples": self._call_factor_samples,
-                "growth_ratio": round(self._growth_ratio, 4),
-                "growth_samples": self._growth_ratio_samples,
-                "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
-            }
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(prof, f, ensure_ascii=False, indent=2)
-            self._log(f"[预算档案] 已保存校准到 {path}", level="info",
-                      event="budget.profile_save")
-        except Exception as e:
-            self._log(f"[预算档案] 保存失败（{e}）", level="warning",
-                      event="budget.profile_save")
-
-    async def _force_compress_all(self) -> None:
-        """预算吃紧：强制压缩所有 Agent 历史以缩小后续输入。
-
-        需求 6：按轮强压缩，只保留最近 BUDGET_KEEP_LAST_ROUNDS 轮的原文，
-        更早轮次压入 compressed_summary，由 system_prompt 注入。
-        """
-        compressed = 0
-        skipped = 0
-        for a in self.agents:
-            try:
-                usage = await a.compress_history(
-                    force=True, keep_rounds=settings.BUDGET_KEEP_LAST_ROUNDS)
-                if usage:
-                    total = usage.get("total_tokens") or 0
-                    if total:
-                        self.spent += int(total)
-                        self.run_stats["compressions"] = \
-                            self.run_stats.get("compressions", 0) + 1
-                    compressed += 1
-                else:
-                    # force=True 下只有「历史过短」会早退（或摘要回退为确定性拼接）
-                    skipped += 1
-            except Exception:
-                skipped += 1
-        self._log(
-            f"预算吃紧：强制压缩 Agent 历史（实际压缩 {compressed} 个，"
-            f"历史过短跳过 {skipped} 个）",
-            level="warning", event="budget.force_compress")
-
-    async def _plan_for_round(self, remaining_rounds: int) -> dict:
-        """为即将到来的辩论轮次计算 effective_max_tokens（降级阶梯）。
-
-        优先降输出上限；不足则强制压缩历史；仍不足则允许小幅超支完成，绝不中断。
-        若开启 BUDGET_AUTO_TRIM_ROUNDS，预算仍不足以支撑全部剩余轮次时，
-        自动削减剩余轮次（本轮跑完即进裁决），保证后续裁判/汇总有预算可用。
-        """
-        plan = self._compute_plan("debate", remaining_rounds)
-        if plan["overshoot"] and remaining_rounds > 0:
-            # 降级第 2 步：强制压缩全部历史后重新规划（压缩已改变 agent 状态）
-            await self._force_compress_all()
-            plan = self._compute_plan("debate", remaining_rounds)
-            if plan["overshoot"]:
-                # 降级第 3 步：允许小幅超支，跑完辩论
-                self._log("预算不足以完成剩余轮次，允许小幅超支完成辩论",
-                          level="warning", event="budget.overshoot")
-        # 降级第 4 步：预算在质量下限仍不足 → 自动削减剩余轮次（用户可配开关）
-        if settings.BUDGET_AUTO_TRIM_ROUNDS and plan["overshoot"] and remaining_rounds > 0:
-            feasible = plan.get("feasible_rounds", 0)
-            trim_to = self.round + feasible - 1  # feasible 含本轮，→ 最后一轮可跑的轮号
-            if trim_to < self.max_rounds:
-                old_rounds = self.max_rounds
-                self.max_rounds = max(1, max(self.round, trim_to))
-                self._log(
-                    f"预算不足，自动削减轮次：剩余仅可支撑 {feasible} 轮，"
-                    f"max_rounds {old_rounds} → {self.max_rounds}（本轮跑完即进裁决）",
-                    level="warning", event="budget.round_trim")
-        self.effective_max_tokens = plan["effective_max_tokens"]
-        self._budget_plan = plan
-        return plan
-
-    async def _plan_for_phase(self, phase: str) -> dict:
-        """裁判 / 汇总阶段的单次规划（压缩无法缩小记录，跳过降级阶梯）。
-
-        预算不足时，若计算出的 E 低于该阶段输出保底（裁判 JSON / 汇总可读性），
-        抬到保底值（JUDGE_MIN_OUTPUT / SUMMARY_MIN_OUTPUT），允许小额超支以保质量。
-        """
-        plan = self._compute_plan(phase=phase, remaining_rounds=0)
-        if plan["overshoot"]:
-            min_out = (settings.JUDGE_MIN_OUTPUT if phase == "judge"
-                       else settings.SUMMARY_MIN_OUTPUT)
-            if plan["effective_max_tokens"] < min_out:
-                plan["effective_max_tokens"] = min_out
-                self._log(
-                    f"预算不足，{phase} 阶段输出上限抬至保底 {min_out}（允许小幅超支）",
-                    level="warning", event="budget.phase_min_output")
-            else:
-                self._log(f"预算不足，{phase} 阶段允许小幅超支完成",
-                          level="warning", event="budget.overshoot")
-        self.effective_max_tokens = plan["effective_max_tokens"]
-        self._budget_plan = plan
-        return plan
+    # ---------------- 公平性治理报告（替代旧的 budget planner） ----------------
+    def _log_fairness_report(self, prefix: str = "") -> dict:
+        """发布公平性治理报告（各层状态 / 违规 / 警告），用于日志与状态同步。"""
+        rep = self.governor.report()
+        lines = [f"{prefix}公平性治理报告："]
+        for layer in rep["layers"]:
+            lines.append(f"  {layer['layer']} {layer['name']}: {layer['status']} — {layer['detail']}")
+        self._log("\n".join(lines), level="info", event="fairness.report")
+        return rep
 
     # ---------------- 讨论主循环 ----------------
-    async def run_discussion(self, topic: str = "", max_rounds: int | None = None,
-                             budget: int | None = None, max_tokens: int | None = None):
+    async def run_discussion(self, topic: str = "", max_rounds: int | None = None):
         if self.status == "running":
             return
         if max_rounds is not None:
@@ -1169,10 +836,8 @@ class Orchestrator:
         if topic:
             self.topic = topic
         self.trace_id = new_trace_id()
-        self.budget = int(budget or settings.TOKEN_BUDGET)
-        self.spent = 0
-        if max_tokens:
-            self.max_tokens = max(1, int(max_tokens))
+        self.spent = 0                  # 累计 token 用量（只读遥测）
+        self.output_tokens = 0          # 累计输出 token（实时显示，只读遥测）
         from app.logger import set_trace_id
         set_trace_id(self.trace_id)
         self.phase = "preparing"
@@ -1190,13 +855,8 @@ class Orchestrator:
         self._opponent_summary_cache = {}
         self.run_stats = {"compressions": 0, "started_at": time.time()}
         self.agent_metrics = {}
-        # 预算规划器状态：开局即做一次全量可行性预估
-        self._load_profile()  # 跨场次持久化校准载入（无档案用 EST_FACTOR_INIT 等保守先验）
-        self._round_real_calls = 0
-        self._round_prompt_real = 0
-        self._prev_round_prompt_real = 0
-        self.effective_max_tokens = self.max_tokens
-        self._budget_plan = self._compute_plan("debate", self.max_rounds) if self.agents else None
+        # 公平性治理：每场全新实例（替代旧的预算规划器状态；token 只读遥测见 __init__）
+        self.governor = FairnessGovernor()
         self.status = "running"
         self._pause_event.set()
         await self.event_bus.publish({
@@ -1222,10 +882,8 @@ class Orchestrator:
                 self.phase = "debating"
                 self._opponent_prep.clear()  # 每轮重新准备对手上轮发言上下文
                 is_last = (self.round >= self.max_rounds)
-                self._round_real_calls = 0  # 本轮真实 LLM 调用计数清零（自适应 N）
-                self._round_prompt_real = 0  # 本轮真实提示词用量清零（自适应增长比 g）
-                # 预算规划：为「剩余轮次 + 裁判 + 汇总」算出本轮生效输出上限（降级阶梯）
-                await self._plan_for_round(self.max_rounds - self.round + 1)
+                # 公平性治理：每轮发布各层状态（替代旧的预算规划）
+                self._log_fairness_report(f"[第{self.round}轮] ")
                 await self.event_bus.publish({
                     "type": "round", "round": self.round, "max": self.max_rounds,
                 })
@@ -1287,21 +945,7 @@ class Orchestrator:
                               level="info", event="convergence.trigger")
                     break
 
-                # 5.5) 自适应 N 校准：用本轮真实调用次数更新工具调用乘数（影响下轮规划）
-                self._update_call_factor(self._round_real_calls)
-
-                # 5.6) 自适应历史增长比 g 校准：用本轮真实提示词用量更新（影响下轮规划）
-                self._update_growth_ratio(self._round_prompt_real)
-
-                # 6) 预算熔断（最后防线——预算规划器已尽量保证剩余轮次可完成）
-                remaining = self.budget - self.spent
-                plan = self._budget_plan or {}
-                if not plan.get("overshoot") and remaining < settings.MIN_TOKEN_THRESHOLD:
-                    self._log(f"预算熔断（最后防线）：剩余Token({remaining})低于阈值，强制进入裁决",
-                              level="warning", event="budget.circuit_break")
-                    break
-
-                # 7) 达到最大轮次则结束
+                # 6) 达到最大轮次则结束（公平性治理下无预算熔断；轮次对称性由 L4 保证）
                 if is_last or self.round >= self.max_rounds:
                     break
 
@@ -1318,8 +962,6 @@ class Orchestrator:
             else:
                 self.phase = "judging"
                 await self.event_bus.publish({"type": "status", "status": "running", "phase": self.phase})
-                # 预算规划：为裁判阶段计算生效输出上限（裁判不受硬熔断约束）
-                await self._plan_for_phase("judge")
                 judgment = await self._judge_round()
                 self.judgment = judgment
                 await self.event_bus.publish({
@@ -1336,20 +978,13 @@ class Orchestrator:
                 })
                 await self.event_bus.publish(self._status_sync())
 
-                # ---- Finished：主持人汇总最终报告（小额超支用 LLM 完成，严重超支才确定性回退） ----
+                # ---- Finished：主持人汇总最终报告（一律用 LLM 完成；公平性治理下无预算熔断） ----
                 self.phase = "finished"
-                await self._plan_for_phase("summary")
-                if self.spent > self.budget + settings.MIN_TOKEN_THRESHOLD:
-                    self._log(f"预算严重超支：已用({self.spent})超预算，主持人汇总使用确定性回退",
-                              level="warning", event="budget.hard_break")
-                    summary = self._fallback_summary(judgment)
-                else:
-                    summary = await self._final_summary(judgment)
+                summary = await self._final_summary(judgment)
                 await self._emit_summary(summary)
                 self.status = "done"
                 await self.event_bus.publish({"type": "status", "status": "done", "phase": self.phase})
                 await self.event_bus.publish(self._status_sync())
-                self._save_profile()  # 正常完成：把本场校准结果持久化供后续场次载入
         except Exception as e:
             self._log(f"[编排器错误] {e}", level="error", event="orchestrator.error")
             self.status = "stopped"
@@ -1447,11 +1082,13 @@ class Orchestrator:
         return "\n".join(lines) if lines else ""
 
     def _compute_composite(self, judgment: Judgment) -> Judgment:
-        """计算模型质量分与最终综合分，并依据综合分推导胜方。
+        """计算全局综合得分、模型质量分与最终综合分，并依据内容分推导胜方。
 
-        composite = 内容均分(agent_scores 四维均值) × 内容权重
-                  + 模型质量分 × 性能权重
-        agent_scores 缺失（如预算熔断回退）时 composite 退化为模型质量分。
+        - 全局综合得分 scores：后端按各辩手四维分数取均值（确定性计算，不再依赖 LLM 输出），
+          避免"综合得分 == 某辩手得分"的照抄问题。
+        - composite = 内容均分(agent_scores 四维均值) × 内容权重 + 模型质量分 × 性能权重（仅展示）。
+        - 胜方仅由内容均分决定（纯内容判定）；模型质量分不参与胜负。
+        - agent_scores 缺失（如裁判调用失败回退）时 composite 退化为模型质量分，胜方为 DRAW。
         """
         names = [a.name for a in self.collaborators]
         perf = self._model_performance()
@@ -1460,10 +1097,23 @@ class Orchestrator:
                             "performance_score": 5.0})
             for n in names
         }
+        # 全局综合得分 = 各辩手该维度分数均值
+        if judgment.agent_scores:
+            global_scores = {}
+            for dim in ("logic", "evidence", "rebuttal", "clarity"):
+                vals = [judgment.agent_scores[n][dim] for n in names
+                        if judgment.agent_scores.get(n, {}).get(dim) is not None]
+                if vals:
+                    global_scores[dim] = round(sum(vals) / len(vals), 1)
+            judgment.scores = global_scores
+
         composite = {}
+        content_avgs = {}
         for n in names:
             content = judgment.agent_scores.get(n)
             content_avg = (sum(content.values()) / len(content)) if content else None
+            if content_avg is not None:
+                content_avgs[n] = content_avg
             pscore = judgment.model_performance[n]["performance_score"]
             if content_avg is not None:
                 comp = (settings.JUDGE_CONTENT_WEIGHT * content_avg
@@ -1473,10 +1123,10 @@ class Orchestrator:
             composite[n] = round(comp, 2)
         judgment.composite_scores = composite
 
-        # 胜方：综合分最高辩手所在方（PRO/CON）；两端并列最高取 DRAW
-        if composite:
-            top = max(composite.values())
-            top_names = [n for n, v in composite.items() if v == top]
+        # 胜方：内容均分最高辩手所在方（PRO/CON）；并列最高取 DRAW（纯内容判定）
+        if content_avgs:
+            top = max(content_avgs.values())
+            top_names = [n for n, v in content_avgs.items() if v == top]
             top_stances = {self.get_agent(n).stance for n in top_names}
             if len(top_stances) == 1 and top_stances <= {"PRO", "CON"}:
                 judgment.winner = top_stances.pop()
@@ -1496,14 +1146,21 @@ class Orchestrator:
             f"- {a.name}（{a.role}）立场：{STANCE_LABEL.get(a.stance, a.stance)}"
             for a in self.collaborators)
         names = [a.name for a in self.collaborators]
+        # 示例使用不同的数值，避免 LLM 照抄同一组分数（few-shot 锚定）；仅作格式展示
+        _example_pool = [
+            {"logic": 8, "evidence": 7, "rebuttal": 9, "clarity": 8},
+            {"logic": 7, "evidence": 6, "rebuttal": 8, "clarity": 7},
+            {"logic": 9, "evidence": 8, "rebuttal": 7, "clarity": 8},
+        ]
         agent_scores_example = "{" + ", ".join(
-            f'"{n}": {{"logic": 8, "evidence": 7, "rebuttal": 9, "clarity": 8}}'
-            for n in names) + "}"
+            f'"{n}": {json.dumps(_example_pool[i % len(_example_pool)])}'
+            for i, n in enumerate(names)) + "}"
         judge_sys = ("你是独立辩论裁判，不参与辩论，也不接收主持人的任务分派信息。"
                      "你保持绝对中立，仅基于各位辩手的辩论发言进行多维度评分。"
                      "评分维度（1-10）：逻辑自洽性(logic)、证据效力(evidence)、"
                      "反驳有效性(rebuttal)、表达清晰度(clarity)。"
-                     "请对【每位辩手】分别打分，再给出全场胜方。")
+                     "请对【每位辩手】分别独立打分，再给出全场胜方。\n"
+                     + self.governor.judge_guidance())
         prompt = (f"辩论主题：{self.topic}\n\n辩手与立场：\n{stance_lines}\n\n"
                   f"辩论记录（仅辩手发言，不含主持人的任务分派）：\n{history}\n\n")
         perf_text = self._performance_text()
@@ -1512,26 +1169,23 @@ class Orchestrator:
                        f"{perf_text}\n\n")
         prompt += (
                   "请输出 JSON（不要输出其他文字或代码块）：\n"
-                  '{"scores": {"logic": 8, "evidence": 7, "rebuttal": 9, "clarity": 8}, '
-                  f'"agent_scores": {agent_scores_example}, '
+                  f'{{"agent_scores": {agent_scores_example}, '
                   '"winner": "PRO" | "CON" | "DRAW", "critique": "详细评语", '
                   '"convergence_flag": false}\n'
                   "agent_scores 的键必须与上方辩手名称完全一致，每位辩手都需给出 4 个维度分数；"
-                  "winner 取全场综合表现更优的一方；若势均力敌取 DRAW。"
+                  "注意：示例中的数字仅为格式展示，禁止照抄，请根据每位辩手的实际发言独立评分，"
+                  "不同辩手的分数可以（也应当）不同；"
+                  "winner 取内容得分更优的一方；若势均力敌取 DRAW。"
                   "convergence_flag 表示辩论是否因观点收敛而提前终止。")
         judge_name = self.judge.name if self.judge else self.main.name
         judge_model = self.judge.model_config if self.judge else self.main.model_config
+        jp = self.governor.judge_params()  # L5：辅助 LLM（裁判）统一采样参数
         try:
             result = await self._run_llm_retry(
                 [{"role": "system", "content": judge_sys},
                  {"role": "user", "content": prompt}],
-                judge_model, tools=None, temperature=0.3, max_tokens=self.effective_max_tokens)
-            self._update_est_factor(
-                self._apply_usage(result),
-                _estimate_usage(
-                    [{"role": "system", "content": judge_sys},
-                     {"role": "user", "content": prompt}],
-                    result.get("content") or "")["total_tokens"])
+                judge_model, tools=None, temperature=jp["temperature"], top_p=jp["top_p"])
+            self._apply_usage(result)  # 只读遥测：累计 token 用量，不做任何约束
             data = self._extract_json(result["content"])
             judgment = Judgment(**data)
             # 系统确定性模型质量分 + 综合评分，并据此推导胜方
@@ -1619,6 +1273,9 @@ class Orchestrator:
                         self.spent += int(total)
                         self.run_stats["compressions"] = \
                             self.run_stats.get("compressions", 0) + 1
+                    completion = usage.get("completion_tokens") or 0
+                    if completion:
+                        self.output_tokens += int(completion)
             except Exception:
                 pass
 
@@ -1633,6 +1290,9 @@ class Orchestrator:
                 self.spent += int(total)
                 self.run_stats["memory_summaries"] = \
                     self.run_stats.get("memory_summaries", 0) + 1
+            completion = (usage or {}).get("completion_tokens") or 0
+            if completion:
+                self.output_tokens += int(completion)
             return summary or ""
         return _summarize
 
@@ -1652,23 +1312,18 @@ class Orchestrator:
 
     # ---------------- 状态同步（架构文档 §3.5） ----------------
     def _status_sync(self) -> dict:
-        plan = self._budget_plan or {}
+        fair = self.governor.report()
         return {
             "type": "status_sync",
             "trace_id": self.trace_id,
             "phase": self.phase,
             "current_round": self.round,
             "agent_states": {a.name: "IDLE" for a in self.agents},
-            "remaining_budget": max(0, self.budget - self.spent),
-            "spent_budget": self.spent,
-            "effective_max_tokens": self.effective_max_tokens,
-            "feasible_rounds": plan.get("feasible_rounds", 0),
-            "projected_total": plan.get("projected_total", self.spent),
-            "budget_overshoot": bool(plan.get("overshoot")),
-            "budget_degraded": bool(plan.get("degraded")),
-            "est_factor": round(self._est_factor, 2),  # 自适应校准因子（调试/观测用）
-            "call_factor": round(self._call_factor, 2),  # 自适应 N 因子（工具调用乘数校准）
-            "growth_ratio": round(self._growth_ratio, 2),  # 自适应历史增长比（输入成本建模）
+            # 只读遥测：token 用量不再做任何约束，仅保留观测（实时显示）
+            "spent_tokens": self.spent,            # 累计 token 用量（输入+输出）
+            "output_tokens": self.output_tokens,   # 累计输出 token（实时）
+            # 公平性治理报告（替代旧的 budget_plan 视图）
+            "fairness": fair,
             "elapsed_time_ms": int((time.time() - self._started_at) * 1000)
             if self._started_at else 0,
         }
@@ -1718,12 +1373,12 @@ class Orchestrator:
         return out["content"] or "（主 Agent 未生成总结）"
 
     def _fallback_summary(self, judgment=None) -> str:
-        """预算硬熔断时的确定性汇总：不调用 LLM，直接基于发言记录与裁决拼装报告。"""
+        """确定性汇总：不调用 LLM，直接基于发言记录与裁决拼装报告（作为系统兜底）。"""
         lines = []
-        lines.append("## 最终讨论报告（预算耗尽自动汇总）\n")
+        lines.append("## 最终讨论报告（系统确定性汇总）\n")
         lines.append(f"- 主题：{self.topic}")
         lines.append(f"- 实际轮次：{self.round}/{self.max_rounds}")
-        lines.append(f"- Token 用量：{self.spent} / 预算：{self.budget}")
+        lines.append(f"- Token 用量（只读遥测）：累计 {self.spent} / 输出 {self.output_tokens}")
         lines.append("")
         lines.append("### 核心观点摘要\n")
         for e in self.transcript:
@@ -1743,8 +1398,8 @@ class Orchestrator:
             if judgment.critique:
                 lines.append(f"- 评语：{judgment.critique}")
             lines.append("")
-        lines.append("> 注：因 Token 预算耗尽（架构文档 §6.3 硬熔断），本报告由系统按发言记录"
-                     "确定性生成，未调用主持人 LLM 汇总。")
+        lines.append("> 注：本报告由系统按发言记录确定性生成（未调用主持人 LLM 汇总），"
+                     "作为公平性治理下的兜底路径保留。")
         return "\n".join(lines)
 
     # ---------------- 导出 Markdown ----------------
@@ -1755,7 +1410,7 @@ class Orchestrator:
         lines.append(f"- 轮次：{self.round}/{self.max_rounds}")
         lines.append(f"- 状态：{self.status} / 阶段：{self.phase}")
         lines.append(f"- Trace ID：{self.trace_id}")
-        lines.append(f"- Token 用量：{self.spent} / 预算：{self.budget}")
+        lines.append(f"- Token 用量（只读遥测）：累计 {self.spent} / 输出 {self.output_tokens}")
         lines.append(f"- 时间：{time.strftime('%Y-%m-%d %H:%M:%S')}")
         lines.append("- 参与 Agent：")
         for a in self.agents:
@@ -1780,8 +1435,14 @@ class Orchestrator:
         lines.append(f"- RAG 证据轮数：{len(self.round_evidence)}")
         lines.append(f"- 任务：{len(self.tasks)}（完成 {done_tasks}）")
         lines.append(f"- 历史压缩次数：{self.run_stats.get('compressions', 0)}")
-        lines.append(f"- 预算：已用 {self.spent} / 总量 {self.budget}"
-                     f"（剩余 {max(0, self.budget - self.spent)}）")
+        lines.append(f"- Token 用量（只读遥测）：累计 {self.spent} / 输出 {self.output_tokens}"
+                     f"（不再作为约束）")
+        # 公平性治理报告（替代旧的预算规划摘要）
+        fair = self.governor.report()
+        lines.append(f"- 公平性治理：{'全部通过' if fair['ok'] else '存在违约'}"
+                     f"（{len(fair['warnings'])} 警告 / {len(fair['violations'])} 违约）")
+        for layer in fair["layers"]:
+            lines.append(f"  - {layer['layer']} {layer['name']}：{layer['status']} — {layer['detail']}")
         lines.append("")
         lines.append("## 发言记录\n")
         for e in self.transcript:

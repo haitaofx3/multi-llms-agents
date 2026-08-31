@@ -86,8 +86,9 @@ class StatusSync(BaseModel):
     phase: str = "idle"              # idle/preparing/debating/judging/finished
     current_round: int = 0
     agent_states: dict[str, str] = {}  # {name: IDLE/THINKING/WAITING}
-    remaining_budget: int = 0
-    spent_budget: int = 0
+    # 只读遥测：token 用量不再做约束，仅保留观测（实时显示）
+    spent_tokens: int = 0            # 累计 token 用量（输入+输出）
+    output_tokens: int = 0           # 累计输出 token（实时）
     elapsed_time_ms: int = 0
 
 

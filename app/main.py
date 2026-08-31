@@ -69,7 +69,6 @@ def _persist_done_markdown() -> str:
         round_no=orchestrator.round,
         max_rounds=orchestrator.max_rounds,
         token_spent=orchestrator.spent,
-        token_budget=orchestrator.budget,
         agents=[{"name": a.name, "role": a.role,
                  "stance": a.stance, "is_main": a.is_main}
                 for a in orchestrator.agents],
@@ -145,17 +144,12 @@ async def configure(payload: ConfigureRequest):
         return JSONResponse({"ok": False, "error": "Agent 数量需在 1-6 之间"}, status_code=400)
     topic = payload.topic
     max_rounds = payload.max_rounds
-    budget = payload.budget
-    max_tokens = payload.max_tokens
     judge_config = payload.judge or {}
     try:
         orchestrator.configure(agents, topic=topic, max_rounds=max_rounds,
-                               judge_config=judge_config, max_tokens=max_tokens)
-        if budget:
-            orchestrator.budget = max(0, int(budget))
+                               judge_config=judge_config)
     except ValueError as e:
         return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
-    feasibility = orchestrator.budget_preview("debate", orchestrator.max_rounds)
     return {
         "ok": True,
         "agents": [{"name": a.name, "role": a.role, "is_main": a.is_main,
@@ -165,19 +159,9 @@ async def configure(payload: ConfigureRequest):
         "status": orchestrator.status,
         "phase": orchestrator.phase,
         "trace_id": orchestrator.trace_id,
-        "budget": orchestrator.budget,
         "max_rounds": orchestrator.max_rounds,
-        "max_tokens": orchestrator.max_tokens,
-        "feasibility": {
-            "effective_max_tokens": feasibility["effective_max_tokens"],
-            "feasible_rounds": feasibility["feasible_rounds"],
-            "projected_total": feasibility["projected_total"],
-            "overshoot": feasibility["overshoot"],
-            "degraded": feasibility["degraded"],
-            "tail_reserve": feasibility["tail_reserve"],
-            "safety_margin": feasibility.get("safety_margin", 0.0),
-            "prompt_forecast": feasibility.get("prompt_forecast", 0),
-        },
+        # 公平性治理报告（L1-L6 各层状态；替代旧预算可行性视图）
+        "fairness": orchestrator.governor.report(),
     }
 
 
@@ -239,10 +223,7 @@ async def start(payload: StartRequest = None):
     payload = payload or StartRequest()
     topic = payload.topic or orchestrator.topic
     max_rounds = payload.max_rounds
-    budget = payload.budget
-    max_tokens = payload.max_tokens
-    _spawn_task(orchestrator.run_discussion(
-        topic=topic, max_rounds=max_rounds, budget=budget, max_tokens=max_tokens))
+    _spawn_task(orchestrator.run_discussion(topic=topic, max_rounds=max_rounds))
     return {
         "ok": True,
         "status": "running",
@@ -272,8 +253,6 @@ async def end():
 # ---------------- 状态 ----------------
 @app.get("/api/status")
 async def status():
-    remaining = max(0, orchestrator.budget - orchestrator.spent)
-    plan = orchestrator.budget_preview()
     return {
         "status": orchestrator.status,
         "phase": orchestrator.phase,
@@ -288,19 +267,11 @@ async def status():
         if orchestrator.judge else None,
         "tasks": orchestrator.tasks,
         "shared_context": orchestrator.shared_context,
-        "budget": orchestrator.budget,
-        "spent": orchestrator.spent,
-        "remaining_budget": remaining,
-        "effective_max_tokens": orchestrator.effective_max_tokens,
-        "feasible_rounds": plan.get("feasible_rounds", 0),
-        "projected_total": plan.get("projected_total", orchestrator.spent),
-        "budget_overshoot": bool(plan.get("overshoot")),
-        "budget_degraded": bool(plan.get("degraded")),
-        "est_factor": round(orchestrator._est_factor, 2),
-        "call_factor": round(orchestrator._call_factor, 2),
-        "growth_ratio": round(orchestrator._growth_ratio, 2),
-        "safety_margin": plan.get("safety_margin", 0.0),
-        "prompt_forecast": plan.get("prompt_forecast", 0),
+        # 只读遥测：token 用量不再做任何约束，仅保留观测（实时显示）
+        "spent_tokens": orchestrator.spent,          # 累计 token 用量（输入+输出）
+        "output_tokens": orchestrator.output_tokens, # 累计输出 token（实时）
+        # 公平性治理报告（L1-L6 各层状态；替代旧的 budget_plan 视图）
+        "fairness": orchestrator.governor.report(),
         "elapsed_time_ms": int((time.time() - orchestrator._started_at) * 1000)
         if orchestrator._started_at else 0,
         "judgment": orchestrator.judgment,
@@ -346,7 +317,6 @@ async def save_markdown(payload: SaveMarkdownRequest = None):
         round_no=orchestrator.round,
         max_rounds=orchestrator.max_rounds,
         token_spent=orchestrator.spent,
-        token_budget=orchestrator.budget,
         agents=[{"name": a.name, "role": a.role, "stance": a.stance,
                  "is_main": a.is_main} for a in orchestrator.agents],
     )
@@ -383,13 +353,9 @@ async def ws_endpoint(websocket: WebSocket):
             "trace_id": orchestrator.trace_id,
             "topic": orchestrator.topic,
             "max_rounds": orchestrator.max_rounds,
-            "budget": orchestrator.budget,
-            "spent": orchestrator.spent,
-            "remaining_budget": max(0, orchestrator.budget - orchestrator.spent),
-            "spent_budget": orchestrator.spent,
-            "est_factor": round(orchestrator._est_factor, 2),
-            "call_factor": round(orchestrator._call_factor, 2),
-            "growth_ratio": round(orchestrator._growth_ratio, 2),
+            "spent_tokens": orchestrator.spent,          # 累计 token 用量（只读遥测）
+            "output_tokens": orchestrator.output_tokens, # 累计输出 token（实时）
+            "fairness": orchestrator.governor.report(),
             "agents": [{"name": a.name, "role": a.role, "is_main": a.is_main,
                         "stance": a.stance} for a in orchestrator.agents],
         })

@@ -71,7 +71,7 @@ def ws_listener():
                     print(f"  [STATUS] {ev.get('status')} round={ev.get('round')} phase={ev.get('phase')}")
                 elif t == "status_sync":
                     print(f"  [SYNC] phase={ev.get('phase')} round={ev.get('current_round')} "
-                          f"remaining={ev.get('remaining_budget')} spent={ev.get('spent_budget')}")
+                          f"output={ev.get('output_tokens')} spent={ev.get('spent_tokens')}")
                 elif t == "judgment":
                     print(f"  [JUDGE] judge={ev.get('judge')} winner={ev.get('winner')} "
                           f"scores={ev.get('scores')} agent_scores={ev.get('agent_scores')} "
@@ -123,8 +123,8 @@ def main():
     t.start()
     time.sleep(1.0)
 
-    # 5. start discussion（携带预算；足够覆盖辩论+裁判，避免裁判阶段触发预算熔断回退）
-    st, r = rest("POST", "/api/start", {"budget": 1000000})
+    # 5. start discussion
+    st, r = rest("POST", "/api/start", {})
     print("start:", st, r)
 
     # 6. wait for done (up to 30 min；MiMo 单轮辩论需数分钟)
@@ -135,7 +135,7 @@ def main():
     st, s = rest("GET", "/api/status")
     print("status:", s.get("status"), "round=", s.get("round"), "max=", s.get("max_rounds"))
     print("status detail: phase=", s.get("phase"), "trace_id=", s.get("trace_id"),
-          "spent=", s.get("spent"), "remaining=", s.get("remaining_budget"),
+          "spent=", s.get("spent_tokens"), "output=", s.get("output_tokens"),
           "judgment=", bool(s.get("judgment")))
 
     st, ex = rest("GET", "/api/export")
@@ -153,13 +153,13 @@ def main():
     print("phases observed:", sorted(set(phases)))
     has_judgment = any(e.get("type") == "judgment" for e in events)
     has_status_sync = any(e.get("type") == "status_sync" for e in events)
-    spent = s.get("spent") or 0
-    remaining = s.get("remaining_budget") or 0
-    print(f"budget check: spent={spent}, remaining={remaining}, total={spent + remaining}")
+    spent = s.get("spent_tokens") or 0
+    output = s.get("output_tokens") or 0
+    print(f"token telemetry: spent={spent}, output={output}")
     print(f"judgment event received: {has_judgment}")
-    assert has_status_sync, "未收到 status_sync 事件（状态机/预算同步缺失）"
+    assert has_status_sync, "未收到 status_sync 事件（状态机/遥测同步缺失）"
     assert has_judgment, "未收到 judgment 事件（裁判裁决缺失）"
-    assert spent >= 0 and remaining >= 0, "预算统计异常"
+    assert spent >= 0 and output >= 0, "token 遥测统计异常"
     if s.get("judgment"):
         assert "winner" in s["judgment"], "judgment 缺少 winner 字段"
         assert "scores" in s["judgment"], "judgment 缺少 scores 字段"

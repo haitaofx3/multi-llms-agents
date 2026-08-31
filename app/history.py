@@ -18,7 +18,6 @@ history.py — 历史讨论记忆化保存与检索服务
       "round":     4,
       "max_rounds": 4,
       "token_spent": 183468,
-      "token_budget": 400000,
       "agents":    [{"name","role","stance","is_main"}, ...]
     }
 
@@ -61,7 +60,7 @@ def _save(records: list):
 def record_discussion(topic: str = "", trace_id: str = "", filename: str = "",
                       status: str = "", phase: str = "", round_no: int = 0,
                       max_rounds: int = 0, token_spent: int = 0,
-                      token_budget: int = 0, agents: list | None = None) -> dict:
+                      agents: list | None = None) -> dict:
     """记录 / 更新一场讨论的记忆索引（按 filename 去重，新记录插入头部）。"""
     if not filename:
         return {}
@@ -77,7 +76,6 @@ def record_discussion(topic: str = "", trace_id: str = "", filename: str = "",
         "round": int(round_no or 0),
         "max_rounds": int(max_rounds or 0),
         "token_spent": int(token_spent or 0),
-        "token_budget": int(token_budget or 0),
         "agents": [
             {
                 "name": a.get("name", ""),

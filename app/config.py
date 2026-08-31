@@ -115,29 +115,6 @@ class Settings:
     EMBED_API_KEY = _get("EMBED_API_KEY", "")
     EMBED_BASE_URL = _get("EMBED_BASE_URL", "")
 
-    # ---- Token 预算与熔断（架构文档 §6.3） ----
-    TOKEN_BUDGET = _int("TOKEN_BUDGET", 100000)              # 单场辩论全局预算
-    MIN_TOKEN_THRESHOLD = _int("MIN_TOKEN_THRESHOLD", 1000)   # 低于此阈值强制结束（预算规划器最后防线）
-    MAX_TOKENS = _int("MAX_TOKENS", 4096)                     # 单次模型输出上限（全局）
-
-    # ---- 预算规划与降级（budget planner） ----
-    BUDGET_OUTPUT_FLOOR = _int("BUDGET_OUTPUT_FLOOR", 256)        # 单次输出下限；低于此触发压缩/超支
-    BUDGET_TAIL_RESERVE = _int("BUDGET_TAIL_RESERVE", 8000)       # 裁判+汇总 尾段保留下限（动态估算的下限）
-    BUDGET_TOOL_OVERHEAD = _float("BUDGET_TOOL_OVERHEAD", 1.5)    # 工具调用迭代对 LLM 调用次数的乘数
-    # 历史增长模型：每轮提示词成本随历史累积按算术级数递增（P_r = P·(1 + (r-1)·g)）
-    BUDGET_GROWTH_RATIO_INIT = _float("BUDGET_GROWTH_RATIO_INIT", 0.5)  # 每轮历史增长比初始值（EMA 自适应）
-    BUDGET_GROWTH_RATIO_MIN = _float("BUDGET_GROWTH_RATIO_MIN", 0.05)   # 增长比钳制下限
-    BUDGET_GROWTH_RATIO_MAX = _float("BUDGET_GROWTH_RATIO_MAX", 2.0)    # 增长比钳制上限
-    BUDGET_SAFETY_MARGIN = _float("BUDGET_SAFETY_MARGIN", 0.08)         # 规划预留的安全余量比例（只压低 E，不计入超支判定）
-    # 校准先验与持久化：首场无档案时用保守先验，解决首轮规划无法校准的问题
-    EST_FACTOR_INIT = _float("EST_FACTOR_INIT", 2.0)                    # 中文 len//2 启发式偏乐观（实测 3~5×），先验取 2.0
-    BUDGET_PROFILE_PATH = _get("BUDGET_PROFILE_PATH", "data/budget_profile.json")  # 跨场次校准档案
-    # 尾段输出保底：裁判/汇总即使超支也保留最小输出，避免裁判 JSON 截断 → 空评语确定性回退
-    JUDGE_MIN_OUTPUT = _int("JUDGE_MIN_OUTPUT", 512)
-    SUMMARY_MIN_OUTPUT = _int("SUMMARY_MIN_OUTPUT", 512)
-    # 自动削减轮次：预算不足（即便下限输出也无法跑满）时，把 max_rounds 削减到可行轮次
-    BUDGET_AUTO_TRIM_ROUNDS = _int("BUDGET_AUTO_TRIM_ROUNDS", 1)   # 1=开（推荐）；0=保持现状跑满
-
     # ---- 收敛检测（架构文档 §4.3/4.4） ----
     CONVERGENCE_SIMILARITY = _float("CONVERGENCE_SIMILARITY", 0.85)
     CONVERGENCE_ROUNDS = _int("CONVERGENCE_ROUNDS", 2)        # 连续 N 轮高度相似即收敛
@@ -161,11 +138,25 @@ class Settings:
     # ---- 记忆压缩（短期 → 情境的 LLM 摘要上限） ----
     MEMORY_SUMMARY_MAX_CHARS = _int("MEMORY_SUMMARY_MAX_CHARS", 200)          # 短期记忆聚合摘要上限（字）
 
-    # ---- 输出 token 约束（需求 5：按字符数控制发言长度） ----
-    OUTPUT_CHAR_PER_TOKEN = _int("OUTPUT_CHAR_PER_TOKEN", 2)                  # 中文约 2 字符/token，用于换算字数上限
-
-    # ---- 预算吃紧时的保留轮数（需求 6：只保留最近 N 轮输出） ----
-    BUDGET_KEEP_LAST_ROUNDS = _int("BUDGET_KEEP_LAST_ROUNDS", 2)
+    # ---- 多层公平性治理（FairnessGovernor，替代旧的 token 预算总控） ----
+    # 不同模型量化方式与 embedding 维度不同，token 数不是跨模型公平的度量单位，
+    # 因此以「字符数 + 相对比例」为公平度量单位，不做全局 total_token 约束，
+    # 也不把 max_tokens 下发给 API（改为事后字符截断兜底）。
+    # L1 输出上限：
+    FAIR_OUTPUT_RATIO = _float("FAIR_OUTPUT_RATIO", 1.5)            # 相对上限 = 对手近 N 轮有效输出均值 × 比例
+    FAIR_HARD_CHAR_CEILING = _int("FAIR_HARD_CHAR_CEILING", 3000)   # 单次发言硬性字符安全上限
+    FAIR_FLOOR_CHAR_LIMIT = _int("FAIR_FLOOR_CHAR_LIMIT", 400)      # 相对基准下限（对手极短时仍给最低输出空间）
+    FAIR_OPENING_CHAR_LIMIT = _int("FAIR_OPENING_CHAR_LIMIT", 1200) # 立论 / 无对手参照时的上限
+    FAIR_REFERENCE_ROUNDS = _int("FAIR_REFERENCE_ROUNDS", 2)        # 参照对手最近 N 轮有效输出
+    # L2 有效回答比例（思考/推理占比）：
+    FAIR_THINK_RATIO_MAX = _float("FAIR_THINK_RATIO_MAX", 0.5)      # 思考占比上限，超过记 warning
+    # L3 输入对称性：
+    FAIR_MAX_SEEN_DIFF = _int("FAIR_MAX_SEEN_DIFF", 1)              # PRO/CON 可见对手轮数允许的最大差值
+    # L5 采样参数对齐：
+    FAIR_TEMPERATURE = _float("FAIR_TEMPERATURE", 0.7)              # 辩论发言统一温度
+    FAIR_TOP_P = _float("FAIR_TOP_P", 1.0)                          # 辩论发言统一 top_p
+    FAIR_JUDGE_TEMPERATURE = _float("FAIR_JUDGE_TEMPERATURE", 0.3)  # 辅助 LLM（裁判/摘要）统一温度
+    FAIR_JUDGE_TOP_P = _float("FAIR_JUDGE_TOP_P", 1.0)              # 辅助 LLM 统一 top_p
 
 
 settings = Settings()

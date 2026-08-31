@@ -44,16 +44,6 @@
         <label>最大讨论轮次</label>
         <input type="number" id="max-rounds" min="1" max="30" value="8" />
       </div>
-      <div class="row">
-        <label>Token 预算</label>
-        <input type="number" id="budget" min="1000" step="1000" value="100000" />
-        <span class="hint">预算熔断：剩余不足阈值时强制进入裁决</span>
-      </div>
-      <div class="row">
-        <label>每轮最大输出 Token</label>
-        <input type="number" id="max-tokens" min="1" step="100" value="4096" />
-        <span class="hint">单次模型输出上限（max_tokens），全局作用于各 Agent</span>
-      </div>
 
       <div class="config-sub">
         <div class="config-sub-title">共享知识库</div>
@@ -128,9 +118,9 @@
           <div id="run-status" class="ctx-list"><div class="muted">未开始</div></div>
         </div>
         <div class="ctx-box">
-          <div class="box-title">预算状态</div>
+          <div class="box-title">Token 统计</div>
           <div id="budget-panel" class="ctx-list"><div class="muted">未开始</div></div>
-          <div class="box-title budget-sub">预算事件</div>
+          <div class="box-title budget-sub">公平性事件</div>
           <div id="budget-events" class="budget-events"></div>
         </div>
         <div class="ctx-box">

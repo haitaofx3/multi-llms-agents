@@ -27,16 +27,16 @@
 16. **历史讨论记忆检索**：每场讨论的题目 + 元信息自动记忆化保存至 `data/discussions/index.json`（按 filename 去重，保留最近 200 条）；前端提供历史面板，支持关键词搜索题目 / trace_id、查看完整 Markdown 与一键下载。
 17. **默认仅本地访问**：`start.py` 默认绑定 `127.0.0.1`，避免远端暴露 / 长期挂载；需要局域网访问时用 `HOST=0.0.0.0` 显式覆盖。
 18. **文件上传解析**：共享知识库支持直接上传文档（`txt/md/csv/log`、`docx`、`xlsx`、`pdf`、图片 OCR），后端解析文本后按段注入共享向量库，方便把本地资料作为全体 Agent 的知识背景。
-19. **裁判综合评分**：辩论结束后独立裁判对**每位辩手**分别按四维（逻辑 / 证据 / 反驳 / 清晰度）打分；系统同时实测各辩手流式发言的 **TTFT 与生成速率**产出模型质量分，最终按「内容分 × 80% + 模型质量分 × 20%」得到综合评分（权重经 `.env` 可调），并由综合分推导胜方。评分范围仅限两位辩手，主持人发言不参与评分。
+19. **裁判纯内容判定**：辩论结束后独立裁判对**每位辩手**分别按四维（逻辑 / 证据 / 反驳 / 清晰度）打分；全局综合得分 `scores` 由后端按各辩手分数逐维取均值**确定性计算**（避免"综合得分照抄某辩手分数"），**胜方仅由内容四维均分决定**（内容并列最高取 DRAW，**纯内容判定**）；系统同时实测各辩手流式发言的 **TTFT 与生成速率**产出模型质量分，与内容分合成综合评分（权重经 `.env` 可调）**仅作展示、不参与胜负**。评分范围仅限两位辩手，主持人发言不参与评分。
 20. **REST 请求体校验**：所有写接口（`configure` / `start` / `ingest` / `save_markdown`）改用 pydantic 请求体模型（`app/schemas.py`），类型 / 形状非法时 FastAPI 返回 `422`；业务语义校验（Agent 数量、讨论状态冲突等）保留在各端点内，维持前端依赖的既有 `{ok, error}` `400` 契约，并自动生成 OpenAPI 文档。
 21. **导出与落盘安全加固**：`save_markdown` 文件名经 `Path(fname).name` 清洗（只保留 basename、强制 `.md`、空名回退自动时间戳），彻底防路径穿越；讨论完成自动落盘失败不再静默吞掉，改为结构化日志 + 幂等重试（1, 2 次）。
 22. **工程化与质量门禁**：`pyproject.toml` 统一 ruff / mypy / coverage 配置；`requirements-dev.txt` 提供开发依赖；新增 `tests/test_api_flow.py` 接口级测试（`httpx.ASGITransport` 直接驱动应用 + LLM 调用点打桩），无需服务器 / 真实模型即可在 CI 全量覆盖 HTTP 链路，与 `test_ci_fast` 一并构成快速回归门禁。
-23. **Token 预算规划与自适应校准**：每轮开始前用纯数学规划求解本轮生效输出上限 `effective_max_tokens`（`_compute_plan`），让「剩余轮次 + 裁判 + 汇总」落在预算内；预算吃紧时走降级阶梯（降输出上限 → 强制压缩历史 → 允许小幅超支），辩论永不因预算中断。规划用量经两路 EMA 自适应校准（`_est_factor` 提示词尺寸、`_call_factor` 每轮调用次数），真实冒烟 2 轮短辩论超支从 42% 收敛到 4.3%（长辩论输入成本建模见 `docs/CODE_LOGIC.md` §20）。
-24. **预算状态前端面板**：讨论页侧栏实时可视化 token 预算运行状态——已用/剩余/总量进度条（超预算标红）、生效输出上限（降级标注）、预计总耗超支比、可支撑轮数与安全余量、三路校准因子（提示词/调用/增长）；预算告警事件（削轮次/超支/保底/压缩/熔断）以彩色标签结构化展示，全量文本 `textContent` 填充防 XSS。
-25. **对手定向反驳（辩论机制）**：第 1 轮基于角色/性格立论；第 2 轮引用**对手上轮发言原文**（截断至 `OPPONENT_SNIPPET_MAX_CHARS` 字）逐条反驳；第 3 轮起引用对手上轮发言的 **LLM 摘要**（`OPPONENT_SUMMARY_MAX_CHARS` 字，按 `(对手,轮次)` 缓存防重复调用，usage 计入预算）——PRO↔CON 互为对手，NEUTRAL/HOST 无固定对手时回退「上一发言人」逻辑。
-26. **输出字数约束（需求 5）**：每轮发言都受 `effective_max_tokens × OUTPUT_CHAR_PER_TOKEN` 字数上限约束——提示词显式给出字数要求（API `max_tokens` 同步生效），LLM 仍超长时按字数硬截断兜底（`debate.output_truncate` 告警），保证单轮输出可控、不挤占后续轮次预算。
-27. **预算吃紧按轮强压缩（需求 6）**：预算不足触发 `_force_compress_all` 时，只保留最近 `BUDGET_KEEP_LAST_ROUNDS`（默认 2）轮的原文，更早轮次经 LLM 摘要压入 `compressed_summary`（由系统提示注入）；`history` 与 `history_rounds` 平行维护、三处裁剪同步，长辩论下输入成本可控。
-28. **记忆 LLM 摘要压缩**：记忆管家偶数轮把短期记忆聚合为一条情境记忆时，调用 `summarize_text` 生成 LLM 摘要（上限 `MEMORY_SUMMARY_MAX_CHARS` 字，usage 计入预算；LLM 失败回退确定性拼接），替代原来的简单 `"近期要点："` 拼接，情境记忆更精炼、可检索性更好。
+23. **公平性治理（FairnessGovernor L1–L6）**：以「字符数 + 相对比例」为跨模型公平的度量单位（Token 数非跨模型公平度量），替代旧的全局 Token 预算总控——L1 输出上限（相对对手近 N 轮有效输出均值 × 比例 + 硬性字符安全上限，超限事后截断）、L2 有效回答比例（剥离 `<think>` 统计）、L3 输入对称性（双方可见对手轮数一致）、L4 轮次对称性（每模型每轮至多一次发言）、L5 采样参数对齐（辩论/裁判统一 temperature / top_p）、L6 长度中性评审（裁判不以长度论优劣）。详见 `app/fairness.py`。
+24. **实时状态面板（遥测 + 公平性）**：讨论页侧栏实时展示运行时长（`elapsed_time_ms`）、Token 用量（累计 `spent_tokens` / 输出 `output_tokens`，**只读遥测**，不做任何约束）与公平性治理报告（L1–L6 各层状态 + 截断/思考占比/可见轮数等指标）；前端每秒轮询 + `status_sync` 事件推送。
+25. **对手定向反驳（辩论机制）**：第 1 轮基于角色/性格立论；第 2 轮引用**对手上轮发言原文**（截断至 `OPPONENT_SNIPPET_MAX_CHARS` 字）逐条反驳；第 3 轮起引用对手上轮发言的 **LLM 摘要**（`OPPONENT_SUMMARY_MAX_CHARS` 字，按 `(对手,轮次)` 缓存防重复调用，usage 计入只读遥测）——PRO↔CON 互为对手，NEUTRAL/HOST 无固定对手时回退「上一发言人」逻辑。
+26. **输出字数约束（需求 5，公平性 L1）**：每轮发言受 `FairnessGovernor.ceiling_for` 字符上限约束（立论/无参照时 `FAIR_OPENING_CHAR_LIMIT`，否则相对对手近 N 轮有效输出均值 × `FAIR_OUTPUT_RATIO`，再与硬上限 `FAIR_HARD_CHAR_CEILING` 取 min）——提示词显式给出字数要求，LLM 仍超长时按字符硬截断兜底（`fairness.output_truncate` 告警）；不再把 `max_tokens` 下发给 API。
+27. **按轮历史强压缩（长对话管理）**：`compress_history(keep_rounds=N)` 支持只保留最近 N 个不同轮次的原文、更早轮次经 LLM 摘要压入 `compressed_summary`（由系统提示注入）；`history` 与 `history_rounds` 平行维护、三处裁剪同步。轮次边界由 `_memory_housekeeping` 调用默认 A9 压缩（`CONTEXT_COMPRESS_THRESHOLD` 触发），保持长对话输入成本可控。
+28. **记忆 LLM 摘要压缩**：记忆管家偶数轮把短期记忆聚合为一条情境记忆时，调用 `summarize_text` 生成 LLM 摘要（上限 `MEMORY_SUMMARY_MAX_CHARS` 字，usage 计入只读遥测；LLM 失败回退确定性拼接），替代原来的简单 `"近期要点："` 拼接，情境记忆更精炼、可检索性更好。
 
 ## 目录结构
 
@@ -68,7 +68,7 @@ mini_test/
 │       └── app.js        前端逻辑（配置、席位等分、WebSocket 事件、并发流式气泡、历史检索）
 ├── tests/
 │   ├── test_e2e.py       端到端集成测试（需先启动服务器）
-│   ├── test_ci_fast.py   快速单元测试（状态机 / 预算 / 裁决）
+│   ├── test_ci_fast.py   快速单元测试（状态机 / 公平性 / 裁决）
 │   └── test_api_flow.py  HTTP 接口级测试（ASGITransport，无需服务器 / 无需真实 LLM）
 ├── docs/
 │   └── CODE_LOGIC.md     代码逻辑详解（模块职责 → 关键函数 → 数据流）
@@ -100,7 +100,7 @@ pip install -r requirements.txt
 | `DEEPSEEK_API_KEY` / `DEEPSEEK_BASE_URL` / `DEEPSEEK_MODEL_ID` | DeepSeek 独立配置（默认 `deepseek-chat`） |
 | `MIMO_API_KEY` / `MIMO_BASE_URL` / `MIMO_MODEL_ID` | MiMo 独立配置（默认 `mimo-v2.5`） |
 | `JUDGE_NAME` / `JUDGE_PROVIDER` / `JUDGE_BASE_URL` / `JUDGE_API_KEY` / `JUDGE_MODEL_ID` | 独立裁判（可选，未配置时回退用主 Agent 模型） |
-| `JUDGE_CONTENT_WEIGHT` / `JUDGE_PERFORMANCE_WEIGHT` | 综合评分权重（内容分 × 前者 + 模型质量分 × 后者，默认 0.8 / 0.2） |
+| `JUDGE_CONTENT_WEIGHT` / `JUDGE_PERFORMANCE_WEIGHT` | 综合评分权重（内容分 × 前者 + 模型质量分 × 后者，默认 0.8 / 0.2）——综合评分**仅作展示**，胜方由内容四维均分决定（纯内容判定） |
 | `SERPAPI_API_KEY` / `TAVILY_API_KEY` | 联网搜索工具（可选） |
 | `QDRANT_URL` 等 | 向量数据库（可选，未配置时自动降级为内存库） |
 | `EMBED_MODEL_TYPE` / `EMBED_MODEL_NAME` | 嵌入模型（默认本地 sentence-transformers） |
@@ -108,10 +108,14 @@ pip install -r requirements.txt
 | `CONTEXT_COMPRESS_THRESHOLD` | 触发 LLM 摘要压缩的字符阈值（默认 6000） |
 | `CONTEXT_COMPRESS_KEEP_RECENT` | 摘要压缩后保留的最近轮次条数（默认 8） |
 | `OPPONENT_SNIPPET_MAX_CHARS` / `OPPONENT_SUMMARY_MAX_CHARS` | 辩论机制：第 2 轮对手发言原文截断上限（默认 500 字）、第 3 轮起对手发言 LLM 摘要上限（默认 200 字） |
-| `MEMORY_SUMMARY_MAX_CHARS` | 记忆压缩：短期 → 情境的 LLM 聚合摘要上限（默认 200 字），摘要 usage 计入预算 |
-| `OUTPUT_CHAR_PER_TOKEN` | 输出字数约束：每 token 换算字数（中文约 2 字符/token，默认 2），用于把 `effective_max_tokens` 换算成发言字数上限 |
-| `BUDGET_KEEP_LAST_ROUNDS` | 预算吃紧强压缩时保留的最近轮次数（默认 2），更早轮次压入压缩摘要 |
-| `BUDGET_*`（`BUDGET_GROWTH_RATIO_INIT` / `BUDGET_GROWTH_RATIO_MIN` / `BUDGET_GROWTH_RATIO_MAX` / `BUDGET_SAFETY_MARGIN` / `EST_FACTOR_INIT` / `BUDGET_PROFILE_PATH` / `JUDGE_MIN_OUTPUT` / `SUMMARY_MIN_OUTPUT` / `BUDGET_AUTO_TRIM_ROUNDS` / `BUDGET_OUTPUT_FLOOR` / `BUDGET_TAIL_RESERVE` / `BUDGET_TOOL_OVERHEAD`） | token 预算规划器：历史增长比（EMA 校准，默认 0.5）、安全余量（默认 8%）、初始估算因子（默认 2.0 保守先验）、校准档案路径（默认 `data/budget_profile.json`）、裁判/汇总输出保底（默认 512）、预算不足时自动削减轮次（默认开启）。预算吃紧时按「降输出上限 → 强制压缩历史 → 削轮次 → 允许小幅超支」阶梯降级，辩论不中断 |
+| `MEMORY_SUMMARY_MAX_CHARS` | 记忆压缩：短期 → 情境的 LLM 聚合摘要上限（默认 200 字），摘要 usage 计入只读遥测 |
+| `FAIR_OUTPUT_RATIO` | 公平性 L1：输出上限 = 对手近 N 轮有效输出均值 × 该比例（默认 1.5） |
+| `FAIR_HARD_CHAR_CEILING` | 公平性 L1：单次发言硬性字符安全上限（默认 3000），超限事后截断 |
+| `FAIR_FLOOR_CHAR_LIMIT` / `FAIR_OPENING_CHAR_LIMIT` / `FAIR_REFERENCE_ROUNDS` | 公平性 L1：相对基准下限（默认 400）、立论/无参照时上限（默认 1200）、参照对手最近 N 轮有效输出（默认 2） |
+| `FAIR_THINK_RATIO_MAX` | 公平性 L2：思考/推理占比上限（默认 0.5），超过记 warning |
+| `FAIR_MAX_SEEN_DIFF` | 公平性 L3：PRO/CON 可见对手轮数允许的最大差值（默认 1） |
+| `FAIR_TEMPERATURE` / `FAIR_TOP_P` | 公平性 L5：辩论发言统一采样参数（默认 0.7 / 1.0） |
+| `FAIR_JUDGE_TEMPERATURE` / `FAIR_JUDGE_TOP_P` | 公平性 L5：辅助 LLM（裁判/摘要）统一采样参数（默认 0.3 / 1.0） |
 
 ### 3. 启动
 
@@ -141,12 +145,12 @@ python start.py
 2. **设置讨论**：填写讨论主题 / 任务，设置最大轮次；可选在"共享知识"中注入文本作为全体 Agent 的知识背景。
 3. **进入圆桌**：点击"进入圆桌并开始讨论"，观察圆桌席位上的 Agent 轮流流式发言（聊天气泡）、任务分派与回报。
 4. **随时控制**：可暂停 / 继续 / 结束讨论。
-5. **导出记录**：讨论完成或结束后，可导出 / 下载 Markdown 记录（自动保存于 `data/discussions/`，末尾附 `## 运行摘要` 统计：时长 / 轮次 / 收敛 / RAG 证据 / 任务 / 历史压缩 / 预算）。
+5. **导出记录**：讨论完成或结束后，可导出 / 下载 Markdown 记录（自动保存于 `data/discussions/`，末尾附 `## 运行摘要` 统计：时长 / 轮次 / 收敛 / RAG 证据 / 任务 / 历史压缩 / Token 遥测 / 公平性）。
 6. **历史检索**：顶部"历史记录"面板按时间倒序展示全部历史讨论（题目 + 状态 + 轮次 + 人数），支持关键词搜索（题目 / trace_id）、点击查看完整 Markdown、一键下载；每场讨论完成或保存时自动写入记忆索引。
 
 ## 运行测试
 
-快速单元测试（状态机 / 预算 / 裁决，无需启动服务器）：
+快速单元测试（状态机 / 公平性 / 裁决，无需启动服务器）：
 
 ```bash
 python -m unittest tests.test_ci_fast -v
@@ -195,7 +199,7 @@ P0 / P1 优化项已实施落地：
 - **P1-3 lifespan 落盘可靠性**：讨论完成自动保存失败不再静默吞掉，改为结构化日志（`lifespan.save_markdown`）+ 幂等重试（1, 2 次）。
 - **P1-4 接口级测试 + CI 静态检查**：`tests/test_api_flow.py`（`httpx.ASGITransport` + LLM 调用点打桩）覆盖 HTTP 全链路与安全用例；ruff / mypy 纳入 CI 质量门禁。
 - **P1-5 依赖与工程化配置**：新增 `pyproject.toml`（ruff / mypy / coverage）与 `requirements-dev.txt`，`requirements.txt` 全部依赖改为 `>=` 版本下限。
-- **辩论机制：对手定向反驳 + 输出约束 + 按轮强压缩**：`orchestrator._find_opponent`（PRO↔CON 立场映射，回退全局最近）→ `_prepare_opponent_context`（第 2 轮原文截断 / 第 3 轮起 `summarize_text` LLM 摘要，缓存 + 预算记账）→ `_debate_prompt` 注入 + 全轮字数提示；`_agent_turn` 超长截断兜底；`agent.history_rounds` 平行维护、`compress_history(keep_rounds=BUDGET_KEEP_LAST_ROUNDS)` 按轮强压缩（详见 `docs/CODE_LOGIC.md` §12.7–12.8）。
+- **辩论机制：对手定向反驳 + 输出约束 + 按轮强压缩**：`orchestrator._find_opponent`（PRO↔CON 立场映射，回退全局最近）→ `_prepare_opponent_context`（第 2 轮原文截断 / 第 3 轮起 `summarize_text` LLM 摘要，缓存 + 只读遥测记账）→ `_debate_prompt` 注入 + 全轮字数提示（公平性 L1 字符上限）；`_agent_turn` 超长截断兜底；`agent.history_rounds` 平行维护、`compress_history(keep_rounds=N)` 按轮强压缩（详见 `docs/CODE_LOGIC.md` §12.8）。
 
 ## 项目依赖
 

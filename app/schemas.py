@@ -33,8 +33,6 @@ class ConfigureRequest(BaseModel):
     agents: list[AgentConfig] = Field(default_factory=list)
     topic: str = ""
     max_rounds: int = 8
-    budget: int | None = None
-    max_tokens: int | None = None
     judge: dict | None = None
 
 
@@ -42,8 +40,6 @@ class StartRequest(BaseModel):
     """POST /api/start 请求体（字段可省略，省略时沿用 configure 时的值）。"""
     topic: str = ""
     max_rounds: int | None = None
-    budget: int | None = None
-    max_tokens: int | None = None
 
 
 class IngestRequest(BaseModel):

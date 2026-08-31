@@ -16,7 +16,8 @@ const state = {
   currentHistory: null,   // 正在查看的历史记录 {filename, topic, ...}
   historyActiveFilename: null,
   elapsedTimer: null,   // 实时耗时轮询定时器（讨论中每秒刷新）
-  budgetEvents: [],     // 预算告警事件（结构化展示，保留最近 6 条）
+  budgetEvents: [],     // 公平性/告警事件（结构化展示，保留最近 6 条）
+  telemetry: { spent_tokens: 0, output_tokens: 0 },   // 最近一次 token 遥测快照（speech_end 实时刷新用）
 };
 
 const STATUS_TEXT = {
@@ -282,7 +283,6 @@ async function startDiscussion() {
     judge,
     topic: $("topic").value.trim(),
     max_rounds: parseInt($("max-rounds").value, 10) || 8,
-    max_tokens: parseInt($("max-tokens").value, 10) || null,
   };
   const cfg = await fetch("/api/configure", {
     method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(payload),
@@ -303,31 +303,17 @@ async function startDiscussion() {
   $("discussion").classList.remove("hidden");
   setPill("running");
 
-  // 配置后立即展示预算可行性（预启动预警）
-  if (cfg.feasibility) {
-    const feas = cfg.feasibility;
-    renderRunStatus({
-      phase: "idle", current_round: 0, budget: cfg.budget,
-      remaining_budget: cfg.budget, spent_budget: 0,
-      effective_max_tokens: feas.effective_max_tokens,
-      feasible_rounds: feas.feasible_rounds,
-      projected_total: feas.projected_total,
-      budget_overshoot: feas.overshoot,
-      elapsed_time_ms: 0, trace_id: cfg.trace_id,
-    });
-    renderBudgetPanel({
-      budget: cfg.budget,
-      spent_budget: 0,
-      remaining_budget: cfg.budget,
-      effective_max_tokens: feas.effective_max_tokens,
-      feasible_rounds: feas.feasible_rounds,
-      projected_total: feas.projected_total,
-      budget_overshoot: feas.overshoot,
-      budget_degraded: feas.degraded,
-      safety_margin: feas.safety_margin,
-      prompt_forecast: feas.prompt_forecast,
-    });
-  }
+  // 配置后立即展示公平性治理基线（预启动预警）
+  renderRunStatus({
+    phase: "idle", current_round: 0,
+    spent_tokens: 0, output_tokens: 0,
+    fairness: cfg.fairness || null,
+    elapsed_time_ms: 0, trace_id: cfg.trace_id,
+  });
+  renderBudgetPanel({
+    spent_tokens: 0, output_tokens: 0,
+    fairness: cfg.fairness || null,
+  });
 
   // 启动讨论
   const st = await fetch("/api/start", {
@@ -335,8 +321,6 @@ async function startDiscussion() {
     body: JSON.stringify({
       topic: payload.topic,
       max_rounds: payload.max_rounds,
-      budget: parseInt($("budget").value, 10) || 100000,
-      max_tokens: payload.max_tokens,
     }),
   }).then(r => r.json());
   if (!st.ok) {
@@ -435,13 +419,9 @@ function handleEvent(ev) {
       if (ev.max_rounds) $("center-round").textContent = `第 ${ev.round || 0} / ${ev.max_rounds} 轮`;
       renderRunStatus({
         phase: ev.phase, current_round: ev.round,
-        remaining_budget: ev.remaining_budget != null ? ev.remaining_budget : (ev.budget != null ? ev.budget - (ev.spent || 0) : null),
-        spent_budget: ev.spent_budget != null ? ev.spent_budget : ev.spent,
-        budget: ev.budget,
-        effective_max_tokens: ev.effective_max_tokens,
-        feasible_rounds: ev.feasible_rounds,
-        projected_total: ev.projected_total,
-        budget_overshoot: ev.budget_overshoot,
+        spent_tokens: ev.spent_tokens != null ? ev.spent_tokens : 0,
+        output_tokens: ev.output_tokens != null ? ev.output_tokens : 0,
+        fairness: ev.fairness,
         elapsed_time_ms: ev.elapsed_time_ms,
         trace_id: ev.trace_id,
       });
@@ -491,6 +471,11 @@ function handleEvent(ev) {
         // 以完整文本替换，避免与流式增量存在偏差（同时移除流式光标）
         box.querySelector(".body").textContent = ev.text;
         delete state.streamBoxes[ev.speaker];
+      }
+      // 实时输出 token 统计：发言结束时立即刷新（无需等待下一次秒级轮询）
+      if (ev.output_tokens != null) {
+        renderRunStatus(Object.assign({}, state.telemetry, { output_tokens: ev.output_tokens }));
+        renderBudgetPanel(Object.assign({}, state.telemetry, { output_tokens: ev.output_tokens }));
       }
       break;
     }
@@ -638,13 +623,9 @@ function startElapsedTick() {
       renderRunStatus({
         phase: s.phase,
         current_round: s.round,
-        remaining_budget: s.remaining_budget,
-        spent_budget: s.spent_budget != null ? s.spent_budget : s.spent,
-        budget: s.budget,
-        effective_max_tokens: s.effective_max_tokens,
-        feasible_rounds: s.feasible_rounds,
-        projected_total: s.projected_total,
-        budget_overshoot: s.budget_overshoot,
+        spent_tokens: s.spent_tokens != null ? s.spent_tokens : 0,
+        output_tokens: s.output_tokens != null ? s.output_tokens : 0,
+        fairness: s.fairness,
         elapsed_time_ms: s.elapsed_time_ms,
         trace_id: s.trace_id,
       });
@@ -661,40 +642,42 @@ function stopElapsedTick() {
 }
 
 function renderRunStatus(data) {
+  // 缓存完整快照：供 speech_end 等事件按最新 output_tokens 立即刷新，不丢耗时/阶段
+  state.telemetry = Object.assign({}, state.telemetry, data, {
+    spent_tokens: data.spent_tokens != null ? data.spent_tokens : state.telemetry.spent_tokens,
+    output_tokens: data.output_tokens != null ? data.output_tokens : state.telemetry.output_tokens,
+  });
   const box = $("run-status");
   if (!box) return;
   const phase = PHASE_TEXT[data.phase] || data.phase || "-";
   const round = data.current_round != null ? `第 ${data.current_round} 轮` : "-";
-  const budget = data.remaining_budget != null
-    ? `剩余 ${data.remaining_budget.toLocaleString()} / 已用 ${(data.spent_budget || 0).toLocaleString()}`
-    : "-";
+  // 实时 token 统计（只读遥测）：累计输出 token + 累计总用量
+  const outT = data.output_tokens != null ? data.output_tokens : 0;
+  const spentT = data.spent_tokens != null ? data.spent_tokens : 0;
+  const tokens = `输出 ${outT.toLocaleString()} / 累计 ${spentT.toLocaleString()}`;
   const elapsed = data.elapsed_time_ms != null
     ? `用时 ${(data.elapsed_time_ms / 1000).toFixed(1)}s` : "";
-  const eff = data.effective_max_tokens != null ? `生效输出上限 ${data.effective_max_tokens}` : "";
-  const feas = data.feasible_rounds != null ? `预算可支撑约 ${data.feasible_rounds} 轮` : "";
-  const warn = (data.budget_overshoot || (data.budget != null && data.projected_total != null
-              && data.projected_total > data.budget))
-    ? ' <span style="color:#d33">（预算不足，将降级/超支完成）</span>' : "";
+  // 公平性治理摘要（L1-L6 各层状态；替代旧「预算可支撑轮数」）
+  const fair = data.fairness && data.fairness.layers ? data.fairness.layers : null;
+  const fairLine = fair
+    ? `<div class="kv"><b>公平性</b>：${fair.map(l => `${l.layer}·${l.status}`).join(" / ")}</div>`
+    : "";
   box.innerHTML = `
     <div class="kv"><b>阶段</b>：${phase}</div>
     <div class="kv"><b>轮次</b>：${round}</div>
-    <div class="kv"><b>预算</b>：${budget}</div>
-    ${eff ? `<div class="kv"><b>生效上限</b>：${eff}</div>` : ""}
-    ${feas ? `<div class="kv"><b>预算可行性</b>：${feas}${warn}</div>` : ""}
+    <div class="kv"><b>Token 输出 / 累计（遥测）</b>：${tokens}</div>
+    ${fairLine}
     ${elapsed ? `<div class="kv"><b>${elapsed}</b></div>` : ""}
     ${data.trace_id ? `<div class="kv muted" style="font-size:11px">Trace: ${data.trace_id}</div>` : ""}
   `;
 }
 
-// ---------------- 预算状态面板 ----------------
-// 结构化展示预算进度 / 校准因子，并把 budget.* 告警事件渲染为彩色标签（防 XSS：全部 textContent）
+// ---------------- Token 统计面板 ----------------
+// 结构化展示实时输出 token / 累计用量 + 公平性各层状态，并把 fairness.* 告警事件渲染为彩色标签（防 XSS：全部 textContent）
 const BUDGET_EVENT_TEXT = {
-  "budget.force_compress":   { text: "强制压缩历史", level: "warn" },
-  "budget.overshoot":        { text: "允许小幅超支", level: "warn" },
-  "budget.round_trim":       { text: "自动削减轮次", level: "warn" },
-  "budget.phase_min_output": { text: "输出抬至保底", level: "ok" },
-  "budget.circuit_break":    { text: "预算熔断", level: "err" },
-  "budget.hard_break":       { text: "硬熔断回退", level: "err" },
+  // 公平性治理事件（替代旧的 budget.* 预算告警）
+  "fairness.output_truncate": { text: "L1 输出截断", level: "warn" },
+  "fairness.report":          { text: "公平性报告", level: "ok" },
 };
 
 function fmtTokens(n) {
@@ -704,48 +687,25 @@ function fmtTokens(n) {
 function renderBudgetPanel(data) {
   const box = $("budget-panel");
   if (!box) return;
-  // status_sync 无 budget 总量：由「已用 + 剩余」反推
-  const spent = data.spent_budget != null ? data.spent_budget : data.spent;
-  const total = data.budget != null ? data.budget
-    : (spent != null && data.remaining_budget != null ? spent + data.remaining_budget : null);
-  const remaining = data.remaining_budget != null ? data.remaining_budget
-    : (total != null && spent != null ? Math.max(0, total - spent) : null);
-  if (total == null && spent == null && remaining == null) {
+  // 只读遥测：累计输出 token 与累计总用量（无预算总量概念）
+  const outT = data.output_tokens != null ? data.output_tokens : null;
+  const spent = data.spent_tokens != null ? data.spent_tokens : null;
+  if (outT == null && spent == null) {
     box.innerHTML = '<div class="muted">未开始</div>';
     return;
   }
-  const over = !!(data.budget_overshoot || (total != null && spent != null && spent > total));
-  const pct = (total != null && spent != null) ? Math.min(100, Math.round(spent / total * 100)) : 0;
   const rows = [];
-  if (remaining != null) rows.push(`<div class="kv"><b>预算剩余</b>：${fmtTokens(remaining)}</div>`);
-  if (spent != null) rows.push(`<div class="kv"><b>预算已用</b>：${fmtTokens(spent)}</div>`);
-  if (total != null) rows.push(`<div class="kv"><b>预算总量</b>：${fmtTokens(total)}</div>`);
-  if (data.effective_max_tokens != null) {
-    const deg = data.budget_degraded ? ' <span class="muted">（降级）</span>' : "";
-    rows.push(`<div class="kv"><b>输出上限</b>：${fmtTokens(data.effective_max_tokens)}${deg}</div>`);
+  if (outT != null) rows.push(`<div class="kv"><b>实时输出 Token（遥测）</b>：${fmtTokens(outT)}</div>`);
+  if (spent != null) rows.push(`<div class="kv"><b>累计用量 Token（遥测）</b>：${fmtTokens(spent)}</div>`);
+  // 公平性治理各层状态（替代旧「输出上限 / 可支撑轮数 / 校准因子」约束视图）
+  if (data.fairness && data.fairness.layers) {
+    data.fairness.layers.forEach(l => {
+      const color = l.status === "ok" ? "" : (l.status === "violation" ? ' style="color:#d33"' : ' style="color:#b80"');
+      rows.push(`<div class="kv"><b>${l.layer} ${l.name}</b>${color}：${l.status}</div>`);
+      if (l.detail) rows.push(`<div class="kv muted" style="font-size:11px;padding-left:12px">${l.detail}</div>`);
+    });
   }
-  if (data.projected_total != null) {
-    let proj = `<b>预计总耗</b>：${fmtTokens(data.projected_total)}`;
-    if (total != null && data.projected_total > total) {
-      proj += ` <span class="muted">（超预算 ${Math.round((data.projected_total - total) / total * 100)}%）</span>`;
-    }
-    rows.push(`<div class="kv">${proj}</div>`);
-  }
-  if (data.feasible_rounds != null) {
-    const m = data.safety_margin != null
-      ? ` <span class="muted">（安全余量 ${Math.round(data.safety_margin * 100)}%）</span>` : "";
-    rows.push(`<div class="kv"><b>可支撑轮数</b>：${data.feasible_rounds}${m}</div>`);
-  }
-  if (data.est_factor != null || data.call_factor != null || data.growth_ratio != null) {
-    const est = data.est_factor != null ? `${data.est_factor}×` : "-";
-    const call = data.call_factor != null ? `${data.call_factor}×` : "-";
-    const g = data.growth_ratio != null ? `${data.growth_ratio}×` : "-";
-    rows.push(`<div class="kv"><b>校准因子</b>：提示词 ${est} / 调用 ${call} / 增长 ${g}</div>`);
-  }
-  box.innerHTML = `
-    <div class="budget-bar${over ? " over" : ""}"><div class="budget-bar-fill" style="width:${pct}%"></div></div>
-    ${rows.join("")}
-  `;
+  box.innerHTML = rows.join("");
 }
 
 function addBudgetEvent(ev) {

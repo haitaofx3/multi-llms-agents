@@ -8,7 +8,7 @@
 
 - **逻辑验证**：通过对抗性辩论，暴露Agent逻辑链条中的漏洞。
 - **知识增强**：利用RAG机制，验证Agent在缺乏内部知识时的外部检索与整合能力。
-- **可控性**：实现辩论流程的自动化控制、成本预算管理及结果的可量化评估。
+- **可控性**：实现辩论流程的自动化控制、跨模型公平性治理及结果的可量化评估。
 
 ### 1.2 系统整体架构描述
 
@@ -23,7 +23,7 @@
 
 - **最小依赖**：核心逻辑不依赖特定LLM厂商，支持模型热切换。
 - **异步解耦**：所有Agent间通信基于消息队列，避免同步调用导致的级联阻塞。
-- **预算控制**：引入Token预算熔断机制，单场辩论设置硬性成本上限。
+- **公平性治理**：引入多层公平性机制（FairnessGovernor L1–L6），以「字符数 + 相对比例」为跨模型公平的度量单位，替代旧的全局 Token 预算硬约束。
 - **可观测性**：全链路Trace ID贯穿，支持单步回溯与人工介入。
 
 ---
@@ -42,7 +42,7 @@
 你是辩论系统的总调度器。你的任务不是辩论，而是管理辩论流程。
 1. 解析用户意图，生成辩论主题与约束条件。
 2. 监控当前轮次状态，若检测到收敛或超时，立即触发Judging流程。
-3. 严格遵循Token预算，若剩余预算<10%，强制结束辩论。
+3. 严格遵循公平性治理（FairnessGovernor L1–L6），不干预辩手发言长度与节奏。
 4. 输出必须为JSON格式，包含action, target_agent, payload字段。
 ```
 
@@ -78,9 +78,9 @@
 
 ### 2.4 Judge Agent（裁判Agent）
 
-- **职责**：评估单轮表现及全场胜负，提供多维度评分与改进建议。**按每位辩手分别评分**（`agent_scores`，四维：logic / evidence / rebuttal / clarity），并结合**系统实测的模型质量分**（流式发言 TTFT 与生成速率，非 LLM、确定性计算）合成**综合评分**推导胜方。
+- **职责**：评估单轮表现及全场胜负，提供多维度评分与改进建议。**按每位辩手分别评分**（`agent_scores`，四维：logic / evidence / rebuttal / clarity）。系统同时实测各辩手的**模型质量分**（流式发言 TTFT 与生成速率，非 LLM、确定性计算），但质量分**仅作展示，不参与胜负**——胜方由内容四维均分决定（**纯内容判定**）。
 - **评分范围**：只接收**辩手发言**（`_build_judge_debate_text` 剔除主持人开场 / 任务分派 / 追问 / 总结，仅保留 `is_main=False` 的 speech）；模型质量分也只对两位辩手（`collaborators`）的流式发言统计。
-- **综合评分公式**：`composite = 内容均分(agent_scores 四维均值) × JUDGE_CONTENT_WEIGHT + 模型质量分 × JUDGE_PERFORMANCE_WEIGHT`（默认 0.8 / 0.2，经 `.env` 可调）；`agent_scores` 缺失（如预算熔断回退）时退化为模型质量分。胜方取综合分最高辩手所在方（PRO/CON），两端并列最高取 DRAW。
+- **综合评分与胜方**：全局综合得分 `scores` 由**后端确定性计算**（按各辩手四维分数逐维取均值，不再请求 LLM 输出，避免"综合得分照抄某辩手分数"）；`composite_scores = 内容均分(agent_scores 四维均值) × JUDGE_CONTENT_WEIGHT + 模型质量分 × JUDGE_PERFORMANCE_WEIGHT`（默认 0.8 / 0.2，经 `.env` 可调）**仅作展示**；胜方取**内容均分最高**辩手所在方（PRO/CON），内容并列最高取 DRAW。`agent_scores` 缺失（如裁判调用失败回退）时 composite 退化为模型质量分、胜方为 DRAW。
 - **能力边界**：不参与辩论，仅做评估；需保持绝对中立。
 - **输入**：完整辩论历史（仅辩手发言）、ArgumentSubmit、Rebuttal。
 - **输出**：Judgment。
@@ -93,7 +93,8 @@
 2. 证据效力：RAG引用是否准确、相关。
 3. 反驳有效性：是否击中对方要害。
 4. 表达清晰度：结构是否清晰。
-输出JSON格式，包含scores, agent_scores（键=辩手名）, winner, critique, convergence_flag字段。
+输出JSON格式，包含agent_scores（键=辩手名）, winner, critique, convergence_flag字段。
+（全局 scores 由后端确定性计算，无需 LLM 输出；示例中的分数仅为格式展示，禁止照抄）
 ```
 
 ### 2.5 RAG Agent（知识检索Agent）
@@ -126,7 +127,7 @@
 | topic | string | ✅ | 辩论主题 |
 | stance | enum | ✅ | PRO / CON |
 | round | int | ✅ | 当前轮次，从1开始 |
-| budget_token | int | ✅ | 本任务剩余Token预算 |
+| budget_token | int | ✅ | 本任务剩余Token预算（协议保留字段，仅审计/遥测，不再做任何约束） |
 | timestamp | int | ✅ | Unix毫秒时间戳 |
 
 ### 3.2 论点提交消息 (ArgumentSubmit)
@@ -154,15 +155,15 @@
 
 | 字段 | 类型 | 必填 | 说明 |
 |------|------|------|------|
-| scores | object | ✅ | {logic: 8, evidence: 7, rebuttal: 9, clarity: 8}（全场总体分） |
+| scores | object | ✅ | {logic: 8, evidence: 7, rebuttal: 9, clarity: 8}（全局总体分，**后端按各辩手四维分数逐维取均值确定性计算**，不再依赖 LLM 输出） |
 | agent_scores | object | ❌ | 按辩手分别评分：{辩手名: {logic, evidence, rebuttal, clarity}}，键与辩手名一致 |
 | model_performance | object | ❌ | 系统实测模型质量：{辩手名: {avg_ttft_ms, avg_gen_rate, performance_score}} |
-| composite_scores | object | ❌ | 综合评分：内容分 × 0.8 + 模型质量分 × 0.2，{辩手名: 分值} |
-| winner | enum | ✅ | PRO / CON / DRAW（由综合分最高辩手所在方推导） |
+| composite_scores | object | ❌ | 综合评分（**仅展示，不参与胜负**）：内容均分 × 0.8 + 模型质量分 × 0.2，{辩手名: 分值} |
+| winner | enum | ✅ | PRO / CON / DRAW（**纯内容判定**：由内容四维均分最高辩手所在方推导；内容并列最高取 DRAW） |
 | critique | string | ✅ | 详细评语 |
 | convergence_flag | bool | ✅ | 是否触发收敛终止 |
 
-> **综合评分权重**：`composite = mean(agent_scores 四维) × JUDGE_CONTENT_WEIGHT(默认0.8) + performance_score × JUDGE_PERFORMANCE_WEIGHT(默认0.2)`。`performance_score` 由流式实测 TTFT（≤1s→10 / ≤5s→8 / ≤15s→6 / ≤30s→4 / 否则2）与生成速率（≥80字/s→10 / ≥40→8 / ≥20→6 / ≥10→4 / 否则2）取均值，无实测数据时取中性 5.0。
+> **综合评分权重**：`composite = mean(agent_scores 四维) × JUDGE_CONTENT_WEIGHT(默认0.8) + performance_score × JUDGE_PERFORMANCE_WEIGHT(默认0.2)`，**仅作展示**；`performance_score` 由流式实测 TTFT（≤1s→10 / ≤5s→8 / ≤15s→6 / ≤30s→4 / 否则2）与生成速率（≥80字/s→10 / ≥40→8 / ≥20→6 / ≥10→4 / 否则2）取均值，无实测数据时取中性 5.0。**胜方不依赖 composite**，只由 `agent_scores` 四维均分决定。
 
 ### 3.5 状态同步消息 (StatusSync)
 
@@ -170,7 +171,9 @@
 |------|------|------|------|
 | current_round | int | ✅ | 当前轮次 |
 | agent_states | object | ✅ | {pro: "IDLE", con: "THINKING", judge: "WAITING"} |
-| remaining_budget | int | ✅ | 全局剩余Token |
+| spent_tokens | int | ✅ | 累计 Token 用量（输入+输出，**只读遥测**，不做任何约束） |
+| output_tokens | int | ✅ | 累计输出 Token（实时，只读遥测） |
+| fairness | object | ✅ | 公平性治理报告（FairnessGovernor L1–L6 各层状态） |
 | elapsed_time_ms | int | ✅ | 已耗时毫秒数 |
 
 ---
@@ -183,7 +186,7 @@
 [*] --> Idle
 Idle --> Preparing: Supervisor接收任务
 Preparing --> Debating: RAG初始化完成 & 双方Ready
-Debating --> Debating: 轮次结束 & 未收敛 & 预算充足
+Debating --> Debating: 轮次结束 & 未收敛
 Debating --> Judging: 触发终止条件
 Judging --> Finished: 裁决完成
 Finished --> [*]
@@ -202,7 +205,6 @@ Debating --> Idle: 异常熔断
 ### 4.3 轮次终止条件
 
 - **硬限制**：current_round >= MAX_ROUNDS (默认5)。
-- **预算熔断**：remaining_budget < MIN_TOKEN_THRESHOLD (默认1000)。
 - **收敛检测**：连续2轮 similarity_score > 0.85 且无新证据引入。
 - **人工终止**：通过API手动触发 force_stop。
 
@@ -269,11 +271,18 @@ Debating --> Idle: 异常熔断
 - **反驳阶段**：依赖对方立论，必须**串行**，但RAG核查可与反驳生成**并行**（异步注入）。
 - **裁决阶段**：等待所有轮次结束后**单次调用**，避免每轮裁决浪费Token。
 
-### 6.3 Token预算控制
+### 6.3 公平性治理（替代 Token 预算控制）
 
-- **预算分配**：Supervisor持有全局Budget，每次分发扣除预估Token（基于历史平均）。
-- **动态调整**：若当前轮实际消耗>预估120%，下一轮自动缩减max_tokens参数或强制摘要。
-- **硬截断**：LLM API调用前检查remaining_budget，不足则直接返回BudgetExceeded，不调用API。
+Token 数不是跨模型公平的度量单位（不同模型的量化方式与 embedding 向量维度不同），全局 `total_token` 预算机制已移除，`max_tokens` 不再下发给 API。改为 `app/fairness.py` 的 **FairnessGovernor** 六层治理，以「字符数 + 相对比例」作为跨模型公平的度量单位：
+
+- **L1 输出上限**：相对（参照对手近 N 轮有效输出均值 × `FAIR_OUTPUT_RATIO`，下限 `FAIR_FLOOR_CHAR_LIMIT`）× 比例与硬性字符安全上限（`FAIR_HARD_CHAR_CEILING` 默认 3000）取 min；超限后**事后截断**（保留头尾，不阻止生成，防止截断竞态）。
+- **L2 有效回答比例**：剥离 `<think>` 思考片段后统计有效回答占比，思考占比超 `FAIR_THINK_RATIO_MAX` 记 warning。
+- **L3 输入对称性**：PRO/CON 反驳时可见的对手历史轮数相等（或差 ≤ `FAIR_MAX_SEEN_DIFF`，落后方下一回合紧跟补齐）。
+- **L4 轮次对称性**：每个模型每轮至多一次发言。
+- **L5 采样参数对齐**：辩论发言统一 `temperature` / `top_p`（`FAIR_TEMPERATURE` / `FAIR_TOP_P`）；裁判/摘要等辅助 LLM 走同一套对齐入口（`FAIR_JUDGE_TEMPERATURE` / `FAIR_JUDGE_TOP_P`）。
+- **L6 长度中性评审**：裁判提示词明确「不以长度论优劣，只看有效论证密度」。
+
+token 用量（累计 `spent_tokens` / 输出 `output_tokens`）仅作**只读遥测**实时展示，不做任何约束。
 
 ### 6.4 缓存策略
 

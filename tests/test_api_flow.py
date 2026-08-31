@@ -9,9 +9,8 @@ _judge_round / _final_summary）实现确定性输出，覆盖：
   2. /api/save_markdown 路径穿越防护（filename 仅保留 basename）；
   3. /api/save_markdown 空请求体（前端发送无 body 的 POST）可用默认文件名；
   4. /api/configure 空 Agent 列表返回既有 400 错误契约；
-  5. /api/configure 的 max_tokens 透传到 orchestrator.max_tokens；
-  6. /api/configure 返回预算可行性（feasibility）；
-  7. /api/status 携带预算规划字段（生效输出上限 / 可达轮数 / 预估总耗 / 校准因子）。
+  5. /api/configure 返回公平性治理报告（fairness），不再有 budget/max_tokens 字段；
+  6. /api/status 携带公平性治理报告与只读 token 遥测（spent_tokens/output_tokens）。
 
 运行方式（无需服务器、无需真实 LLM）：
     python -m unittest tests.test_api_flow -v
@@ -74,7 +73,6 @@ class ApiFlowTest(unittest.IsolatedAsyncioTestCase):
         """配置 + 启动，并轮询 /api/status 直到 done；返回最终状态体。"""
         cfg = await self.client.post("/api/configure", json={
             "agents": agents, "topic": topic, "max_rounds": max_rounds,
-            "budget": 100000,
         })
         self.assertEqual(cfg.status_code, 200, cfg.text)
         self.assertTrue(cfg.json()["ok"])
@@ -149,69 +147,56 @@ class ApiFlowTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resp.status_code, 400)
         self.assertIn("error", resp.json())
 
-    async def test_configure_max_tokens_passthrough(self):
-        """/api/configure 的 max_tokens 应落到 orchestrator.max_tokens。"""
+    async def test_configure_returns_fairness_only(self):
+        """/api/configure 应返回公平性治理报告（L1-L6），不再返回 budget/max_tokens。"""
         cfg = await self.client.post("/api/configure", json={
-            "agents": [HOST_CFG, PRO_CFG, CON_CFG], "topic": "测试主题",
-            "max_rounds": 1, "budget": 100000, "max_tokens": 1234,
-        })
-        self.assertEqual(cfg.status_code, 200, cfg.text)
-        self.assertTrue(cfg.json()["ok"])
-        self.assertEqual(cfg.json().get("max_tokens"), 1234)
-        self.assertEqual(orchestrator.max_tokens, 1234)
-
-        # 再次 configure 不传 max_tokens 时，沿用上一次设置（字段仍应存在）
-        cfg2 = await self.client.post("/api/configure", json={
-            "agents": [HOST_CFG, PRO_CFG, CON_CFG], "topic": "测试主题2",
-            "max_rounds": 1, "budget": 100000,
-        })
-        self.assertEqual(cfg2.status_code, 200, cfg2.text)
-        self.assertIsInstance(cfg2.json().get("max_tokens"), int)
-        self.assertEqual(cfg2.json()["max_tokens"], orchestrator.max_tokens)
-
-    async def test_configure_returns_feasibility(self):
-        """/api/configure 应返回预算可行性（生效上限 / 可达轮数 / 预估总耗 / 是否超支）。"""
-        cfg = await self.client.post("/api/configure", json={
-            "agents": [HOST_CFG, PRO_CFG, CON_CFG], "topic": "预算可行性",
-            "max_rounds": 3, "budget": 1_000_000, "max_tokens": 4096,
+            "agents": [HOST_CFG, PRO_CFG, CON_CFG], "topic": "公平性可行性",
+            "max_rounds": 3,
         })
         self.assertEqual(cfg.status_code, 200, cfg.text)
         data = cfg.json()
         self.assertTrue(data["ok"])
-        feas = data.get("feasibility")
-        self.assertIsNotNone(feas)
-        for key in ("effective_max_tokens", "feasible_rounds", "projected_total",
-                    "overshoot", "degraded", "tail_reserve"):
-            self.assertIn(key, feas)
-        self.assertEqual(feas["effective_max_tokens"], 4096)
-        self.assertGreaterEqual(feas["feasible_rounds"], 3)
-        self.assertIs(feas["overshoot"], False)
+        # 公平性治理报告（六层）
+        fair = data.get("fairness")
+        self.assertIsNotNone(fair)
+        self.assertIn("ok", fair)
+        self.assertIsInstance(fair["layers"], list)
+        self.assertEqual({l["layer"] for l in fair["layers"]},
+                         {"L1", "L2", "L3", "L4", "L5", "L6"})
+        # total_tokens 预算限制已删除：不再返回 budget / max_tokens / feasibility
+        for key in ("budget", "max_tokens", "feasibility",
+                    "effective_max_tokens", "projected_total"):
+            self.assertNotIn(key, data)
 
-    async def test_api_status_has_budget_plan_fields(self):
-        """/api/status 应携带预算规划字段（供前端状态栏展示与预警）。"""
+    async def test_api_status_has_fairness_and_token_telemetry(self):
+        """/api/status 应携带公平性治理报告与只读 token 遥测（实时显示用）。"""
         cfg = await self.client.post("/api/configure", json={
-            "agents": [HOST_CFG, PRO_CFG], "topic": "预算状态",
-            "max_rounds": 2, "budget": 100000,
+            "agents": [HOST_CFG, PRO_CFG], "topic": "公平性状态",
+            "max_rounds": 2,
         })
         self.assertEqual(cfg.status_code, 200, cfg.text)
         r = await self.client.get("/api/status")
         self.assertEqual(r.status_code, 200)
         s = r.json()
-        for key in ("effective_max_tokens", "feasible_rounds", "projected_total",
+        self.assertIn("fairness", s)
+        self.assertIsInstance(s["fairness"]["ok"], bool)
+        self.assertEqual({l["layer"] for l in s["fairness"]["layers"]},
+                         {"L1", "L2", "L3", "L4", "L5", "L6"})
+        # 只读遥测：累计输出 token / 累计用量 / 耗时（前端实时显示）
+        for key in ("spent_tokens", "output_tokens", "elapsed_time_ms"):
+            self.assertIn(key, s)
+        self.assertIsInstance(s["output_tokens"], int)
+        self.assertIsInstance(s["spent_tokens"], int)
+        self.assertGreaterEqual(s["output_tokens"], 0)
+        self.assertGreaterEqual(s["spent_tokens"], 0)
+        self.assertIsInstance(s["elapsed_time_ms"], int)
+        # total_tokens 预算限制已删除：不再返回任何预算字段
+        for key in ("budget", "remaining_budget", "spent_budget",
+                    "effective_max_tokens", "feasible_rounds", "projected_total",
                     "budget_overshoot", "budget_degraded",
                     "est_factor", "call_factor", "growth_ratio",
                     "safety_margin", "prompt_forecast"):
-            self.assertIn(key, s)
-        self.assertIsInstance(s["effective_max_tokens"], int)
-        self.assertIsInstance(s["feasible_rounds"], int)
-        self.assertIsInstance(s["budget_overshoot"], bool)
-        # 校准因子 / 安全余量 / 提示词预估：前端预算面板渲染所需
-        self.assertIsInstance(s["est_factor"], float)
-        self.assertIsInstance(s["call_factor"], float)
-        self.assertIsInstance(s["growth_ratio"], float)
-        self.assertIsInstance(s["safety_margin"], float)
-        self.assertIsInstance(s["prompt_forecast"], int)
-        self.assertGreaterEqual(s["est_factor"], 1.0)  # 保守先验 / 档案载入均钳制 ≥1.0
+            self.assertNotIn(key, s)
 
 
 if __name__ == "__main__":
