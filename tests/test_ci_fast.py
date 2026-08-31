@@ -41,6 +41,18 @@ def _fake_llm_result(content="发言"):
             "usage": {"total_tokens": 1}}
 
 
+def _restore_llm_fakes(orch):
+    """删除在 orchestrator 实例上注入的 LLM 假方法，回落到真实类方法。
+
+    这些测试会 monkeypatch 全局 orchestrator 的 LLM 调用点；若测试结束后
+    不还原，会污染后续执行的测试模块（例如 test_features_v2 看到的是残留的
+    fake _final_summary，而不是真实实现）。
+    """
+    for name in ("_judge_round", "_final_summary", "_consume_stream", "_run_llm_retry"):
+        if name in orch.__dict__:
+            delattr(orch, name)
+
+
 class OrchestratorControlTest(unittest.IsolatedAsyncioTestCase):
     """编排器控制流（暂停/继续/结束 + 手动结束收尾）测试。"""
 
@@ -104,6 +116,7 @@ class OrchestratorControlTest(unittest.IsolatedAsyncioTestCase):
         orchestrator._final_summary = fake_summary
         orchestrator._consume_stream = fake_consume
         orchestrator._run_llm_retry = lambda *a, **k: _fake_llm_result()
+        self.addCleanup(_restore_llm_fakes, orchestrator)
 
         orchestrator.status = "idle"
         task = asyncio.create_task(orchestrator.run_discussion())
@@ -136,6 +149,7 @@ class OrchestratorControlTest(unittest.IsolatedAsyncioTestCase):
         orchestrator._final_summary = fake_summary
         orchestrator._consume_stream = fake_consume
         orchestrator._run_llm_retry = lambda *a, **k: _fake_llm_result()
+        self.addCleanup(_restore_llm_fakes, orchestrator)
 
         orchestrator.status = "idle"
         task = asyncio.create_task(orchestrator.run_discussion())
@@ -347,6 +361,7 @@ class FairnessGovernorTest(unittest.IsolatedAsyncioTestCase):
         orchestrator._final_summary = fake_summary
         orchestrator._consume_stream = fake_consume
         orchestrator._run_llm_retry = lambda *a, **k: _fake_llm_result()
+        self.addCleanup(_restore_llm_fakes, orchestrator)
 
         orchestrator.status = "idle"
         task = asyncio.create_task(orchestrator.run_discussion())

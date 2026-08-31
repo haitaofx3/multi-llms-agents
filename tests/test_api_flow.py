@@ -40,6 +40,18 @@ def _fake_llm_result(content="发言"):
             "usage": {"total_tokens": 1}}
 
 
+def _restore_llm_fakes(orch):
+    """删除在 orchestrator 实例上注入的 LLM 假方法，回落到真实类方法。
+
+    asyncSetUp 会 monkeypatch 全局 orchestrator 的 LLM 调用点；若测试结束
+    后不还原，会污染后续执行的测试模块（例如 test_features_v2 看到的将是
+    残留的 fake _final_summary，而不是真实实现）。
+    """
+    for name in ("_judge_round", "_final_summary", "_consume_stream", "_run_llm_retry"):
+        if name in orch.__dict__:
+            delattr(orch, name)
+
+
 class ApiFlowTest(unittest.IsolatedAsyncioTestCase):
     """HTTP 接口全流程（无真实 LLM，CI 可用）。"""
 
@@ -67,6 +79,8 @@ class ApiFlowTest(unittest.IsolatedAsyncioTestCase):
 
     async def asyncTearDown(self):
         orchestrator.end()
+        # 还原 LLM 调用点，避免污染后续测试模块
+        _restore_llm_fakes(orchestrator)
         await self.client.aclose()
 
     async def _configure_and_run(self, agents, topic="测试主题", max_rounds=1):
