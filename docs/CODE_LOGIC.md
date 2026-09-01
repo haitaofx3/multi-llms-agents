@@ -14,6 +14,7 @@
 - 每个 Agent 拥有**独立的基础模型**（Qwen / DeepSeek / MiMo / 自定义，默认取 `.env` 的 `LLM_*`，当前为 MiMo）、**立场**（主持人 HOST / 正方 PRO / 反方 CON / 中立 NEUTRAL）、**记忆系统**（短期 / 长期 / 情境 + 遗忘）、**MCP 工具集**（知识检索 / 联网搜索 / 记忆回忆）。
 - 首个 Agent 为**辩论主持人（Supervisor 视角）**：分派任务、逐轮追问、最终汇总；辩论结束后由**裁判（Judge）**单次裁决，按内容四维（logic / evidence / rebuttal / clarity）对**每位辩手**独立评分，**胜方由内容四维均分决定（纯内容判定）**；系统实测的模型质量分（TTFT / 生成速率）与内容分合成综合评分（`composite_scores`）**仅作展示、不参与胜负**。最终报告为**结构化结论（四段式）**：核心结论 / 各方立场 / 裁判裁决 / 分歧与待办。
 - 辩论流程：第 1 轮**并行立论**（`asyncio.gather`），后续轮次**串行反驳/辩护**；达到终止条件（最大轮次 / 语义收敛 / 手动结束）后进入裁决与汇总。全局 Token 预算已移除，改为 **FairnessGovernor L1–L6** 公平性治理（以字符数 + 相对比例为度量），token 用量与**费用估算（¥）**仅作只读遥测。
+- **双模式（§12.17）**：同一编排器支持辩论 / 合作两种讨论模式（前端选择器 / `/api/configure` `mode` 字段 / `.env` `DISCUSSION_MODE` 兜底）。**合作模式**由主 Agent 把整体任务拆成子任务放入共享任务池，子 Agent `claim_task` 认领独占 + `report_result` 回报，全部完成即提前收尾、无裁判；**反思与自我修正（§12.18）**使子 Agent 回报前对照 `expected_outcome` 额外一次 LLM 自评修订，有修订才落库。
 - 提供**简约大气**的圆桌 UI（席位按数量等分）、**聊天气泡式发言**（并发流式按 speaker 独立气泡）、**工具调用可视化**（气泡内显示"正在调用工具 X…"）、**首字母文字头像**（按立场配色）、暂停 / 继续 / 结束、Markdown 结果导出。
 - **历史记忆化检索**：每场讨论完成或保存时，题目 + 元信息自动写入 `data/discussions/index.json`，前端历史面板支持关键词搜索与一键查看 / 下载。
 - **可观测性**：每次讨论生成 `trace_id`，贯穿事件流、状态同步与导出的 Markdown。
@@ -58,7 +59,7 @@ mini_test/
 │   ├── test_ci_fast.py   快速单元测试（状态机/公平性/裁决，无需服务器）
 │   ├── test_api_flow.py  HTTP 接口级测试（ASGITransport + LLM 打桩，无需服务器/真实模型）
 │   ├── test_multi_session.py  多会话隔离测试（DebateManager / 会话元数据 / 中断恢复）
-│   └── test_features_v2.py    新特性测试（费用估算 / 收敛降级 / 工具可视化 / 结构化结论 / 论据句抽取 / 任务-辩论分离）
+│   └── test_features_v2.py    新特性测试（费用估算 / 收敛降级 / 工具可视化 / 结构化结论 / 论据句抽取 / 任务-辩论分离 / 双模式合作 / 反思与自我修正）
 ├── docs/
 │   └── CODE_LOGIC.md     本文档
 ├── data/                 运行时数据（自动生成，不提交到版本库）
@@ -512,7 +513,7 @@ while round < max_rounds:
 
 **反思调用**：
 - 取草稿 `report.get("var_value","") or report.get("message","")`，经 `_reflection_prompt(task, draft)`（模块级纯函数）拼出三段式提示词；
-- 经 `_agent_turn(collab, prompt, mode="collaboration", allow_delegate=False, stream=False)` 调用：**非主 Agent + `"collaboration"`** → 不注入任何工具（§12.4），非流式不产生 speech 气泡，`_apply_usage` 自动计入 spent/output_tokens 遥测，L1 截断自动生效。
+- 经 `_agent_turn(collab, prompt, mode="collaboration", allow_delegate=False, stream=False)` 调用：**非主 Agent + `"collaboration"`** → 不注入任何工具（§12.4），非流式不产生 speech 气泡，`_apply_usage` 自动计入 spent/output_tokens 遥测；反思 LLM 的原始输出**不**经 `_agent_turn` 的 L1 兜底截断，仅在落库前由 `_reflect_report` 对修订版显式截断（见下）。
 
 **输出解析**：
 - `_parse_reflection(text)`（模块级纯函数）按 `re.match(r"^#{1,2}\s+(.+)$")` 匹配 Markdown 标题，按「自我反思 / 修订后结果 / 修订说明」关键词映射段名，缺段回退空串，返回 `{"reflection", "revision", "explanation"}`。不复用 `_split_sections`（其按标题精确取段、无缺失容错）。
@@ -550,6 +551,7 @@ FastAPI 应用，挂载 `/static`，提供 REST + WebSocket。
 | GET | `/api/defaults` | 返回供应商预设（**已剥离 api_key**）、向量库后端、最大 Agent 数 |
 | POST | `/api/configure` | 配置 Agent（1–6）、主题、最大轮次；**请求体 `ConfigureRequest`（含 `session_id`，pydantic 校验，非法 422）**；返回 `agents/stance/phase/trace_id/max_rounds/session_id` + **`fairness`（L1–L6 各层状态报告，替代旧可行性/预算视图）** |
 | POST | `/api/ingest` | 向共享向量库注入知识（**请求体 `IngestRequest` 校验**，按段落切分） |
+| POST | `/api/upload` | 上传文件解析并注入共享向量库（`file_parser`，支持 txt/md/docx/xlsx/pdf/图片 OCR，20MB 上限，见 §13.5） |
 | POST | `/api/start` | 启动讨论（**请求体 `StartRequest` 可省略**，`_spawn_task(run_discussion)` 登记后台任务） |
 | POST | `/api/pause` `/api/resume` `/api/end` | 暂停/继续/结束（**请求体 `SessionRequest` 仅需 `session_id`，可省略**） |
 | GET | `/api/status` | 状态、阶段、轮次、Agent、任务、共享上下文、裁判结果、**Token 遥测（`spent_tokens` / `output_tokens`）与公平性报告（`fairness`）与费用估算（`cost_rmb`）**；会话被标记为 `interrupted` 时额外返回 `status=interrupted` + `interrupted=true` |
@@ -661,7 +663,9 @@ FastAPI 应用，挂载 `/static`，提供 REST + WebSocket。
 | `tool_call_args` | `speaker, tool, index, delta` | 工具参数增量（P1-4，可选展示） |
 | `tool_call_end` | `speaker, tool, index, result` | 工具调用结束（P1-4） |
 | `task_assigned` | `from, to, content, expected, var, task_id, timestamp` | 任务分派 |
+| `task_claimed` | `from, task_id, var, timestamp` | 合作模式任务被认领（认领者独占负责，经 `_spawn_task` 异步发布） |
 | `task_result` | `from, var, value, completed, message, task_id, timestamp, token_cost` | 任务回报/变量回填 |
+| `task_revised` | `from, var, task_id, value, reflections, revised, timestamp` | 合作模式反思修订（§12.18）：`revised=true` 修订后已落库 / `false` 维持草稿 |
 | `status_sync` | `trace_id, phase, current_round, agent_states, spent_tokens, output_tokens, fairness, cost_rmb, elapsed_time_ms` | 状态同步（架构状态机/遥测心跳，驱动状态面板实时刷新） |
 | `judgment` | `judge, scores, agent_scores, model_performance, composite_scores, winner, critique, convergence_flag, round` | 裁判裁决（`scores` 后端均值；`composite_scores` 仅展示；`winner` 纯内容判定） |
 | `summary` | `speaker, text, round` | 最终总结 |
@@ -769,7 +773,7 @@ FastAPI 应用，挂载 `/static`，提供 REST + WebSocket。
 - **导出**：`/api/export` 返回约 19KB Markdown（含发言记录、裁判裁决、**「模型性能与综合评分」表**、任务结果表、记忆快照），落盘 `data/discussions/e2e_export.md`。
 - **校验输出**：`ARCHITECTURE CHECKS PASS (state machine / budget / judge)`（budget 字样为旧版断言残留）、`STREAMING CHECKS PASS`，断言覆盖 `agent_scores / model_performance / composite_scores` 非空且 `winner ∈ (PRO, CON, DRAW)`。
 
-> 该验证同时覆盖了降级路径（本机无 Qdrant → `in-memory`；无 HF 网络 → 哈希向量）。无需服务器的快速回归见 `tests/test_ci_fast.py`（状态机 / **公平性治理 L1–L6** / 裁决分档 / 综合评分逻辑 / Token 遥测）与 `tests/test_api_flow.py`（HTTP 接口全链路 + 路径穿越防护，LLM 打桩）及 `tests/test_features_v2.py`（费用估算 / 收敛降级 / 工具可视化 / 结构化结论 / **论据句抽取 `ArgumentSnippetTest`** / **任务-辩论分离 `TaskDebateSeparationTest`**）。全量回归：`python -m unittest discover tests` → **82 tests OK**。
+> 该验证同时覆盖了降级路径（本机无 Qdrant → `in-memory`；无 HF 网络 → 哈希向量）。无需服务器的快速回归见 `tests/test_ci_fast.py`（状态机 / **公平性治理 L1–L6** / 裁决分档 / 综合评分逻辑 / Token 遥测）与 `tests/test_api_flow.py`（HTTP 接口全链路 + 路径穿越防护，LLM 打桩）及 `tests/test_features_v2.py`（费用估算 / 收敛降级 / 工具可视化 / 结构化结论 / **论据句抽取 `ArgumentSnippetTest`** / **任务-辩论分离 `TaskDebateSeparationTest`** / **双模式合作 `CollaborationModeTest`** / **反思与自我修正 `ReflectionTest`**）。全量回归：`python -m unittest discover tests` → **94 tests OK**。
 
 ---
 
