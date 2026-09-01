@@ -33,17 +33,19 @@
 22. **工程化与质量门禁**：`pyproject.toml` 统一 ruff / mypy / coverage 配置；`requirements-dev.txt` 提供开发依赖；新增 `tests/test_api_flow.py` 接口级测试（`httpx.ASGITransport` 直接驱动应用 + LLM 调用点打桩），无需服务器 / 真实模型即可在 CI 全量覆盖 HTTP 链路，与 `test_ci_fast` 一并构成快速回归门禁。
 23. **公平性治理（FairnessGovernor L1–L6）**：以「字符数 + 相对比例」为跨模型公平的度量单位（Token 数非跨模型公平度量），替代旧的全局 Token 预算总控——L1 输出上限（相对对手近 N 轮有效输出均值 × 比例 + 硬性字符安全上限，超限事后截断）、L2 有效回答比例（剥离 `<think>` 统计）、L3 输入对称性（双方可见对手轮数一致）、L4 轮次对称性（每模型每轮至多一次发言）、L5 采样参数对齐（辩论/裁判统一 temperature / top_p）、L6 长度中性评审（裁判不以长度论优劣）。详见 `app/fairness.py`。
 24. **实时状态面板（遥测 + 公平性）**：讨论页侧栏实时展示运行时长（`elapsed_time_ms`）、Token 用量（累计 `spent_tokens` / 输出 `output_tokens`，**只读遥测**，不做任何约束）与公平性治理报告（L1–L6 各层状态 + 截断/思考占比/可见轮数等指标）；前端每秒轮询 + `status_sync` 事件推送。
-25. **对手定向反驳（辩论机制）**：第 1 轮基于角色/性格立论；第 2 轮引用**对手上轮发言原文**（截断至 `OPPONENT_SNIPPET_MAX_CHARS` 字）逐条反驳；第 3 轮起引用对手上轮发言的 **LLM 摘要**（`OPPONENT_SUMMARY_MAX_CHARS` 字，按 `(对手,轮次)` 缓存防重复调用，usage 计入只读遥测）——PRO↔CON 互为对手，NEUTRAL/HOST 无固定对手时回退「上一发言人」逻辑。
+25. **对手定向反驳（辩论机制）**：第 1 轮基于角色/性格立论；第 2 轮引用**对手上轮发言原文**（截断至 `OPPONENT_SNIPPET_MAX_CHARS` 字）逐条反驳；第 3 轮起引用对手上轮发言的 **LLM 摘要**（`OPPONENT_SUMMARY_MAX_CHARS` 字，按 `(对手,轮次)` 缓存防重复调用，usage 计入只读遥测）——PRO↔CON 互为对手，NEUTRAL/HOST 无固定对手时回退「上一发言人」逻辑。第 3 轮起额外抽取对手发言中的**关键论据句**（`OPPONENT_ARGUMENT_SNIPPET_MAX_CHARS` 字，`_extract_argument_sentences` 按序号/论据关键词启发式，§5.4）随摘要一起注入 prompt，并要求「逐条回应，不要遗漏」——弥补 LLM 摘要丢失具体论点导致的泛泛反驳。
 26. **输出字数约束（需求 5，公平性 L1）**：每轮发言受 `FairnessGovernor.ceiling_for` 字符上限约束（立论/无参照时 `FAIR_OPENING_CHAR_LIMIT`，否则相对对手近 N 轮有效输出均值 × `FAIR_OUTPUT_RATIO`，再与硬上限 `FAIR_HARD_CHAR_CEILING` 取 min）——提示词显式给出字数要求，LLM 仍超长时按字符硬截断兜底（`fairness.output_truncate` 告警）；不再把 `max_tokens` 下发给 API。
 27. **按轮历史强压缩（长对话管理）**：`compress_history(keep_rounds=N)` 支持只保留最近 N 个不同轮次的原文、更早轮次经 LLM 摘要压入 `compressed_summary`（由系统提示注入）；`history` 与 `history_rounds` 平行维护、三处裁剪同步。轮次边界由 `_memory_housekeeping` 调用默认 A9 压缩（`CONTEXT_COMPRESS_THRESHOLD` 触发），保持长对话输入成本可控。
 28. **记忆 LLM 摘要压缩**：记忆管家偶数轮把短期记忆聚合为一条情境记忆时，调用 `summarize_text` 生成 LLM 摘要（上限 `MEMORY_SUMMARY_MAX_CHARS` 字，usage 计入只读遥测；LLM 失败回退确定性拼接），替代原来的简单 `"近期要点："` 拼接，情境记忆更精炼、可检索性更好。
-29. **多会话隔离（P1-7）**：`app/manager.py` 的 `DebateManager` 按 `session_id` 管理**独立 Orchestrator 实例**，不同浏览器 / 客户端互不干扰；前端每个浏览器在 `localStorage` 持久化一个稳定 `session_id`；会话元数据落盘 `data/sessions/{sid}.json`，进程重启后把遗留 `running/paused` 会话标记为 `interrupted` 并在前端展示「上次讨论中断」横幅。缺省会话 `"default"` 保持向后兼容。
+29. **多会话隔离（P1-7）**：`app/manager.py` 的 `DebateManager` 按 `session_id` 管理**独立 Orchestrator 实例**，不同浏览器 / 客户端互不干扰；前端每个浏览器在 `localStorage` 持久化一个稳定 `session_id`；会话元数据落盘 `data/sessions/{sid}.json`，进程重启后把遗留 `running/paused` 会话标记为 `interrupted` 并在前端展示「上次讨论中断」横幅。会话实例统一经 `get_or_create(session_id)` 惰性创建并持有（§1.3 解耦：已移除模块级 `orchestrator` 单例与 `register()` 双入口）。
 30. **工具调用可视化（P1-4）**：流式通道新增 `tool_call_start` / `tool_call_args` 事件，前端发言气泡内实时显示"正在调用工具 X…"；`_agent_turn` 自动去重（流式已发出的工具开始事件不再重复发），纯工具回合补发 `speech_start`/`speech_end` 保证气泡不悬空——消除工具调用的"黑盒等待"。
 31. **结构化结论（P0-1）**：讨论结束的最终报告固定**四段式**——「核心结论 / 各方立场与论点摘要 / 裁判裁决 / 分歧与待办」；模型输出的裁决段被权威数据（`_judge_ruling_text`）**确定性重写**，其余段缺失时确定性补齐；前端「核心结论」面板实时展示 `conclusion` 事件。
 32. **费用估算展示（P1-6）**：按 token 遥测估算本场费用并展示为**人民币 ¥**（`_estimate_cost_rmb`：输入 = 累计 − 输出，单价 `COST_INPUT_PER_1M`（默认 ¥2） / `COST_OUTPUT_PER_1M`（默认 ¥8）每百万 token，可按供应商在 `.env` 覆盖）；作为**只读遥测**随 `speech_end` / `status_sync` / `/api/status` / 导出文档展示，不参与任何约束。
-33. **收敛检测降级回退（P0-3）**：语义嵌入不可用（`is_fallback()`，如离线哈希向量模式）时，收敛检测自动切换到**文本相似度**（difflib `SequenceMatcher`，阈值 `CONVERGENCE_TEXT_SIMILARITY` 默认 0.6），连续 `CONVERGENCE_ROUNDS` 轮高度相似且无新证据即提前结束——嵌入缺失不再让"收敛提前终止"失效。
+33. **收敛检测降级回退（P0-3）**：语义嵌入不可用（`is_fallback()`，如离线哈希向量模式）时，收敛检测自动切换到**文本相似度**（difflib `SequenceMatcher`，阈值 `CONVERGENCE_TEXT_SIMILARITY` 默认 0.6），连续 `CONVERGENCE_ROUNDS` 轮高度相似且无新证据即提前结束——嵌入缺失不再让"收敛提前终止"失效。`CONVERGENCE_PER_SPEAKER`（默认开）启用时按**连续两轮都有发言的共同辩手逐人计算相似度再取平均**（§5.7），避免拼接全文时单一长文本主导而误判收敛。
 34. **讨论模板持久化（P1-5）**：前端支持把当前席位配置保存为模板（`localStorage`，`debate.templates.v1`），一键载入 / 删除，重复配置零成本。
 35. **质量基线评估脚本（P0-2）**：`scripts/eval_baseline.py` 对一场导出的讨论 Markdown 做**五维质量评分**（结构 0.20 / 完成度 0.25 / 参与度 0.25 / 公平性 0.20 / 效率 0.10，0–100 分），可与历史基线 JSON 对比，发现质量退化时以退出码 2 报回归——改 prompt / 换模型后的质量是否退化"一测便知"。
+36. **任务与辩论回合分离（§5.8）**：协作 Agent 每轮拆为两个独立回合——`_task_turn`（只处理待办任务，结果回填 `shared_context` 并发布 `task_result`，**不写 `round_arguments` / 记忆**）与 `_debate_turn`（专职立论 / 反驳，正常记录发言）。任务输出不再污染收敛检测、RAG 事实核查与对手上下文，也避免任务细节泄露到辩论发言中。
+37. **RAG 证据按立场分桶（§5.3）**：每轮事实核查把证据按发言人立场分组存放（`round_evidence[round] = {stance: [...]}`），下一轮注入时 `_evidence_for_round(round, stance)` 只取**与本人立场对应**的证据桶（无立场 / 空桶回退默认桶）——辩手不会被对手立场的核查结果干扰。
 
 ## 目录结构
 
@@ -65,8 +67,9 @@ mini_test/
 │   ├── logger.py         结构化 JSON 日志（trace_id 追踪、事件归类）
 │   ├── tools.py          每个 Agent 的 MCP 工具注册表 + 内置工具
 │   ├── agent.py          Agent 定义（角色/性格/模型/记忆/MCP/上下文构建 + 历史压缩）
-│   ├── orchestrator.py   圆桌编排器（辩论主循环、任务分派/回报、停止判定、运行摘要）
-│   ├── manager.py        多会话管理器（DebateManager 会话注册表 + 元数据持久化 + 中断恢复）
+│   ├── orchestrator.py   圆桌编排器（辩论主循环、任务回合/辩论回合分离、任务分派/回报、停止判定、运行摘要）
+│   ├── manager.py        多会话管理器（DebateManager 会话注册表 + 元数据持久化 + 中断恢复；会话统一经 get_or_create 持有）
+│   ├── bgtasks.py        后台 asyncio 任务强引用集合（RUF006；main/orchestrator 统一复用 spawn()，防 GC 提前回收）
 │   ├── history.py        历史讨论记忆索引（data/discussions/index.json + 检索 + Markdown 读取，防路径穿越）
 │   ├── file_parser.py    上传文件文本提取（txt/md/docx/xlsx/pdf/图片 OCR，懒加载依赖 + 大小/字符上限）
 │   ├── main.py           FastAPI 应用（REST + WebSocket + 静态服务）
@@ -81,7 +84,7 @@ mini_test/
 │   ├── test_ci_fast.py   快速单元测试（状态机 / 公平性 / 裁决）
 │   ├── test_api_flow.py  HTTP 接口级测试（ASGITransport，无需服务器 / 无需真实 LLM）
 │   ├── test_multi_session.py  多会话隔离测试（DebateManager / 会话元数据 / 中断恢复）
-│   └── test_features_v2.py    新特性测试（费用估算 / 收敛降级 / 工具可视化 / 结构化结论）
+│   └── test_features_v2.py    新特性测试（费用估算 / 收敛降级 / 工具可视化 / 结构化结论 / 论据句抽取 / 任务-辩论分离）
 ├── docs/
 │   └── CODE_LOGIC.md     代码逻辑详解（模块职责 → 关键函数 → 数据流）
 ├── data/                 运行时数据（自动生成，不提交到版本库）
@@ -120,14 +123,14 @@ pip install -r requirements.txt
 | `CONTEXT_MAX_CHARS` | 单 Agent 上下文字符硬上限，超出时丢弃最旧轮次（默认 8000） |
 | `CONTEXT_COMPRESS_THRESHOLD` | 触发 LLM 摘要压缩的字符阈值（默认 6000） |
 | `CONTEXT_COMPRESS_KEEP_RECENT` | 摘要压缩后保留的最近轮次条数（默认 8） |
-| `OPPONENT_SNIPPET_MAX_CHARS` / `OPPONENT_SUMMARY_MAX_CHARS` | 辩论机制：第 2 轮对手发言原文截断上限（默认 500 字）、第 3 轮起对手发言 LLM 摘要上限（默认 200 字） |
+| `OPPONENT_SNIPPET_MAX_CHARS` / `OPPONENT_SUMMARY_MAX_CHARS` / `OPPONENT_ARGUMENT_SNIPPET_MAX_CHARS` | 辩论机制：第 2 轮对手发言原文截断上限（默认 500 字）、第 3 轮起对手发言 LLM 摘要上限（默认 200 字）、摘要轮额外保留的对手**关键论据句**上限（默认 160 字，§5.4） |
 | `MEMORY_SUMMARY_MAX_CHARS` | 记忆压缩：短期 → 情境的 LLM 聚合摘要上限（默认 200 字），摘要 usage 计入只读遥测 |
 | `FAIR_OUTPUT_RATIO` | 公平性 L1：输出上限 = 对手近 N 轮有效输出均值 × 该比例（默认 1.5） |
 | `FAIR_HARD_CHAR_CEILING` | 公平性 L1：单次发言硬性字符安全上限（默认 3000），超限事后截断 |
 | `FAIR_FLOOR_CHAR_LIMIT` / `FAIR_OPENING_CHAR_LIMIT` / `FAIR_REFERENCE_ROUNDS` | 公平性 L1：相对基准下限（默认 400）、立论/无参照时上限（默认 1200）、参照对手最近 N 轮有效输出（默认 2） |
 | `FAIR_THINK_RATIO_MAX` | 公平性 L2：思考/推理占比上限（默认 0.5），超过记 warning |
 | `FAIR_MAX_SEEN_DIFF` | 公平性 L3：PRO/CON 可见对手轮数允许的最大差值（默认 1） |
-| `CONVERGENCE_SIMILARITY` / `CONVERGENCE_ROUNDS` | 收敛检测：语义余弦相似度阈值（默认 0.85）、连续相似轮数（默认 2） |
+| `CONVERGENCE_SIMILARITY` / `CONVERGENCE_ROUNDS` / `CONVERGENCE_PER_SPEAKER` | 收敛检测：语义余弦相似度阈值（默认 0.85）、连续相似轮数（默认 2）、按发言者逐人计算开关（默认 1 开启，§5.7） |
 | `CONVERGENCE_TEXT_SIMILARITY` | 收敛检测降级（P0-3）：嵌入不可用时文本相似度阈值（默认 0.6，difflib SequenceMatcher） |
 | `COST_INPUT_PER_1M` / `COST_OUTPUT_PER_1M` | 费用估算单价（P1-6，人民币 ¥/百万 token，默认 2.0 / 8.0；按供应商价格覆盖） |
 | `FAIR_TEMPERATURE` / `FAIR_TOP_P` | 公平性 L5：辩论发言统一采样参数（默认 0.7 / 1.0） |
@@ -178,10 +181,16 @@ HTTP 接口级测试（`httpx.ASGITransport` 直接驱动 FastAPI 应用，LLM �
 python -m unittest tests.test_api_flow -v
 ```
 
-多会话隔离与新特性测试（DebateManager 会话注册表 / 会话元数据 / 中断恢复；费用估算 / 收敛降级 / 工具调用可视化 / 结构化结论，均无需服务器与真实模型）：
+多会话隔离与新特性测试（DebateManager 会话注册表 / 会话元数据 / 中断恢复；费用估算 / 收敛降级 / 工具调用可视化 / 结构化结论 / **论据句抽取** / **任务-辩论分离**，均无需服务器与真实模型）：
 
 ```bash
 python -m unittest tests.test_multi_session tests.test_features_v2 -v
+```
+
+全量快速回归（无需服务器 / 真实模型）共 **82 项用例**：
+
+```bash
+python -m unittest discover tests
 ```
 
 质量基线评估（P0-2）：对一场导出的讨论 Markdown 打五维质量分，并可与基线对比发现回归：
@@ -224,13 +233,14 @@ P0 / P1 优化项已实施落地：
 - **UI / UX 升级**：简约大气的低饱和深色设计、聊天气泡式发言（并发流式独立气泡）、首字母文字头像（按立场配色）。
 - **历史记忆化**：`app/history.py` 将每场讨论题目与元信息持久化到 `data/discussions/index.json`，提供 `/api/history` 检索与一键查看 / 下载。
 - **安全加固**：`start.py` 默认绑定 `127.0.0.1`，关闭远端暴露；历史读取带路径穿越防护。
-- **裁判综合评分**：`orchestrator._compute_composite` 按「内容分（agent_scores 四维均值）× `JUDGE_CONTENT_WEIGHT` + 模型质量分（TTFT / 生成速率实测，`_score_ttft` / `_score_rate` 分档）× `JUDGE_PERFORMANCE_WEIGHT`」合成综合分并据此推导胜方；裁判只看辩手发言（`_build_judge_debate_text` 剔除主持人），质量分只统计协作 Agent 的流式发言指标。
+- **裁判综合评分**：`orchestrator._compute_composite` 按「内容分（agent_scores 四维均值）× `JUDGE_CONTENT_WEIGHT` + 模型质量分（TTFT / 生成速率实测，`_score_ttft` / `_score_rate` 分档）× `JUDGE_PERFORMANCE_WEIGHT`」合成综合分，**仅作展示**；胜方由内容四维均分最高方决定（纯内容判定，并列 DRAW），模型质量分 / 综合分不参与胜负。裁判只看辩手发言（`_build_judge_debate_text` 剔除主持人），质量分只统计协作 Agent 的流式发言指标。
 - **P0-1 路径穿越修复**：`save_markdown` 文件名经 `Path(fname).name` 清洗（只保留 basename、强制 `.md`、空名回退时间戳），配合 `history.get_markdown` 的 `resolve()` + `relative_to()`，读写两侧均无法越出 `data/discussions/`。
 - **P0-2 REST 请求体 pydantic 校验**：`app/schemas.py` 为 `configure / start / ingest / save_markdown` 定义请求模型；类型 / 形状非法返回 `422`，业务语义校验保留在各端点内，维持前端依赖的 `{ok, error}` `400` 契约。
 - **P1-3 lifespan 落盘可靠性**：讨论完成自动保存失败不再静默吞掉，改为结构化日志（`lifespan.save_markdown`）+ 幂等重试（1, 2 次）。
 - **P1-4 接口级测试 + CI 静态检查**：`tests/test_api_flow.py`（`httpx.ASGITransport` + LLM 调用点打桩）覆盖 HTTP 全链路与安全用例；ruff / mypy 纳入 CI 质量门禁。
 - **P1-5 依赖与工程化配置**：新增 `pyproject.toml`（ruff / mypy / coverage）与 `requirements-dev.txt`，`requirements.txt` 全部依赖改为 `>=` 版本下限。
-- **辩论机制：对手定向反驳 + 输出约束 + 按轮强压缩**：`orchestrator._find_opponent`（PRO↔CON 立场映射，回退全局最近）→ `_prepare_opponent_context`（第 2 轮原文截断 / 第 3 轮起 `summarize_text` LLM 摘要，缓存 + 只读遥测记账）→ `_debate_prompt` 注入 + 全轮字数提示（公平性 L1 字符上限）；`_agent_turn` 超长截断兜底；`agent.history_rounds` 平行维护、`compress_history(keep_rounds=N)` 按轮强压缩（详见 `docs/CODE_LOGIC.md` §12.8）。
+- **辩论机制：对手定向反驳 + 输出约束 + 按轮强压缩**：`orchestrator._find_opponent`（`config.OPPONENT_STANCE` 立场映射，回退全局最近）→ `_prepare_opponent_context`（第 2 轮原文截断 / 第 3 轮起 `summarize_text` LLM 摘要 + 关键论据句抽取 `_extract_argument_sentences`，缓存 + 只读遥测记账）→ `_debate_prompt` 注入 + 全轮字数提示（公平性 L1 字符上限）；`_agent_turn` 超长截断兜底；`agent.history_rounds` 平行维护、`compress_history(keep_rounds=N)` 按轮强压缩（详见 `docs/CODE_LOGIC.md` §12.8）。
+- **任务与辩论回合分离（§5.8）**：协作 Agent 回合拆为 `_task_turn`（任务输出不回填 `round_arguments` / 记忆）与 `_debate_turn`（正常发言记录），主循环两阶段调用，消除任务输出对收敛 / RAG / 对手上下文的污染。
 - **P1-7 完整多会话重构**：`app/manager.py` `DebateManager` 按 `session_id` 管理独立 `Orchestrator` 实例；前端 `localStorage` 持久化 `session_id`；`data/sessions/{sid}.json` 元数据快照 + 启动时 `mark_interrupted()` 中断恢复横幅；所有 REST/WS 端点经 `_get_orch(session_id)` 路由（详见 `docs/CODE_LOGIC.md` §12.15）。
 - **P1-4 工具调用可视化**：`chat_stream` 新增 `tool_call_start`/`tool_call_args`，`_consume_stream` 桥接 `tool_starts` 去重，前端气泡显示"正在调用工具 X…"（详见 `docs/CODE_LOGIC.md` §12.4）。
 - **P0-1 结构化结论**：`_normalize_conclusion` 固定四段式 + 裁决段权威重写，`_final_summary` 发布 `conclusion` 事件，前端核心结论面板（详见 `docs/CODE_LOGIC.md` §12.13）。
