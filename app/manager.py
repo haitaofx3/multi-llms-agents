@@ -9,7 +9,8 @@ manager.py — 多会话管理（DebateManager）
     标记为 interrupted，前端据此展示「上次讨论中断」横幅；
   - 通过 set_done_handler() 注册「讨论完成」回调（如自动落盘 Markdown）。
 
-默认会话（"default"）沿用原模块级单例行为，向后兼容现有调用方与测试。
+默认会话（"default"）通过 get_or_create 惰性创建并缓存；会话实例统一由
+DebateManager 注册表持有（§1.3 解耦：不再存在模块级单例与注册表两份身份）。
 """
 from __future__ import annotations
 
@@ -48,15 +49,6 @@ class DebateManager:
     def get(self, session_id: str = "default"):
         """仅返回已存在的会话；不存在返回 None（不创建）。"""
         return self._sessions.get(session_id)
-
-    def register(self, orch) -> None:
-        """显式注册一个已存在的 Orchestrator 到会话表（按 orch.session_id）。
-
-        用于把模块级默认会话（orchestrator = Orchestrator(session_id="default")）
-        绑定到管理器，保证 main.py / 现有测试引用的单例与
-        manager.get_or_create("default") 返回同一实例，向后兼容。
-        """
-        self._sessions[orch.session_id] = orch
 
     def list_sessions(self) -> dict:
         return dict(self._sessions)

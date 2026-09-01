@@ -3,7 +3,7 @@ test_multi_session.py — 多会话隔离（P1-7）与 HTTP 级会话绑定测�
 
 覆盖完整多会话重构：
   1. DebateManager 注册表：get_or_create 同会话复用 / 异会话隔离 / 空值回退默认；
-  2. register() 把既有 Orchestrator 绑定到其 session_id（模块级单例向后兼容）；
+  2. §1.3 解耦：外部构造的 Orchestrator 不自动注册（注册表是会话唯一持有者）；
   3. 元数据持久化：save_meta / load_meta 往返，不安全 session_id 清洗为 default；
   4. 中断恢复：mark_interrupted 只标记上一进程遗留的 running/paused 会话，
      已结束（done）会话与损坏文件不受影响；
@@ -79,13 +79,17 @@ class DebateManagerTest(unittest.IsolatedAsyncioTestCase):
         mgr = DebateManager()
         self.assertIsNone(mgr.get("not_created"))
 
-    def test_register_binds_existing_orchestrator(self):
+    def test_externally_constructed_orchestrator_not_auto_registered(self):
+        """§1.3 解耦：外部构造的 Orchestrator 不自动进入注册表（消除双身份）。
+
+        注册表是会话的唯一持有者；模块外直接 new 出来的实例不共享 session_id 身份。
+        """
         from app.orchestrator import Orchestrator
         mgr = DebateManager()
         orch = Orchestrator(session_id="custom_sid")
-        mgr.register(orch)
-        self.assertIs(mgr.get_or_create("custom_sid"), orch)
-        self.assertIs(mgr.get("custom_sid"), orch)
+        self.assertIsNone(mgr.get("custom_sid"))
+        # get_or_create 惰性创建自己的实例，不会复用外部构造的那个
+        self.assertIsNot(mgr.get_or_create("custom_sid"), orch)
 
     async def test_configuring_one_session_leaves_other_idle(self):
         """会话隔离：配置 A 不影响 B 的任意状态。"""

@@ -2,6 +2,7 @@
 
 > 本文档系统梳理当前项目的全部代码逻辑，按"模块职责 → 关键函数 → 数据流"组织，便于理解与二次开发。
 > 内容对齐《多Agent辩论系统架构设计文档》（Supervisor 编排 + 立场辩手 + Judge 裁决 + RAG 核查 + 公平性治理 + 收敛检测 + 状态机 + 协议层）与当前实现。
+> **交叉引用约定**：`架构文档 §N` 指《多Agent辩论系统架构设计文档》；**裸 `§N.M`**（如 §1.3 / §3.4 / §5.4 / §5.8，与代码注释一致）指《问题整理与根因分析.md》中对应小节；本文档自身章节用 `§N` 标题，不含 `.M` 后缀。
 
 ---
 
@@ -40,8 +41,9 @@ mini_test/
 │   ├── rag.py            独立 RAG 事实核查服务（断言提取 / 带置信度检索 / 24h 缓存）
 │   ├── agent.py          Agent 定义（角色/性格/立场/模型/记忆/MCP/上下文构建）
 │   ├── fairness.py       公平性治理（FairnessGovernor L1–L6：输出上限/有效比例/输入对称/轮次对称/采样对齐/长度中性）
-│   ├── orchestrator.py   编排器（Supervisor：状态机、并行立论、收敛终止、Judge、任务分派/回报、结构化结论）
-│   ├── manager.py        多会话管理器（DebateManager：session 注册表 + 元数据持久化 + 中断恢复）
+│   ├── orchestrator.py   编排器（Supervisor：状态机、并行立论、收敛终止、Judge、任务回合/辩论回合分离、结构化结论）
+│   ├── manager.py        多会话管理器（DebateManager：session 注册表 + 元数据持久化 + 中断恢复；会话统一经 get_or_create 持有）
+│   ├── bgtasks.py        后台 asyncio 任务强引用集合（RUF006；main/orchestrator 统一复用 spawn()，防 GC 提前回收）
 │   ├── history.py        历史讨论记忆索引（data/discussions/index.json + 检索 + Markdown 读取，防路径穿越）
 │   ├── file_parser.py    上传文件文本提取（txt/md/docx/xlsx/pdf/图片 OCR，懒加载依赖 + 大小/字符上限）
 │   ├── main.py           FastAPI 应用（REST + WebSocket + 静态服务，lifespan 自动落盘 + 重试 + 中断标记）
@@ -56,7 +58,7 @@ mini_test/
 │   ├── test_ci_fast.py   快速单元测试（状态机/公平性/裁决，无需服务器）
 │   ├── test_api_flow.py  HTTP 接口级测试（ASGITransport + LLM 打桩，无需服务器/真实模型）
 │   ├── test_multi_session.py  多会话隔离测试（DebateManager / 会话元数据 / 中断恢复）
-│   └── test_features_v2.py    新特性测试（费用估算 / 收敛降级 / 工具可视化 / 结构化结论）
+│   └── test_features_v2.py    新特性测试（费用估算 / 收敛降级 / 工具可视化 / 结构化结论 / 论据句抽取 / 任务-辩论分离）
 ├── docs/
 │   └── CODE_LOGIC.md     本文档
 ├── data/                 运行时数据（自动生成，不提交到版本库）
@@ -109,14 +111,18 @@ HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 python start.py
 | 嵌入 | `EMBED_MODEL_TYPE`、`EMBED_MODEL_NAME`、`EMBED_API_KEY` |
 | Neo4j | `NEO4J_*`（保留，当前未在核心链路使用） |
 | **公平性治理** | `FAIR_OUTPUT_RATIO`（相对上限比例，默认 1.5）、`FAIR_HARD_CHAR_CEILING`（单次发言硬性字符上限，默认 3000）、`FAIR_FLOOR_CHAR_LIMIT`（相对基准下限，默认 400）、`FAIR_OPENING_CHAR_LIMIT`（立论上限，默认 1200）、`FAIR_REFERENCE_ROUNDS`（参照对手最近 N 轮，默认 2）、`FAIR_THINK_RATIO_MAX`（思考占比上限，默认 0.5）、`FAIR_MAX_SEEN_DIFF`（可见对手轮数最大差值，默认 1）、`FAIR_TEMPERATURE`/`FAIR_TOP_P`（辩论采样参数，默认 0.7/1.0）、`FAIR_JUDGE_TEMPERATURE`/`FAIR_JUDGE_TOP_P`（辅助采样参数，默认 0.3/1.0） |
-| **收敛检测** | `CONVERGENCE_SIMILARITY`（默认 0.85）、`CONVERGENCE_ROUNDS`（默认 2）；**降级阈值** `CONVERGENCE_TEXT_SIMILARITY`（默认 0.6，嵌入不可用时走 difflib 文本相似度） |
+| **收敛检测** | `CONVERGENCE_SIMILARITY`（默认 0.85）、`CONVERGENCE_ROUNDS`（默认 2）、`CONVERGENCE_PER_SPEAKER`（默认 1，按发言者逐人算相似度再取平均，§5.7）；**降级阈值** `CONVERGENCE_TEXT_SIMILARITY`（默认 0.6，嵌入不可用时走 difflib 文本相似度） |
 | **费用估算（P1-6）** | `COST_INPUT_PER_1M`（默认 2.0）/ `COST_OUTPUT_PER_1M`（默认 8.0），人民币 ¥ / 百万 token，只读遥测 |
 | **LLM 重试** | `LLM_RETRY_ATTEMPTS`（默认 3）、`LLM_RETRY_DELAYS`（(1.0, 3.0)） |
 | **流式超时** | `STREAM_TIMEOUT`（默认 300s，对齐 `LLM_TIMEOUT`） |
-| **辩论对手/输出约束** | `OPPONENT_SNIPPET_MAX_CHARS`（第 2 轮对手发言原文截断上限，默认 500 字）、`OPPONENT_SUMMARY_MAX_CHARS`（第 3 轮起对手发言 LLM 摘要上限，默认 200 字）；输出长度约束走公平性 L1 字符上限（见上） |
+| **辩论对手/输出约束** | `OPPONENT_SNIPPET_MAX_CHARS`（第 2 轮对手发言原文截断上限，默认 500 字）、`OPPONENT_SUMMARY_MAX_CHARS`（第 3 轮起对手发言 LLM 摘要上限，默认 200 字）、`OPPONENT_ARGUMENT_SNIPPET_MAX_CHARS`（摘要轮额外保留的对手**关键论据句**上限，默认 160 字，§5.4）；输出长度约束走公平性 L1 字符上限（见上） |
 | **记忆压缩** | `MEMORY_SUMMARY_MAX_CHARS`（短期 → 情境的 LLM 聚合摘要上限，默认 200 字） |
 
 > `PROJECT_ROOT = Path(__file__).resolve().parent.parent`（`app/` 的上一级）供其余模块定位项目根目录与资源目录。
+
+**模块级辅助（§1.4 / §3.4）**：
+- `resolve_provider(prefix, provider="", base_url="", api_key="", model_id="")`：**provider 规格统一合并入口**——显式字段为空时依次回退 `settings.{PREFIX}_PROVIDER/_BASE_URL/_API_KEY/_MODEL_ID`，返回过滤掉空值的 spec dict（全部为空返回空 dict，调用方据此判断「未配置」）。只做合并不解析预设，供应商预设解析仍由 `app.llm.resolve_model_config` 负责；`_build_judge` 以 `resolve_provider("JUDGE", ...)` 收敛裁判配置（§12.2）。
+- `OPPONENT_STANCE = {"PRO": "CON", "CON": "PRO"}`：立场对手映射，收敛到 `config.py` 模块级常量，由 `orchestrator._find_opponent` 与 `app/fairness.py` 共享，避免重复定义漂移（§3.4）。
 
 ---
 
@@ -329,14 +335,15 @@ Agent(agent_id, name, role, personality, model_config, is_main, forget_config, s
 - `DELEGATE_SCHEMA` / `REPORT_SCHEMA`：任务分派/回报的 function-calling 定义。
 - `STANCE_LABEL`：立场显示名；`PHASES = ("idle", "preparing", "debating", "judging", "finished")` 架构状态机（§4.1）。
 - `EventBus`：基于 `asyncio.Queue` 的发布/订阅。
-- `Orchestrator` 单例 `orchestrator`，关键状态：
+- `Orchestrator` 实例统一由 `DebateManager` 注册表持有（§12.15 / §1.3 解耦：**不再存在模块级 `orchestrator` 单例**，测试与入口均走 `manager.get_or_create("default")`）。关键状态：
   - `agents / main / collaborators`、`shared_context`、`tasks`、`round / max_rounds`、`topic`；
   - `status`（idle/running/paused/done/stopped，UI 状态）与 `phase`（idle/preparing/debating/judging/finished，**架构状态机**）；
-  - `trace_id`、`spent / output_tokens`（token 用量，**只读遥测**，不再做约束）、`governor`（FairnessGovernor 公平性治理器，每场全新）、`convergence_streak`、`round_arguments / latest_arguments / round_evidence`、`judgment`、`_pause_event`。
+  - `trace_id`、`spent / output_tokens`（token 用量，**只读遥测**，不再做约束）、`governor`（FairnessGovernor 公平性治理器，每场全新）、`convergence_streak`、`round_arguments / latest_arguments / round_evidence`（RAG 证据按立场分桶，§12.11）、`judgment`、`_pause_event`。
 
 ### 12.2 配置 `configure()`
 - 校验 status 非 running；重置全部状态并生成新 `trace_id`。
 - 逐个 `resolve_model_config` 构造 `Agent`；**立场**：显式指定优先，否则主位=HOST、其余按 PRO/CON 交替（i 为奇数为 PRO，偶数为 CON）。
+- `_build_judge`：`resolve_provider("JUDGE", ...)` 合并前端显式字段与 `.env` 的 `JUDGE_*` 默认值（§1.4），再交 `resolve_model_config` 解析预设；完全未配置返回 `None`（`_judge_round` 回退主 Agent 模型）。裁判不进入 `agents / collaborators`，不占席位、不参与辩论、不接收任务。
 - 首个为 `main`，其余进 `collaborators`。
 
 ### 12.3 控制 `pause() / resume() / end()`
@@ -344,7 +351,7 @@ Agent(agent_id, name, role, personality, model_config, is_main, forget_config, s
 
 ### 12.4 单 Agent 回合 `_agent_turn(agent, user_msg, mode, allow_delegate, stream)`
 封装"工具调用循环"（上限 5 次）：
-1. 构建 `messages = [system] + history + [user]`；
+1. 构建 `messages = [system] + history + [user]`；`system_prompt` 内部会做记忆检索（`memory.context_text`），经 `asyncio.to_thread` 卸载到线程执行，避免阻塞事件循环（§2.4）；
 2. 工具集 = `mcp.schemas()`，主 Agent 追加 `DELEGATE_SCHEMA`（除非 `allow_delegate=False`），协作任务模式追加 `REPORT_SCHEMA`；
 3. **流式**：`_consume_stream()` 在后台线程运行 `chat_stream`，通过 `asyncio.Queue` + `loop.call_soon_threadsafe` 把增量桥接回事件循环；整体受 `settings.STREAM_TIMEOUT` 约束；流式异常时**回退非流式重试调用**。**工具调用可视化（P1-4）**：流式期间把 `tool_call_start` / `tool_call_args` 事件转发前端（气泡显示"正在调用工具 X…"），`_consume_stream` 返回 `result["tool_starts"]`（已发过 `tool_call_start` 的工具索引集合）供调用方去重——`_agent_turn` 对未流式发出索引的工具补发 `tool_call_start`（同样先补 `speech_start` 保证纯工具回合气泡存在），已发出的不再重复发；
 4. **性能实测**：流式结果携带 `metrics = {ttft_s, gen_s, chars}`（在 `_consume_stream` 的 `_drain` 内实测首 token 延迟与生成耗时），回合末尾按辩手聚合进 `agent_metrics`（calls / ttft_sum / gen_sum / chars），供裁判**模型质量评分**使用；**非流式回退不计入**；
@@ -372,10 +379,13 @@ while round < max_rounds:
     round += 1; phase = debating; 发布 round 事件 + StatusSync
     # 0) 公平性治理：发布 governor.report()（L1-L6 各层状态）作为日志（替代旧的预算规划）
     # 1) 主持人回合（分派 / 追问）→ _create_task + task_assigned 事件
-    # 2) 协作 Agent 回合：
-    #    第 1 轮 → asyncio.gather 并行立论（架构文档 §4.2/§6.2）
-    #    后续轮 → 串行反驳/辩护（_prepare_opponent_context 注入对手上轮发言：
-    #              第 2 轮原文截断 / 第 3 轮起 LLM 摘要）
+    # 2) 协作 Agent 回合（§5.8 拆分，先任务后辩论，两者完全分离）：
+    #    2a) 任务回合 _task_turn：只处理待办任务，结果回填 shared_context 并发布
+    #        task_result 事件，不进入 round_arguments（不污染收敛/RAG/对手上下文）
+    #    2b) 辩论回合 _debate_turn：
+    #        第 1 轮 → asyncio.gather 并行立论（架构文档 §4.2/§6.2）
+    #        后续轮 → 串行反驳/辩护（_prepare_opponent_context 注入对手上轮发言：
+    #                  第 2 轮原文截断 / 第 3 轮起 LLM 摘要 + 关键论据句）
     # 3) RAG 事实核查（_rag_check_round，异步注入下一轮上下文）
     # 4) 记忆管家（_memory_housekeeping：提升/压缩/遗忘；调用 compress_history 按轮强压缩）
     # 5) 收敛检测（_check_convergence）→ 连续 N 轮相似且无新证据则 break
@@ -387,7 +397,7 @@ while round < max_rounds:
 # 异常熔断：status = stopped，phase = idle
 ```
 
-**并行立论**（架构文档 §6.2）：第 1 轮协作 Agent 无相互依赖，用 `asyncio.gather(..., return_exceptions=True)` 并发立论；流式事件带 `speaker`，前端按 speaker 独立气泡，天然支持并发流式。
+**并行立论**（架构文档 §6.2）：第 1 轮协作 Agent 无相互依赖，用 `asyncio.gather(..., return_exceptions=True)` 并发 `_debate_turn`；流式事件带 `speaker`，前端按 speaker 独立气泡，天然支持并发流式。
 
 ### 12.7 公平性治理 `FairnessGovernor`（`app/fairness.py`，替代旧 budget planner）
 
@@ -403,14 +413,19 @@ while round < max_rounds:
 **观测**：`governor.report()` 返回 `{ok, warnings, violations, layers:[{layer, name, status, detail}]}`，经 `_status_sync` 暴露为 `fairness` 字段；export_markdown 亦逐层打印。Token 用量（`spent` / `output_tokens`）仅由 `_apply_usage` 累加为**只读遥测**，不参与任何约束。
 
 ### 12.8 协作 Agent 回合与对手定向反驳（需求 1–5）
-**`_collab_turn(collab)`**：
-- 有未完成任务：逐个 `_agent_turn(..., mode="task")`；收到 `report` → `_apply_report` + 发布 `task_result`；未回报则 `rounds_waiting+1`，超 3 轮强制标记完成。
-- 无任务（辩论环节）：先 `await self._prepare_opponent_context(collab)` 准备对手上轮发言，再 `_debate_prompt(collab)` 构造立论/反驳 prompt（含对手引用 + 上一轮 RAG 证据注入 + 字数提示），`_agent_turn(..., mode="discussion", stream=True)`。
+
+**`_task_turn(collab)`（任务回合，§5.8）**：
+- 只处理该辩手的待办任务（无任务直接返回）：逐个 `_agent_turn(..., mode="task", stream=True)`；收到 `report` → `_apply_report` + 发布 `task_result`；未回报则 `rounds_waiting+1`，超 3 轮强制标记完成。
+- **不调用 `_record_argument` / `_record_memory`**：任务输出仅回填 `shared_context` 并流式展示，不进入 `round_arguments`（避免污染收敛检测 / RAG 核查 / 对手上下文）也不进入辩论记忆（避免任务细节暴露到辩论发言）。
+
+**`_debate_turn(collab)`（辩论回合，§5.8）**：立论/反驳发言，与任务回合完全分离；无论本轮回合是否处理过任务，辩手每轮都发言，保证严格交替。先 `await self._prepare_opponent_context(collab)` 准备对手上轮发言，再 `_debate_prompt(collab)` 构造立论/反驳 prompt（含对手引用 + 关键论据句 + 上一轮 RAG 证据注入 + 字数提示），`_agent_turn(..., mode="discussion", stream=True)`。
 
 **对手定向（需求 2/3）**：
-- `_find_opponent(collab)`：`OPPONENT_STANCE = {"PRO": "CON", "CON": "PRO"}`（编排器类常量，`ClassVar` 标注）。先在上一轮 `round_arguments[round-1]` 找对立场**最近发言人**（`reversed` 扫描）；上一轮无对立场发言者时回退 `latest_arguments` 全局最近对立场发言者；`NEUTRAL`/`HOST` 无固定对手返回 `None`。
-- `_prepare_opponent_context(collab)`：第 1 轮不准备；**第 2 轮**取对手上轮发言原文截断到 `OPPONENT_SNIPPET_MAX_CHARS` 字；**第 3 轮起**调用 `summarize_text`（`llm.py`）压缩到 `OPPONENT_SUMMARY_MAX_CHARS` 字，按 `(对手名, 轮次)` 缓存进 `_opponent_summary_cache` 防同轮重复调用，usage 计入 `self.spent`（只读遥测），事件 `debate.opponent_summary`；结果写入 `_opponent_prep`（每轮开始清空，`configure()` 重置）。
-- `_debate_prompt(collab)`：第 1 轮基于角色/性格立论（需求 1，PRO/CON 分立场措辞）；第 2 轮起优先注入 `_opponent_prep`（标注"发言"（第 2 轮原文）/ "摘要"（第 3 轮起））；`NEUTRAL`/无立场对手回退旧 `last_debate_speaker` 逻辑；**全轮**追加 `【输出要求】... {limit} 字以内 ...`（需求 5），`limit = self.governor.ceiling_for(stance, round, 对手近N轮有效输出均值)`（公平性 L1 相对上限，与硬上限取 min；仅作提示约束，超限由 `_agent_turn` 事后截断兜底，不再把 `max_tokens` 下发 API）。
+- `_find_opponent(collab)`：`OPPONENT_STANCE` 定义收敛于 `app.config`（§3.4，`orchestrator` 与 `fairness` 共享）。先在上一轮 `round_arguments[round-1]` 找对立场**最近发言人**（`reversed` 扫描）；上一轮无对立场发言者时回退 `latest_arguments` 全局最近对立场发言者；`NEUTRAL`/`HOST` 无固定对手返回 `None`。
+- `_prepare_opponent_context(collab)`：第 1 轮不准备；**第 2 轮**取对手上轮发言原文截断到 `OPPONENT_SNIPPET_MAX_CHARS` 字；**第 3 轮起**调用 `summarize_text`（`llm.py`）压缩到 `OPPONENT_SUMMARY_MAX_CHARS` 字，按 `(对手名, 轮次)` 缓存进 `_opponent_summary_cache` 防同轮重复调用，usage 计入 `self.spent`（只读遥测），事件 `debate.opponent_summary`；第 3 轮起额外以 `_extract_argument_sentences(text, OPPONENT_ARGUMENT_SNIPPET_MAX_CHARS)` 抽取对手发言中的**关键论据句**写入 `_opponent_prep["arguments"]`（§5.4，弥补 LLM 摘要丢失具体论点的不足）；结果写入 `_opponent_prep`（每轮开始清空，`configure()` 重置）。
+- `_debate_prompt(collab)`：第 1 轮基于角色/性格立论（需求 1，PRO/CON 分立场措辞）；第 2 轮起优先注入 `_opponent_prep`（标注"发言"（第 2 轮原文）/ "摘要"（第 3 轮起）），摘要轮若含 `arguments` 则追加指令「对方发言中的关键论据句（请逐条回应，不要遗漏）」（§5.4）；`NEUTRAL`/无立场对手回退旧 `last_debate_speaker` 逻辑；**全轮**追加 `【输出要求】... {limit} 字以内 ...`（需求 5），`limit = self.governor.ceiling_for(stance, round, 对手近N轮有效输出均值)`（公平性 L1 相对上限，与硬上限取 min；仅作提示约束，超限由 `_agent_turn` 事后截断兜底，不再把 `max_tokens` 下发 API）；RAG 证据按调用者立场取桶注入（`_evidence_for_round(round-1, collab.stance)`，§12.11）。
+
+**论据句抽取 `_extract_argument_sentences(text, max_chars)`（模块级函数，§5.4）**：按 `。！？!?;\n` 切句后，只保留带**序号标记**（首先/其次/最后/第一/1.…）或**论据性关键词**（指出/表明/因为/因此/证据/数据…）的句子（标记 3 分 / 关键词各 1 分，长句同分靠前），无任何命中回退最长句；按分数降序拼接，超出 `max_chars` 整体截断。保证摘要轮辩手仍能看到对方的具体论点，逐条回应而非泛泛反驳。
 
 ### 12.9 任务与变量
 - `_create_task(d)`：**校验 recipient 存在**（P15 修复，非法则忽略并记日志）；生成任务 `{id, task_id(UUID), recipient, content, expected_outcome, var_name, completed, rounds_waiting, timestamp(ms), token_cost}`，并在 `shared_context[var_name]` 登记。
@@ -418,11 +433,12 @@ while round < max_rounds:
 
 ### 12.10 收敛检测 `_check_convergence()`（架构文档 §4.4）
 - `round >= 2` 时计算本轮 vs 上一轮发言的相似度：嵌入可用（`is_fallback() == False`）用 `embed_query` 余弦相似度，阈值 `CONVERGENCE_SIMILARITY`（0.85）；**嵌入不可用（P0-3 降级）**时切换为 `_text_similarity()`——difflib `SequenceMatcher` 对去空白文本计算相似度，阈值 `CONVERGENCE_TEXT_SIMILARITY`（0.6），保证离线哈希向量模式仍能收敛提前终止；
+- **按发言者逐人计算（§5.7）**：`CONVERGENCE_PER_SPEAKER=1` 时取连续两轮**都有发言**的共同辩手，逐人算相似度再取**平均**，避免拼接全文时单一长文本主导而误判收敛；无共同发言者（或关闭开关）时回退整轮聚合拼接对比。`embed_query` 经 `asyncio.to_thread` 在 worker 线程执行，不阻塞事件循环（§2.4）；
 - 相似度 ≥ 阈值**且**本轮无新 RAG 证据 → `convergence_streak += 1`，否则清零；
 - `convergence_streak >= CONVERGENCE_ROUNDS`（2）→ 触发收敛，提前进入裁决。
 
 ### 12.11 RAG 核查 `_rag_check_round()`
-对本轮发言合并文本 → `asyncio.to_thread(rag_service.check, ...)` → 结果存 `round_evidence[round]`，供下一轮 `_evidence_for_round` 注入。
+**按立场分桶（§5.3）**：把本轮发言按发言人立场分组，每组合并文本 → `asyncio.to_thread(rag_service.check, ...)` → 证据归入对应立场桶，结果存 `round_evidence[round] = {stance: [EvidenceItem]}`（旧数据 / 无立场发言回退 `"default"` 桶）。下一轮 `_evidence_for_round(round_no, stance)` 只取**与本人立场对应**的证据桶（无立场或空桶回退默认桶），辩手不会被对手立场的核查结果干扰。
 
 ### 12.12 Judge 裁决 `_judge_round()`（架构文档 §2.4）
 - **输入范围**：`_build_judge_debate_text()` 只保留 `type=="speech" and not is_main` 的**辩手发言**（剔除主持人开场 / 任务分派 / 追问 / 总结）。
@@ -449,8 +465,7 @@ while round < max_rounds:
 **背景（P5）**：原 `orchestrator = Orchestrator()` 模块级单例 + 全局 `EventBus` 不支持多客户端——两个浏览器同时打开会互相覆盖配置 / 状态 / 事件，一个客户端的 `pause/end` 会操作到另一客户的讨论。
 
 **`DebateManager`（全局单例 `manager`）**：
-- `get_or_create(session_id="default")`：按 `session_id` 取会话；不存在则惰性构造 `Orchestrator(session_id=...)`（惰性导入防循环依赖）。**安全字符白名单** `_SAFE_SID = ^[A-Za-z0-9._-]+$`：非法 `session_id` 读写元数据时一律清洗回 `"default"`，防路径穿越；
-- `register(orch)`：把模块级默认会话（`orchestrator = Orchestrator(session_id="default")`）绑定进注册表，保证 `main.py` / 旧测试引用的单例与 `get_or_create("default")` 返回**同一实例**（向后兼容）；
+- `get_or_create(session_id="default")`：按 `session_id` 取会话；不存在则惰性构造 `Orchestrator(session_id=...)`（惰性导入防循环依赖）。**会话实例统一由此路径持有**（§1.3 解耦：已删除模块级 `orchestrator` 单例与 `register()` 双入口，`main.py` / 测试 / 前端均走本方法）。**安全字符白名单** `_SAFE_SID = ^[A-Za-z0-9._-]+$`：非法 `session_id` 读写元数据时一律清洗回 `"default"`，防路径穿越；
 - `set_done_handler(handler)`：注册"讨论完成"回调（`main.py` 用于自动落盘 Markdown），每个会话完成时经 `notify_done(orch)` 触发。
 
 **元数据持久化（轻量快照，非发言明细）**：
@@ -553,7 +568,7 @@ FastAPI 应用，挂载 `/static`，提供 REST + WebSocket。
 - **`requirements-dev.txt`**：`-r requirements.txt` + `ruff>=0.5` / `mypy>=1.10` / `coverage>=7.0`，与运行依赖分离。
 - **接口级测试 `tests/test_api_flow.py`**：`httpx.AsyncClient(transport=ASGITransport(app))` 直接驱动 FastAPI 应用，monkeypatch `_judge_round / _final_summary / _consume_stream / _run_llm_retry` 四个 LLM 调用点实现确定性输出，**无需启动服务器、无需真实模型**。7 个用例：HTTP 全链路（configure→start→done→export→save_markdown→history）、`../../evil.md` 路径穿越被清洗为 `evil.md`、空请求体 save_markdown 回退默认文件名、空 Agent 列表保持 `400` 契约、configure 返回 fairness 报告、**status 携带 Token 遥测 + 公平性字段（`spent_tokens` / `output_tokens` / `fairness` 各层状态）**。运行：`python -m unittest tests.test_api_flow -v`。
 - **CI 门禁**（`.github/workflows/ci.yml`）：安装步骤含 `fastapi httpx ruff mypy`，在 fast 单测之后新增 `Lint (ruff)`、`Type check (mypy)`、`API flow tests` 三步。
-- **RUF006 后台任务强引用**：`main.py` / `orchestrator.py` 均以模块级 `_background_tasks: set[asyncio.Task]` 持有后台任务引用（`_spawn_task` helper 登记 + 完成回调自动 discard），防止任务被 GC 提前回收。
+- **RUF006 后台任务强引用**：后台任务集合与 `spawn()` 抽取为独立模块 `app/bgtasks.py`（§2），`main.py` / `orchestrator.py` 统一 `from app.bgtasks import spawn as _spawn_task` 登记后台任务（完成回调自动 discard），消除两份重复实现，防止任务被 GC 提前回收。
 
 ---
 
@@ -650,15 +665,16 @@ FastAPI 应用，挂载 `/static`，提供 REST + WebSocket。
 | 消息协议：TaskDispatch / ArgumentSubmit / Rebuttal / Judgment / StatusSync（§3） | `app/protocol.py`（pydantic + task_id UUID + token_cost + 毫秒时间戳） |
 | 状态机：Idle→Preparing→Debating→Judging→Finished（§4.1） | `PHASES` + `self.phase`（异常熔断回 Idle） |
 | 多客户端隔离 / 会话路由（P5 → P1-7） | `app/manager.py` `DebateManager` 按 `session_id` 独立 `Orchestrator`；`data/sessions/{sid}.json` 元数据快照；重启后 `mark_interrupted()` 中断恢复横幅；前端 `localStorage` 持久化 `session_id` |
-| 并行立论（§4.2/6.2） | 第 1 轮 `asyncio.gather` 并发 `_collab_turn` |
+| 并行立论（§4.2/6.2） | 第 1 轮 `asyncio.gather` 并发 `_debate_turn` |
 | 终止条件：max_rounds + 收敛 + 人工（§4.3） | `run_discussion` 终止判断（收敛/轮次/手动 end；公平性治理下无预算熔断） |
-| 收敛检测：语义相似度 + 新证据增量（§4.4） | `_check_convergence`（embedding 余弦 + RAG 新证据判断） |
+| 收敛检测：语义相似度 + 新证据增量（§4.4） | `_check_convergence`（embedding 余弦 + RAG 新证据判断；`CONVERGENCE_PER_SPEAKER` 按发言者逐人平均，§5.7） |
 | 超时与重试（§4.5） | `_run_llm_retry`（1s/3s 指数退避）+ `STREAM_TIMEOUT` 单步超时 |
 | 消息队列（§5.1） | 进程内 `EventBus`（单进程部署可接受，未采用 Redis） |
 | 共享黑板（§5.2） | 内存 `shared_context` + `transcript`（未持久化） |
 | 心跳与故障恢复（§5.3） | 未实现（`status_sync` 事件承担部分状态广播） |
 | 公平性治理（替代旧 Token 预算控制 §6.3） | `FairnessGovernor` L1–L6（`app/fairness.py`）：输出字数上限/有效回答占比/输入对称/轮次对称/采样对齐/长度中立裁判；`spent`/`output_tokens` 只读遥测；不再下发 `max_tokens` |
-| 对手定向反驳 + 输出字数约束 + 按轮强压缩 | `_find_opponent`（PRO↔CON 立场映射，回退全局最近）/ `_prepare_opponent_context`（第 2 轮原文截断、第 3 轮起 `summarize_text` 摘要 + 缓存）/ `_debate_prompt` 注入字数提示（`governor.ceiling_for`）/ `_agent_turn` 超长截断兜底 / `compress_history(keep_rounds=N)` 按轮保留 |
+| 对手定向反驳 + 输出字数约束 + 按轮强压缩 | `_find_opponent`（`config.OPPONENT_STANCE` 立场映射，回退全局最近）/ `_prepare_opponent_context`（第 2 轮原文截断、第 3 轮起 `summarize_text` 摘要 + 缓存 + **关键论据句 `_extract_argument_sentences`**）/ `_debate_prompt` 注入字数提示（`governor.ceiling_for`）与论据句逐条回应指令 / `_agent_turn` 超长截断兜底 / `compress_history(keep_rounds=N)` 按轮保留 |
+| 任务与辩论分离（§5.8） | `_task_turn`（只回填 `shared_context`，任务输出不进 `round_arguments`/记忆）/ `_debate_turn`（正常发言记录）；主循环两阶段调用 |
 | 缓存策略（§6.4） | RAG 检索 24h 缓存（`rag.py:_search_cached`） |
 | 可观测性：Trace ID（§7.2） | `trace_id` 贯穿事件/日志/导出 |
 | 审计回溯：快照 + 回放（§7.3） | 未实现（仅最终 Markdown 落盘） |
@@ -679,9 +695,10 @@ FastAPI 应用，挂载 `/static`，提供 REST + WebSocket。
                                 │    ├─ phase=debating
                                 │    ├─ 公平性治理日志（发布 governor.report() L1–L6 状态）
                                 │    ├─ 主持人 _agent_turn（分派 delegate_task → _create_task）
-                                │    ├─ 第1轮: asyncio.gather 并行立论（并发流式）
-                                │    │   后序: 串行 _collab_turn 反驳/辩护
-                                │    ├─ _rag_check_round（证据注入下一轮）
+                                │    ├─ 任务回合 _task_turn（待办任务 → 回填 shared_context，不进 round_arguments）
+                                │    ├─ 第1轮: asyncio.gather 并行 _debate_turn 立论（并发流式）
+                                │    │   后序: 串行 _debate_turn 反驳/辩护（摘要轮注入关键论据句）
+                                │    ├─ _rag_check_round（按立场分桶证据注入下一轮）
                                 │    ├─ _memory_housekeeping
                                 │    ├─ _check_convergence → 收敛提前 break
                                 ├─ phase=judging → _judge_round（调用失败 → 确定性回退 DRAW）
@@ -709,7 +726,7 @@ FastAPI 应用，挂载 `/static`，提供 REST + WebSocket。
 - **导出**：`/api/export` 返回约 19KB Markdown（含发言记录、裁判裁决、**「模型性能与综合评分」表**、任务结果表、记忆快照），落盘 `data/discussions/e2e_export.md`。
 - **校验输出**：`ARCHITECTURE CHECKS PASS (state machine / budget / judge)`（budget 字样为旧版断言残留）、`STREAMING CHECKS PASS`，断言覆盖 `agent_scores / model_performance / composite_scores` 非空且 `winner ∈ (PRO, CON, DRAW)`。
 
-> 该验证同时覆盖了降级路径（本机无 Qdrant → `in-memory`；无 HF 网络 → 哈希向量）。无需服务器的快速回归见 `tests/test_ci_fast.py`（状态机 / **公平性治理 L1–L6** / 裁决分档 / 综合评分逻辑 / Token 遥测）与 `tests/test_api_flow.py`（HTTP 接口全链路 + 路径穿越防护，LLM 打桩）。
+> 该验证同时覆盖了降级路径（本机无 Qdrant → `in-memory`；无 HF 网络 → 哈希向量）。无需服务器的快速回归见 `tests/test_ci_fast.py`（状态机 / **公平性治理 L1–L6** / 裁决分档 / 综合评分逻辑 / Token 遥测）与 `tests/test_api_flow.py`（HTTP 接口全链路 + 路径穿越防护，LLM 打桩）及 `tests/test_features_v2.py`（费用估算 / 收敛降级 / 工具可视化 / 结构化结论 / **论据句抽取 `ArgumentSnippetTest`** / **任务-辩论分离 `TaskDebateSeparationTest`**）。全量回归：`python -m unittest discover tests` → **82 tests OK**。
 
 ---
 
@@ -776,4 +793,4 @@ python scripts/eval_baseline.py data/discussions/discussion_xxx.md --baseline da
 
 ---
 
-*文档覆盖 `app/config / app/protocol / app/schemas / app/llm / app/embeddings / app/vector_store / app/memory / app/tools / app/rag / app/agent / app/orchestrator / app/manager / app/history / app/file_parser / app/main / app/static` 全部模块，可作为二次开发与维护的权威参考。*
+*文档覆盖 `app/config / app/protocol / app/schemas / app/llm / app/embeddings / app/vector_store / app/memory / app/tools / app/rag / app/agent / app/orchestrator / app/manager / app/bgtasks / app/history / app/file_parser / app/main / app/static` 全部模块，可作为二次开发与维护的权威参考。*

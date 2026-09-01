@@ -22,10 +22,7 @@ embedding 向量维度不同，token 数不是跨模型公平的度量单位，�
 import re
 from dataclasses import dataclass, field
 
-from app.config import settings
-
-# 对手映射（与 orchestrator.OPPONENT_STANCE 保持一致）
-OPPONENT_STANCE = {"PRO": "CON", "CON": "PRO"}
+from app.config import OPPONENT_STANCE, settings
 
 # <think> 片段正则（与 llm._strip_think 一致）
 _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)

@@ -15,7 +15,6 @@ main.py — FastAPI 应用入口（后端）
 
 统一由项目根目录的 start.py 启动（uvicorn）。
 """
-import asyncio
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -24,6 +23,7 @@ from fastapi import FastAPI, File, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+from app.bgtasks import spawn as _spawn_task
 from app.config import PROJECT_ROOT
 from app.file_parser import SUPPORTED_EXTS, ParseError, parse_file, split_paragraphs
 from app.history import get_markdown, list_discussions, record_discussion
@@ -47,18 +47,6 @@ DISCUSSIONS_DIR.mkdir(parents=True, exist_ok=True)
 
 def _ts():
     return time.strftime("%Y%m%d_%H%M%S")
-
-
-# 持有所有后台 asyncio 任务的强引用，防止任务被 GC 提前回收（RUF006）
-_background_tasks: set[asyncio.Task] = set()
-
-
-def _spawn_task(coro):
-    """创建并登记一个后台任务，任务结束后自动从集合移除。"""
-    task = asyncio.create_task(coro)
-    _background_tasks.add(task)
-    task.add_done_callback(_background_tasks.discard)
-    return task
 
 
 def _get_orch(session_id: str | None):

@@ -19,10 +19,10 @@ import json
 import re
 import threading
 import time
-from typing import ClassVar
 
 from app.agent import Agent
-from app.config import settings
+from app.bgtasks import spawn as _spawn_task
+from app.config import OPPONENT_STANCE, settings
 from app.fairness import FairnessGovernor
 from app.llm import chat, chat_stream, summarize_text
 from app.protocol import Judgment, new_trace_id, new_uuid, now_ms
@@ -131,18 +131,6 @@ class EventBus:
             self.subs.remove(q)
 
 
-# 持有事件推送等后台 asyncio 任务的强引用，防止任务被 GC 提前回收（RUF006）
-_background_tasks: set[asyncio.Task] = set()
-
-
-def _spawn_task(coro):
-    """创建并登记一个后台任务，任务结束后自动从集合移除。"""
-    task = asyncio.create_task(coro)
-    _background_tasks.add(task)
-    task.add_done_callback(_background_tasks.discard)
-    return task
-
-
 def _text_similarity(a: str, b: str) -> float:
     """字符级文本相似度（difflib），用于嵌入模型不可用时的收敛检测降级（P0-3）。
 
@@ -155,6 +143,51 @@ def _text_similarity(a: str, b: str) -> float:
     if not a or not b:
         return 0.0
     return difflib.SequenceMatcher(None, a, b).ratio()
+
+
+# 论据句抽取（§5.4）：关键句启发式——序号标记（首先/第一/1.…）优先，
+# 论据性动词（指出/表明/因为…）加权，长度次之；无命中时回退最长句。
+_ARG_MARKER_WORDS = ("首先", "其次", "再次", "最后", "第一", "第二", "第三", "第四",
+                     "其一", "其二", "其三", "一方面", "另一方面", "一是", "二是", "三是")
+_ARG_KEY_WORDS = ("指出", "认为", "表明", "证明", "说明", "因为", "因此", "所以",
+                  "优势", "劣势", "缺陷", "问题", "局限", "不可替代", "证据", "数据",
+                  "研究", "导致", "意味着", "必须", "应当", "应该", "然而", "反而")
+
+
+def _extract_argument_sentences(text: str, max_chars: int) -> str:
+    """从发言原文中抽取关键论据句（截断到 max_chars 字）。
+
+    按句号/感叹/问号/分号/换行切句后，只保留带序号标记（首先/第一/1.…）
+    或论据性关键词（指出/表明/因为…）的句子，优先取标记多者；
+    原文无任何标记时回退最长句，避免信息完全丢失。超出 max_chars 时整体截断。
+    """
+    if not text or max_chars <= 0:
+        return ""
+    sentences = [s.strip() for s in re.split(r"[。！？!?;\n]", text) if s.strip()]
+    if not sentences:
+        return ""
+
+    def _score(s: str) -> int:
+        sc = 0
+        if any(w in s for w in _ARG_MARKER_WORDS):
+            sc += 3
+        sc += sum(1 for w in _ARG_KEY_WORDS if w in s)
+        return sc
+
+    scored = [(_score(s), -len(s), s) for s in sentences if _score(s) > 0]
+    if not scored:
+        # 无任何标记/关键词：回退取最长句，保留最大信息量
+        scored = [(1, -len(s), s) for s in sentences]
+    scored.sort(reverse=True)
+    kept, total = [], 0
+    for _, _, s in scored:
+        if total + len(s) > max_chars:
+            if not kept:
+                kept.append(s[:max_chars])
+            break
+        kept.append(s)
+        total += len(s)
+    return "；".join(kept)[:max_chars]
 
 
 class Orchestrator:
@@ -192,7 +225,7 @@ class Orchestrator:
         self.convergence_mode = "embedding"
         self.round_arguments = {}     # round -> {speaker: text}
         self.latest_arguments = {}    # speaker -> {"text","round"}
-        self.round_evidence = {}      # round -> {speaker: [EvidenceItem]}
+        self.round_evidence = {}      # round -> {stance: [EvidenceItem]}（按立场分桶，§5.3）
         self.judgment = None
         self.conclusion = None        # P0-1 结构化结论（core/positions/judge_ruling/pending）
         self.last_main_message = ""
@@ -278,19 +311,28 @@ class Orchestrator:
         - judge_config 非空（前端已选择裁判模型）或 .env 配置了 JUDGE_* 时创建独立裁判；
         - 完全未配置时返回 None，_judge_round 回退使用主 Agent 的模型配置（保持向后兼容）。
         裁判不进入 self.agents / self.collaborators，因此不占席位、不参与辩论、不接收任务。
+
+        provider 字段的显式值/环境默认值合并统一走 config.resolve_provider（§1.4），
+        供应商预设解析仍由 llm.resolve_model_config 负责。
         """
+        from app.config import resolve_provider
         from app.llm import resolve_model_config
         judge_cfg = {k: v for k, v in (judge_config or {}).items() if v}
-        provider = judge_cfg.get("provider") or settings.JUDGE_PROVIDER
-        base_url = judge_cfg.get("base_url") or settings.JUDGE_BASE_URL
-        api_key = judge_cfg.get("api_key") or settings.JUDGE_API_KEY
-        model_id = judge_cfg.get("model_id") or settings.JUDGE_MODEL_ID
-        has_env = any([settings.JUDGE_PROVIDER, settings.JUDGE_BASE_URL,
-                       settings.JUDGE_API_KEY, settings.JUDGE_MODEL_ID])
-        if not (judge_cfg or has_env):
+        spec = resolve_provider(
+            "JUDGE",
+            provider=judge_cfg.get("provider", ""),
+            base_url=judge_cfg.get("base_url", ""),
+            api_key=judge_cfg.get("api_key", ""),
+            model_id=judge_cfg.get("model_id", ""),
+        )
+        if not (judge_cfg or spec):
             return None
         model_config = resolve_model_config(
-            provider or "default", base_url or "", api_key or "", model_id or "")
+            spec.get("provider", "default"),
+            spec.get("base_url", ""),
+            spec.get("api_key", ""),
+            spec.get("model_id", ""),
+        )
         name = judge_cfg.get("name") or settings.JUDGE_NAME
         return Agent(
             agent_id="judge",
@@ -468,9 +510,10 @@ class Orchestrator:
     async def _agent_turn(self, agent: Agent, user_msg: str, mode: str,
                           allow_delegate: bool = True, stream: bool = False):
         collaborators_meta = [{"name": c.name} for c in self.collaborators]
-        sys_prompt = agent.system_prompt(
-            collaborators_meta, self.shared_context, self._task_status_text(),
-            mode, self.topic)
+        # system_prompt 内部会做记忆检索（memory.context_text），卸载到线程避免阻塞事件循环（§2.4）
+        sys_prompt = await asyncio.to_thread(
+            agent.system_prompt, collaborators_meta, self.shared_context,
+            self._task_status_text(), mode, self.topic)
         messages = [{"role": "system", "content": sys_prompt},
                     *list(agent.history),
                     {"role": "user", "content": user_msg}]
@@ -692,12 +735,11 @@ class Orchestrator:
         self.latest_arguments[speaker] = {"text": text, "round": round_no}
 
     # ---------------- 对手定向反驳（需求 2/3） ----------------
-    # PRO↔CON 立场互为对手；NEUTRAL/HOST 无固定对手
-    OPPONENT_STANCE: ClassVar[dict[str, str]] = {"PRO": "CON", "CON": "PRO"}
+    # PRO↔CON 立场互为对手；NEUTRAL/HOST 无固定对手（定义收敛于 app.config.OPPONENT_STANCE，§3.4）
 
     def _find_opponent(self, collab: Agent) -> Agent | None:
         """找到 collab 的立场对手：优先取上一轮对立场的最新发言人，空则回退全局最近。"""
-        target = self.OPPONENT_STANCE.get(collab.stance)
+        target = OPPONENT_STANCE.get(collab.stance)
         if target is None:
             return None
         # 先在上一轮找对立场最近发言人
@@ -719,6 +761,8 @@ class Orchestrator:
         - 第 2 轮：对手原文截断到 OPPONENT_SNIPPET_MAX_CHARS 字；
         - 第 3 轮起：对手发言 LLM 摘要到 OPPONENT_SUMMARY_MAX_CHARS 字
           （按 (对手,轮次) 缓存；usage 计入 self.spent 只读遥测）。
+        第 3 轮起额外抽取对手关键论据句（OPPONENT_ARGUMENT_SNIPPET_MAX_CHARS 字，§5.4），
+        弥补 LLM 摘要丢失具体论点的不足。
         """
         self._opponent_prep.pop(collab.name, None)
         if self.round < 2:
@@ -759,16 +803,26 @@ class Orchestrator:
             "stance": STANCE_LABEL.get(opp.stance, opp.stance),
             "round": round_no,
             "text": brief,
+            # 摘要轮补充关键论据句（§5.4）：原文中带序号/论据标记的句子，
+            # 防止 LLM 摘要丢失具体论点导致反驳泛泛而谈；第 2 轮原文片段已足够。
+            "arguments": _extract_argument_sentences(
+                text, settings.OPPONENT_ARGUMENT_SNIPPET_MAX_CHARS) if self.round >= 3 else "",
         }
 
-    def _evidence_for_round(self, round_no: int) -> str:
+    def _evidence_for_round(self, round_no: int, stance: str = "") -> str:
+        """取第 round_no 轮的 RAG 证据文本；按调用者立场取对应证据桶（§5.3）。
+
+        无立场或该立场无证据时回退到默认桶（旧数据 / 未分桶场景）。
+        """
         items = self.round_evidence.get(round_no)
         if not items:
             return ""
-        flat = []
-        for v in items.values():
-            flat.extend(v)
-        return rag_service.evidence_text(flat)
+        bucket = items.get(stance) if stance else None
+        if not bucket:
+            bucket = items.get("default")
+        if not bucket:
+            return ""
+        return rag_service.evidence_text(bucket)
 
     def _debate_prompt(self, collab: Agent) -> str:
         stance_label = STANCE_LABEL.get(collab.stance, collab.stance)
@@ -796,6 +850,11 @@ class Orchestrator:
                 parts.append(f"这是第 {self.round} 轮反驳/辩护阶段。你的对手「{opp_prep['speaker']}」"
                              f"（{opp_prep['stance']}）在第 {opp_prep['round']} 轮的{digest}如下：\n"
                              f"{opp_prep['text']}")
+                # 摘要轮补充关键论据句（§5.4）：明确列出对方具体论点，要求逐条回应，
+                # 避免只攻击摘要里的一句话而遗漏其余论点。
+                if opp_prep.get("arguments"):
+                    parts.append(f"对方发言中的关键论据句（请逐条回应，不要遗漏）：\n"
+                                 f"{opp_prep['arguments']}")
                 parts.append(f"请以{persona}为出发点进行反驳：优先逐条回应对方发言中"
                              "与你立场相悖的核心观点，指出逻辑谬误（如滑坡谬误、稻草人）或提供反证"
                              "（可调用 knowledge_search 检索）。必须坚定维护你的「"
@@ -828,8 +887,8 @@ class Orchestrator:
                                  "直接回应对方核心论据，指出逻辑谬误（如滑坡谬误、稻草人）或提供反证"
                                  "（可调用 knowledge_search 检索）。必须坚定维护你的「"
                                  + stance_label + "」立场，禁止倒戈。")
-        # RAG 证据注入（上一轮核查结果）
-        ev = self._evidence_for_round(self.round - 1)
+        # RAG 证据注入（上一轮核查结果；只注入与本人立场对应的证据桶，§5.3）
+        ev = self._evidence_for_round(self.round - 1, collab.stance)
         if ev:
             parts.append(ev)
         # 公平性 L1：相对上限（对手近 N 轮有效输出均值 × 比例，与硬上限取 min）。
@@ -856,48 +915,58 @@ class Orchestrator:
         order.extend(others)
         return order
 
-    async def _collab_turn(self, collab: Agent):
+    async def _task_turn(self, collab: Agent):
+        """任务回合（§5.8）：只处理该辩手的待办任务，不发言辩论。
+
+        任务输出仅回填 shared_context 并发布 task_result 事件；
+        不再调用 _record_argument / _record_memory——任务结果不进入
+        round_arguments（避免污染收敛检测、RAG 核查与对手上下文），
+        也不进入辩论记忆（避免任务细节暴露到辩论发言中）。
+        """
         pending = [t for t in self.tasks
                    if not t["completed"] and t["recipient"] == collab.name]
-        if pending:
-            for task in pending:
-                umsg = (f"你收到任务#{task['id']}：\n内容：{task['content']}\n"
-                        f"期望效果：{task['expected_outcome']}\n"
-                        f"请将结果回填到变量 `{task['var_name']}`。")
-                # 优化 A8：任务协作模式同样启用流式输出，前端按 speaker 并行展示
-                out = await self._agent_turn(collab, umsg, mode="task", stream=True)
-                if out["report"]:
-                    report = out["report"]
-                    self._apply_report(task, report)
-                    msg = report.get("message", "")
-                    if msg:
-                        # 流式已展示过程发言；未流式（空内容/回退路径）时才补发言气泡
-                        if not out["streamed"]:
-                            await self._emit_speech(collab, msg)
-                        self._record_argument(collab.name, msg, self.round)
-                    await self.event_bus.publish({
-                        "type": "task_result",
-                        "from": collab.name,
-                        "var": task["var_name"],
-                        "value": report.get("var_value", ""),
-                        "completed": bool(report.get("completed", False)),
-                        "message": msg,
-                        "task_id": task["task_id"],
-                        "timestamp": now_ms(),
-                        "token_cost": out.get("token_cost", 0),
-                    })
-                else:
-                    # 未回报，记录其发言（若有）
-                    if out["content"]:
-                        if not out["streamed"]:
-                            await self._emit_speech(collab, out["content"])
-                        self._record_argument(collab.name, out["content"], self.round)
-                    task["rounds_waiting"] = task.get("rounds_waiting", 0) + 1
-                    if task["rounds_waiting"] >= 3:
-                        task["completed"] = True
-                        if task["var_name"] in self.shared_context:
-                            self.shared_context[task["var_name"]]["value"] = "（超时未完成）"
-        # 辩论环节（立论 / 反驳）：无论是否处理过任务，辩手每轮都发言，保证严格交替
+        if not pending:
+            return
+        for task in pending:
+            umsg = (f"你收到任务#{task['id']}：\n内容：{task['content']}\n"
+                    f"期望效果：{task['expected_outcome']}\n"
+                    f"请将结果回填到变量 `{task['var_name']}`。")
+            # 优化 A8：任务协作模式同样启用流式输出，前端按 speaker 并行展示
+            out = await self._agent_turn(collab, umsg, mode="task", stream=True)
+            if out["report"]:
+                report = out["report"]
+                self._apply_report(task, report)
+                msg = report.get("message", "")
+                if msg:
+                    # 流式已展示过程发言；未流式（空内容/回退路径）时才补发言气泡
+                    if not out["streamed"]:
+                        await self._emit_speech(collab, msg)
+                await self.event_bus.publish({
+                    "type": "task_result",
+                    "from": collab.name,
+                    "var": task["var_name"],
+                    "value": report.get("var_value", ""),
+                    "completed": bool(report.get("completed", False)),
+                    "message": msg,
+                    "task_id": task["task_id"],
+                    "timestamp": now_ms(),
+                    "token_cost": out.get("token_cost", 0),
+                })
+            else:
+                # 未回报：不计入辩论发言记录（§5.8），仅流式展示其过程输出
+                if out["content"] and not out["streamed"]:
+                    await self._emit_speech(collab, out["content"])
+                task["rounds_waiting"] = task.get("rounds_waiting", 0) + 1
+                if task["rounds_waiting"] >= 3:
+                    task["completed"] = True
+                    if task["var_name"] in self.shared_context:
+                        self.shared_context[task["var_name"]]["value"] = "（超时未完成）"
+
+    async def _debate_turn(self, collab: Agent):
+        """辩论回合（§5.8）：立论 / 反驳发言，与任务回合完全分离。
+
+        无论本轮回合是否处理过任务，辩手每轮都发言，保证严格交替。
+        """
         await self._prepare_opponent_context(collab)  # 需求 2/3：注入对手上轮发言（截断/摘要）
         self.governor.record_speech(collab.stance, self.round)  # 公平性 L4：每模型每轮至多发言一次
         umsg = self._debate_prompt(collab)
@@ -911,46 +980,71 @@ class Orchestrator:
 
     # ---------------- RAG 事实核查（架构文档 §2.5 / §4.2） ----------------
     async def _rag_check_round(self):
-        texts = list(self.round_arguments.get(self.round, {}).values())
-        if not texts:
+        args = self.round_arguments.get(self.round, {}) or {}
+        if not args:
             return
-        combined = "\n".join(texts)
-        try:
-            evidence = await asyncio.to_thread(rag_service.check, combined, 3)
-        except Exception as e:
-            self._log(f"[RAG核查失败] {e}", level="warning", event="rag.fail")
-            return
-        if evidence:
-            self.round_evidence[self.round] = {"default": evidence}
-            self._log(f"[RAG] 第{self.round}轮事实核查返回 {len(evidence)} 条证据",
+        # 按立场分桶（§5.3）：只核查该立场辩手本轮发言，证据归入对应立场桶，
+        # 下一轮注入时辩手只拿到与自己立场相关的核查结果，避免被对手证据干扰。
+        by_stance: dict[str, list[str]] = {}
+        for name, text in args.items():
+            agent = self.get_agent(name)
+            stance = agent.stance if agent is not None else "default"
+            by_stance.setdefault(stance, []).append(text)
+        buckets: dict[str, list] = {}
+        total = 0
+        for stance, texts in by_stance.items():
+            combined = "\n".join(texts)
+            try:
+                evidence = await asyncio.to_thread(rag_service.check, combined, 3)
+            except Exception as e:
+                self._log(f"[RAG核查失败] 立场{stance}: {e}",
+                          level="warning", event="rag.fail")
+                continue
+            if evidence:
+                buckets[stance] = evidence
+                total += len(evidence)
+        if buckets:
+            self.round_evidence[self.round] = buckets
+            self._log(f"[RAG] 第{self.round}轮事实核查返回 {total} 条证据"
+                      f"（{ {k: len(v) for k, v in buckets.items()} }）",
                       level="info", event="rag.check")
 
     # ---------------- 收敛检测（架构文档 §4.4；P0-3 支持降级模式） ----------------
     async def _check_convergence(self) -> bool:
         if self.round < 2:
             return False
-        cur = " ".join(self.round_arguments.get(self.round, {}).values())
-        prev = " ".join(self.round_arguments.get(self.round - 1, {}).values())
-        if not cur or not prev:
+        cur_args = self.round_arguments.get(self.round, {}) or {}
+        prev_args = self.round_arguments.get(self.round - 1, {}) or {}
+        if not cur_args or not prev_args:
             return False
         try:
             from app.embeddings import embed_query, is_fallback
-            if is_fallback():
-                # 降级：哈希向量不表达语义（余弦值近随机），改用字符级文本相似度
-                mode = "text-similarity"
-                if self.convergence_mode != mode:
-                    self.convergence_mode = mode
+            mode = "text-similarity" if is_fallback() else "embedding"
+            if mode != self.convergence_mode:
+                self.convergence_mode = mode
+                if mode == "text-similarity":
                     self._log("嵌入模型不可用，收敛检测降级为文本相似度 "
                               f"（difflib 字符级，阈值 {settings.CONVERGENCE_TEXT_SIMILARITY}）",
                               level="warning", event="convergence.degraded")
-                sim = _text_similarity(cur, prev)
-            else:
-                self.convergence_mode = "embedding"
+
+            async def _sim(a: str, b: str) -> float:
+                if mode == "text-similarity":
+                    return _text_similarity(a, b)
                 import numpy as np
-                v_cur = np.array(embed_query(cur))
-                v_prev = np.array(embed_query(prev))
-                sim = float(np.dot(v_cur, v_prev) /
-                            (np.linalg.norm(v_cur) * np.linalg.norm(v_prev) + 1e-9))
+                # 向量化在 worker 线程执行，避免阻塞事件循环（§2.4）
+                v_a = np.array(await asyncio.to_thread(embed_query, a))
+                v_b = np.array(await asyncio.to_thread(embed_query, b))
+                return float(np.dot(v_a, v_b) /
+                             (np.linalg.norm(v_a) * np.linalg.norm(v_b) + 1e-9))
+
+            # 按发言者逐人计算（§5.7）：连续两轮都有发言的每个辩手单独算相似度再取平均，
+            # 避免拼接全文时单一长文本主导而误判收敛；无共同发言者时回退整轮聚合对比。
+            common = [n for n in cur_args if n in prev_args]
+            if settings.CONVERGENCE_PER_SPEAKER and common:
+                sims = [await _sim(cur_args[n], prev_args[n]) for n in common]
+                sim = sum(sims) / len(sims)
+            else:
+                sim = await _sim(" ".join(cur_args.values()), " ".join(prev_args.values()))
         except Exception:
             return False
         # 新证据检测：本轮 RAG 若返回了新证据，则不视为无效循环
@@ -1068,11 +1162,17 @@ class Orchestrator:
                 self._record_memory(self.main, main_out["content"])
                 self._record_argument(self.main.name, main_out["content"], self.round)
 
-                # 2) 协作 Agent 回合（严格交替：正方/反方轮流发言，其余立场排后）
+                # 2) 协作 Agent 回合（§5.8 拆分：任务回合 → 辩论回合，两者完全分离）
+                # 2a) 任务回合：处理各辩手待办任务；任务输出不回填 round_arguments，
+                #     不污染收敛检测 / RAG 核查 / 对手上下文
+                if any(not t["completed"] for t in self.tasks):
+                    for c in self.collaborators:
+                        await self._task_turn(c)
+                # 2b) 辩论回合（严格交替：正方/反方轮流发言，其余立场排后）
                 if self.round == 1:
                     # 第 1 轮并行立论（架构文档 §4.2 / §6.2）
                     await asyncio.gather(
-                        *[self._collab_turn(c) for c in self.collaborators],
+                        *[self._debate_turn(c) for c in self.collaborators],
                         return_exceptions=True,
                     )
                     # 确定第 2 轮首位发言人的"上一发言人"（交替顺序的末位）
@@ -1082,7 +1182,7 @@ class Orchestrator:
                 else:
                     # 第 2 轮起严格交替串行发言：正/反方轮流，其余立场最后
                     for c in self._debate_order():
-                        await self._collab_turn(c)
+                        await self._debate_turn(c)
 
                 # 3) RAG 事实核查（注入下一轮上下文）
                 await self._rag_check_round()
@@ -1728,12 +1828,3 @@ class Orchestrator:
             lines.append(f"- {a.name}：短期 {snap['short_term']} / 长期 {snap['long_term']} "
                          f"/ 情境 {snap['contextual']}")
         return "\n".join(lines)
-
-
-# 默认会话编排器实例（session_id="default"，向后兼容现有调用方与测试）
-orchestrator = Orchestrator(session_id="default")
-
-# 把默认会话注册进全局会话管理器，保证 main.py / 现有测试引用的模块级单例
-# 与 manager.get_or_create("default") 返回同一实例（多会话隔离的向后兼容层）
-from app.manager import manager  # noqa: E402, I001  （惰性导入 Orchestrator，无循环依赖）
-manager.register(orchestrator)

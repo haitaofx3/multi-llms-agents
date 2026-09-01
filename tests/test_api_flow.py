@@ -21,8 +21,11 @@ import unittest
 import httpx
 
 from app import main as main_module
-from app.orchestrator import orchestrator
+from app.manager import manager
 from app.protocol import Judgment
+
+# §1.3 解耦：会话实例统一由 DebateManager 注册表持有，不再导入模块级单例。
+orchestrator = manager.get_or_create("default")
 
 HOST_CFG = {"name": "主持", "role": "主持", "personality": "",
             "provider": "custom", "stance": "HOST",

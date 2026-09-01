@@ -128,6 +128,9 @@ class Settings:
     # 降级阈值：嵌入模型不可用时（哈希向量无语义），改用 difflib 字符级文本相似度，
     # 其数值分布低于向量余弦相似度，故单独设置较低阈值（P0-3）。
     CONVERGENCE_TEXT_SIMILARITY = _float("CONVERGENCE_TEXT_SIMILARITY", 0.6)
+    # 收敛检测是否按发言者逐人计算（§5.7）：True 时对连续两轮都发言的每个辩手
+    # 单独算相似度再取平均，避免拼接全文时单一长文本主导而误判收敛。
+    CONVERGENCE_PER_SPEAKER = _int("CONVERGENCE_PER_SPEAKER", 1) == 1
 
     # ---- LLM 重试（架构文档 §4.5：最多重试 2 次，间隔 1s、3s） ----
     LLM_RETRY_ATTEMPTS = _int("LLM_RETRY_ATTEMPTS", 3)
@@ -144,6 +147,9 @@ class Settings:
     # ---- 辩论对手上下文（需求 2/3：对手发言的引用与压缩） ----
     OPPONENT_SNIPPET_MAX_CHARS = _int("OPPONENT_SNIPPET_MAX_CHARS", 500)      # 第 2 轮对手上轮发言原文截断上限（字）
     OPPONENT_SUMMARY_MAX_CHARS = _int("OPPONENT_SUMMARY_MAX_CHARS", 200)      # 第 3 轮起对手发言 LLM 摘要上限（字）
+    # 摘要轮额外保留的对手关键论据句上限（字，§5.4）：LLM 摘要可能丢失具体论点，
+    # 补充保留对手发言中带序号/论据标记的关键句子，避免辩手反驳"泛泛而谈"。
+    OPPONENT_ARGUMENT_SNIPPET_MAX_CHARS = _int("OPPONENT_ARGUMENT_SNIPPET_MAX_CHARS", 160)
 
     # ---- 记忆压缩（短期 → 情境的 LLM 摘要上限） ----
     MEMORY_SUMMARY_MAX_CHARS = _int("MEMORY_SUMMARY_MAX_CHARS", 200)          # 短期记忆聚合摘要上限（字）
@@ -170,3 +176,31 @@ class Settings:
 
 
 settings = Settings()
+
+
+def resolve_provider(prefix: str, provider: str = "", base_url: str = "",
+                     api_key: str = "", model_id: str = ""):
+    """把显式字段与 .env 的 `{prefix}_*` 配置合并为一份 provider 规格（§1.4 统一入口）。
+
+    例：prefix="JUDGE" 时，空字段依次回退 settings.JUDGE_PROVIDER /
+    JUDGE_BASE_URL / JUDGE_API_KEY / JUDGE_MODEL_ID。返回过滤掉空值的规格 dict；
+    全部字段为空时返回空 dict（调用方据此判断「未配置」）。
+    本函数只做合并，不解析供应商预设——预设解析仍由 app.llm.resolve_model_config 负责。
+    """
+    def _env(name: str) -> str:
+        if not prefix:
+            return ""
+        return getattr(settings, f"{prefix}_{name}", "") or ""
+
+    spec = {
+        "provider": provider or _env("PROVIDER"),
+        "base_url": base_url or _env("BASE_URL"),
+        "api_key": api_key or _env("API_KEY"),
+        "model_id": model_id or _env("MODEL_ID"),
+    }
+    return {k: v.strip() for k, v in spec.items() if v and v.strip()}
+
+
+# 立场对手映射（PRO↔CON 互为对手；NEUTRAL/HOST 无固定对手）。
+# 收敛到 config 后由 orchestrator/fairness 共享，避免重复定义漂移（§3.4）。
+OPPONENT_STANCE = {"PRO": "CON", "CON": "PRO"}

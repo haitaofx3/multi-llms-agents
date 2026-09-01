@@ -21,9 +21,12 @@ from unittest.mock import AsyncMock, patch
 
 from app.config import settings
 from app.fairness import FairnessGovernor
+from app.manager import manager
 from app.memory import MemorySystem
-from app.orchestrator import orchestrator
 from app.protocol import Judgment
+
+# §1.3 解耦：会话实例统一由 DebateManager 注册表持有，不再导入模块级单例。
+orchestrator = manager.get_or_create("default")
 
 HOST_CFG = {"name": "主持", "role": "主持", "personality": "",
             "provider": "default", "stance": "HOST"}

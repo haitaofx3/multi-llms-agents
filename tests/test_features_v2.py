@@ -20,8 +20,12 @@ import unittest
 from unittest.mock import patch
 
 from app.config import settings
-from app.orchestrator import _estimate_cost_rmb, _text_similarity, orchestrator
+from app.manager import manager
+from app.orchestrator import _estimate_cost_rmb, _extract_argument_sentences, _text_similarity
 from app.protocol import Judgment
+
+# §1.3 解耦：会话实例统一由 DebateManager 注册表持有，不再导入模块级单例。
+orchestrator = manager.get_or_create("default")
 
 HOST_CFG = {"name": "主持", "role": "主持", "personality": "",
             "provider": "default", "stance": "HOST"}
@@ -38,7 +42,6 @@ def _fake_llm_result(content="发言"):
 
 class CostEstimateTest(unittest.TestCase):
     """P1-6 成本估算纯函数：输入/输出分别按每百万单价计价（只读展示）。"""
-
     def test_zero_cost(self):
         self.assertEqual(_estimate_cost_rmb(0, 0), 0.0)
         self.assertEqual(_estimate_cost_rmb(None, None), 0.0)
@@ -382,6 +385,142 @@ class StructuredConclusionTest(unittest.IsolatedAsyncioTestCase):
             self.assertIn("胜方：PRO", ev["judge_ruling"])
         finally:
             orch._agent_turn = orig_agent_turn
+        orchestrator.event_bus.unsubscribe(q)
+
+
+class ArgumentSnippetTest(unittest.TestCase):
+    """§5.4 对手关键论据句抽取纯函数：序号/论据标记句优先，截断到 max_chars。"""
+
+    def test_picks_marker_sentences(self):
+        text = ("首先，历史数据表明ATM机未减少银行职员。"
+                "其次，AI在创造性工作上仍有局限。"
+                "天气不错。")
+        out = _extract_argument_sentences(text, 200)
+        self.assertIn("首先", out)
+        self.assertIn("其次", out)
+        # 无标记句不入选（短句“天气不错”分数最低）
+        self.assertNotIn("天气不错", out)
+
+    def test_max_chars_truncated(self):
+        text = "第一，" + "长" * 500 + "。第二，另有论点。"
+        out = _extract_argument_sentences(text, 50)
+        self.assertLessEqual(len(out), 50)
+
+    def test_empty_input(self):
+        self.assertEqual(_extract_argument_sentences("", 100), "")
+        self.assertEqual(_extract_argument_sentences("   \n", 100), "")
+        self.assertEqual(_extract_argument_sentences("有效文本", 0), "")
+
+    def test_fallback_longest_when_no_markers(self):
+        text = "短句。这是一句没有任何标记但相对较长的论据性内容。"
+        out = _extract_argument_sentences(text, 200)
+        # 无序号标记时仍返回非空内容，不会整体丢失
+        self.assertTrue(out)
+
+
+class TaskDebateSeparationTest(unittest.IsolatedAsyncioTestCase):
+    """§5.8 任务回合与辩论回合分离：
+    - _task_turn 处理任务但不污染 round_arguments；
+    - _debate_turn 才记录辩论发言；
+    - _prepare_opponent_context 第 3 轮起附带关键论据句。
+    """
+
+    async def _configure(self):
+        orchestrator.configure([HOST_CFG, PRO_CFG, CON_CFG],
+                               topic="任务辩论分离", max_rounds=3)
+        q = orchestrator.event_bus.subscribe()
+        while True:
+            try:
+                await asyncio.wait_for(q.get(), timeout=0.1)
+            except asyncio.TimeoutError:
+                break
+        return q
+
+    @staticmethod
+    def _collab(stance):
+        for c in orchestrator.collaborators:
+            if c.stance == stance:
+                return c
+        raise AssertionError(f"无 {stance} 立场协作辩手")
+
+    async def test_task_turn_does_not_pollute_round_arguments(self):
+        await self._configure()
+        pro = self._collab("PRO")
+        orch = orchestrator
+        orch.round = 2
+        orch.tasks.clear()
+        orch.round_arguments.clear()
+        orch._create_task({
+            "recipient": pro.name, "content": "调研就业数据",
+            "expected_outcome": "给出关键数字", "var_name": "research"})
+        orig = orch._agent_turn
+
+        async def fake_agent_turn(agent, user_msg, mode, allow_delegate=True, stream=False):
+            self.assertEqual(mode, "task")  # 任务回合必须走 task 模式
+            return {"content": "过程输出", "delegate": [],
+                    "report": {"var_name": "research", "var_value": "8.0%",
+                               "completed": True, "message": "已查得数据"},
+                    "streamed": True, "token_cost": 0}
+
+        orch._agent_turn = fake_agent_turn
+        try:
+            await orch._task_turn(pro)
+        finally:
+            orch._agent_turn = orig
+        # 结果回填 shared_context 且任务标记完成
+        self.assertEqual(orch.shared_context["research"]["value"], "8.0%")
+        self.assertTrue(orch.tasks[0]["completed"])
+        # 关键：round_arguments 无任务痕迹（§5.8）
+        self.assertEqual(orch.round_arguments, {})
+
+    async def test_debate_turn_records_speech(self):
+        await self._configure()
+        pro = self._collab("PRO")
+        orch = orchestrator
+        orch.round = 2
+        orch.tasks.clear()
+        orch.round_arguments.clear()
+        orig = orch._agent_turn
+
+        async def fake_agent_turn(agent, user_msg, mode, allow_delegate=True, stream=False):
+            self.assertEqual(mode, "discussion")
+            return {"content": "我的反驳发言", "delegate": [],
+                    "report": None, "streamed": True, "token_cost": 0}
+
+        orch._agent_turn = fake_agent_turn
+        try:
+            await orch._debate_turn(pro)
+        finally:
+            orch._agent_turn = orig
+        self.assertEqual(orch.round_arguments[2][pro.name], "我的反驳发言")
+        self.assertEqual(orch.last_debate_speaker, pro.name)
+
+    async def test_round3_opponent_prep_includes_argument_snippets(self):
+        q = await self._configure()
+        import app.orchestrator as orch_mod
+        pro = self._collab("PRO")
+        con = self._collab("CON")
+        orch = orchestrator
+        orch.round = 3
+        orch.round_arguments[2] = {con.name: (
+            "第一，历史数据表明技术变革未减少总就业。"
+            "第二，人类在伦理决策上有不可替代优势。"
+            "其余填充内容。")}
+
+        async def fake_summarize_text(model_config, text, max_chars=150):
+            return "浓缩要点", {"total_tokens": 5}
+
+        orig = orch_mod.summarize_text
+        orch_mod.summarize_text = fake_summarize_text
+        try:
+            await orch._prepare_opponent_context(pro)
+        finally:
+            orch_mod.summarize_text = orig
+        prep = orch._opponent_prep[pro.name]
+        self.assertEqual(prep["text"], "浓缩要点")
+        # §5.4：摘要轮额外保留关键论据句
+        self.assertIn("第一", prep.get("arguments", ""))
+        self.assertIn("第二", prep.get("arguments", ""))
         orchestrator.event_bus.unsubscribe(q)
 
 
