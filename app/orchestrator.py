@@ -1860,55 +1860,73 @@ class Orchestrator:
         return task
 
     async def _reflect_report(self, collab: Agent, task: dict, report: dict):
-        """合作模式反思与自我修正（§12.18）：对照期望效果自评草稿并输出修订版。
+        """合作模式反思与自我修正（§12.18）：对照期望效果对草稿做至多 N 轮自评修订。
+
+        每轮把上一轮修订版作为新草稿继续自评，直到达到 REFLECTION_MAX_PASSES 上限
+        或收敛（无修订 / 修订等于当前草稿）提前终止。
 
         返回 (report, meta)：
-          - meta=None  未反思（被禁用 / 已达上限 / 反思调用异常），report 保持原草稿；
-          - meta={"revised": bool, "reflections": int, "token_cost": int} 已执行一次反思。
-        反思调用异常或输出无法解析时保留草稿照常落库，不阻塞任务完成。
+          - meta=None  未反思（被禁用 / 已达上限 / 首轮调用即异常），report 保持原草稿；
+          - meta={"revised": bool, "reflections": int, "token_cost": int}
+            已执行 ≥1 次反思（reflections 为本轮实际完成的轮数）。
+        任一反思调用异常或输出无法解析时，保留当前最佳草稿照常落库，不阻塞任务完成。
         """
         if not (settings.REFLECTION_ENABLED
                 and task["reflections"] < settings.REFLECTION_MAX_PASSES):
             return report, None
-        draft = report.get("var_value", "") or report.get("message", "")
+        original = report.get("var_value", "") or report.get("message", "")
+        current = original
+        last_explanation = ""
+        passes_done = 0
+        token_cost_total = 0
         try:
             # 非主 Agent + mode="collaboration" → 不注入任何工具（§12.4），非流式不产生气泡；
             # _apply_usage 自动把本次调用计入 spent/output_tokens 遥测，_run_llm_retry 内置重试。
-            out = await self._agent_turn(collab, _reflection_prompt(task, draft),
-                                         mode="collaboration", allow_delegate=False,
-                                         stream=False)
-            parsed = _parse_reflection(out["content"])
-            revision = (parsed.get("revision") or "").strip()
-            if revision:
-                # 公平性 L1：修订版同样按硬性字符上限截断
-                revision, _ = self.governor.truncate_output(
-                    revision, self.governor.hard_char_ceiling)
-            task["reflections"] += 1
-            revised = bool(revision) and revision != draft
-            if revised:
-                report = {**report, "var_value": revision,
-                          "message": parsed.get("explanation")
-                          or report.get("message", "")}
-                self._record_memory(collab, f"任务#{task['id']}({task['var_name']}) 反思修订："
-                                            f"{parsed.get('explanation','')[:100]}")
-                self._log(f"[反思修订] 任务#{task['id']} 反思后修订结果",
-                          level="info", event="reflection.revised")
-            else:
-                self._log(f"[反思通过] 任务#{task['id']} 反思后维持草稿",
-                          level="info", event="reflection.passed")
-            task["reflection_log"].append({
-                "pass": task["reflections"],
-                "summary": parsed.get("reflection", "")[:200],
-                "revision": (revision or draft)[:200],
-                "revised": revised,
-                "timestamp": now_ms(),
-            })
-            return report, {"revised": revised, "reflections": task["reflections"],
-                            "token_cost": out.get("token_cost", 0)}
+            while (settings.REFLECTION_ENABLED
+                   and task["reflections"] < settings.REFLECTION_MAX_PASSES):
+                out = await self._agent_turn(
+                    collab, _reflection_prompt(task, current),
+                    mode="collaboration", allow_delegate=False, stream=False)
+                parsed = _parse_reflection(out["content"])
+                revision = (parsed.get("revision") or "").strip()
+                if revision:
+                    # 公平性 L1：修订版同样按硬性字符上限截断
+                    revision, _ = self.governor.truncate_output(
+                        revision, self.governor.hard_char_ceiling)
+                task["reflections"] += 1  # 每次反思调用计一轮
+                passes_done = task["reflections"]
+                token_cost_total += int(out.get("token_cost", 0) or 0)
+                changed = bool(revision) and revision != current
+                if changed:
+                    current = revision
+                last_explanation = parsed.get("explanation") or last_explanation
+                task["reflection_log"].append({
+                    "pass": task["reflections"],
+                    "summary": parsed.get("reflection", "")[:200],
+                    "revision": (revision or current)[:200],
+                    "revised": changed,
+                    "timestamp": now_ms(),
+                })
+                if not changed:
+                    break  # 收敛：无修订 / 修订无变化 → 提前终止
         except Exception as e:
-            self._log(f"[反思失败] 任务#{task['id']}: {e}，保留草稿落库",
+            self._log(f"[反思失败] 任务#{task['id']}: {e}，保留当前草稿落库",
                       level="warning", event="reflection.fail")
-            return report, None
+        if passes_done == 0:
+            return report, None  # 首轮即异常 → 不发布 task_revised
+        revised = current != original
+        if revised:
+            report = {**report, "var_value": current,
+                      "message": last_explanation or report.get("message", "")}
+            self._record_memory(collab, f"任务#{task['id']}({task['var_name']}) 反思修订："
+                                        f"{last_explanation[:100]}")
+            self._log(f"[反思修订] 任务#{task['id']} 反思后修订结果",
+                      level="info", event="reflection.revised")
+        else:
+            self._log(f"[反思通过] 任务#{task['id']} 反思后维持草稿",
+                      level="info", event="reflection.passed")
+        return report, {"revised": revised, "reflections": passes_done,
+                        "token_cost": token_cost_total}
 
     def _apply_report(self, task, report: dict):
         var = report.get("var_name") or task["var_name"]

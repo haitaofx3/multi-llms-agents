@@ -180,9 +180,10 @@ class Settings:
     DISCUSSION_MODE = _get("DISCUSSION_MODE", "debate")
 
     # ---- 合作模式子 Agent 反思与自我修正（仅 collaboration/collab 生效） ----
-    # 子 Agent 回报任务前额外一次 LLM 调用，对照 expected_outcome 自我批判并修订后再落库。
+    # 子 Agent 回报任务前做至多 N 轮反思 LLM 调用（每轮把上一轮修订版作新草稿继续自评，
+    # 无修订/无变化即收敛提前终止），对照 expected_outcome 自我批判并修订后再落库。
     REFLECTION_ENABLED = _int("REFLECTION_ENABLED", 1) == 1    # 是否启用
-    REFLECTION_MAX_PASSES = _int("REFLECTION_MAX_PASSES", 1)   # 单任务反思轮数上限（0=完全跳过）
+    REFLECTION_MAX_PASSES = _int("REFLECTION_MAX_PASSES", 2)   # 单任务反思轮数上限（0=完全跳过）
 
 
 settings = Settings()

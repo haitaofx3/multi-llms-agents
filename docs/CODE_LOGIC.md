@@ -506,26 +506,27 @@ while round < max_rounds:
 
 ### 12.18 合作模式反思与自我修正
 
-**定位**：仅 `collaboration/collab` 生效，辩论模式行为不变。子 Agent 在 `report_result` 落库之前增加**一次反思 LLM 调用**，对照任务 `expected_outcome` 自我批判并输出修订版，有修订才落库。
+**定位**：仅 `collaboration/collab` 生效，辩论模式行为不变。子 Agent 在 `report_result` 落库之前做**至多 N 轮反思 LLM 调用**，对照任务 `expected_outcome` 自我批判并输出修订版，有修订才落库。
 
 **触发与开关**：
-- `_reflect_report(collab, task, report)`（`_collab_work_turn` 的 report 分支内、`_apply_report` 之前调用）：先检查 `settings.REFLECTION_ENABLED`（默认开）与 `task["reflections"] < settings.REFLECTION_MAX_PASSES`（默认 1）；任一不满足 → 直接返回 `(report, None)`，草稿照常落库。`REFLECTION_MAX_PASSES=0` 时 `reflections(0) < 0` 恒 False，整段跳过。
+- `_reflect_report(collab, task, report)`（`_collab_work_turn` 的 report 分支内、`_apply_report` 之前调用）：先检查 `settings.REFLECTION_ENABLED`（默认开）与 `task["reflections"] < settings.REFLECTION_MAX_PASSES`（默认 2）；任一不满足 → 直接返回 `(report, None)`，草稿照常落库。`REFLECTION_MAX_PASSES=0` 时 `reflections(0) < 0` 恒 False，整段跳过。
 
-**反思调用**：
-- 取草稿 `report.get("var_value","") or report.get("message","")`，经 `_reflection_prompt(task, draft)`（模块级纯函数）拼出三段式提示词；
-- 经 `_agent_turn(collab, prompt, mode="collaboration", allow_delegate=False, stream=False)` 调用：**非主 Agent + `"collaboration"`** → 不注入任何工具（§12.4），非流式不产生 speech 气泡，`_apply_usage` 自动计入 spent/output_tokens 遥测；反思 LLM 的原始输出**不**经 `_agent_turn` 的 L1 兜底截断，仅在落库前由 `_reflect_report` 对修订版显式截断（见下）。
+**反思循环（多轮）**：
+- 初始草稿 `current = report.get("var_value","") or report.get("message","")`；**每轮把当前草稿喂给下一轮**，直到达到 `REFLECTION_MAX_PASSES` 上限或**收敛（无修订 / 修订与当前草稿相同 / 截断后为空）提前终止**；
+- 每轮经 `_agent_turn(collab, _reflection_prompt(task, current), mode="collaboration", allow_delegate=False, stream=False)` 调用：**非主 Agent + `"collaboration"`** → 不注入任何工具（§12.4），非流式不产生 speech 气泡，`_apply_usage` 自动计入 spent/output_tokens 遥测；反思 LLM 的原始输出**不**经 `_agent_turn` 的 L1 兜底截断，仅在落库前由 `_reflect_report` 对修订版显式截断（见下）；
+- 每次反思调用 `task["reflections"] += 1` 并写一条 `reflection_log`；`meta.reflections` = 本轮实际完成的轮数。
 
 **输出解析**：
 - `_parse_reflection(text)`（模块级纯函数）按 `re.match(r"^#{1,2}\s+(.+)$")` 匹配 Markdown 标题，按「自我反思 / 修订后结果 / 修订说明」关键词映射段名，缺段回退空串，返回 `{"reflection", "revision", "explanation"}`。不复用 `_split_sections`（其按标题精确取段、无缺失容错）。
 
 **落库语义**：
-- `revision` 非空 → 经 `self.governor.truncate_output(revision, hard_char_ceiling)` **L1 截断**；`revised = bool(revision) and revision != draft`；
-- 修订时：更新 report 的 `var_value`/`message`、写该 Agent 长期记忆（`importance` 沿用 `_record_memory` 默认）、发布事件 `reflection.revised`；否则事件 `reflection.passed`；
-- 每次成功反思写 `task["reflection_log"].append({pass, summary, revision, revised, timestamp})`，`task["reflections"] += 1`；返回 `(report, meta={"revised","reflections","token_cost"})`。
+- `revision` 非空 → 经 `self.governor.truncate_output(revision, hard_char_ceiling)` **L1 截断**；该轮 `changed = bool(revision) and revision != current`，`changed` 时 `current = revision`（作为下一轮草稿）；
+- 循环结束后 `revised = current != original`：修订时更新 report 的 `var_value`/`message`、写该 Agent 长期记忆（`importance` 沿用 `_record_memory` 默认）、发布事件 `reflection.revised`；否则事件 `reflection.passed`；
+- 返回 `(report, meta={"revised","reflections","token_cost"})`（token_cost 为该任务全部反思轮次之和）。
 
 **降级与事件**：
-- 反思 LLM 异常 / 输出无法解析 → **保留草稿照常落库** + warning 日志（`reflection.fail`），不阻塞任务完成（meta 返回 `None`）；
-- `_collab_work_turn` 在发布 `task_result` 之后、仅当 `reflected is not None` 时发布 **`task_revised`** 事件：`{type, from, var, task_id, value, reflections, revised, timestamp}`；前端仿 `task_result` 消费，展示「反思后已修订落库（第 N 轮）/ 反思后维持草稿（第 N 轮）」并同步 `state.tasks` 与 `state.ctx` 的值。
+- 任一反思调用异常 / 输出无法解析 → **保留当前最佳草稿照常落库** + warning 日志（`reflection.fail`），不阻塞任务完成；mid-loop 异常不丢弃此前已产生的修订，`passes_done>0` 时 meta 正常返回；**首轮即异常** `passes_done==0` → meta 返回 `None`；
+- `_collab_work_turn` 在发布 `task_result` 之后、仅当 `reflected is not None` 时发布 **`task_revised`** 事件：`{type, from, var, task_id, value, reflections, revised, timestamp}`（`reflections` = 实际完成的反思轮数）；前端仿 `task_result` 消费，展示「反思后已修订落库（第 N 轮）/ 反思后维持草稿（第 N 轮）」并同步 `state.tasks` 与 `state.ctx` 的值。
 - 配置：`REFLECTION_ENABLED` / `REFLECTION_MAX_PASSES`（`app/config.py` 经 `_int` 读取，`.env` 可覆盖，仅整数布尔语义）。
 
 ---
@@ -773,7 +774,7 @@ FastAPI 应用，挂载 `/static`，提供 REST + WebSocket。
 - **导出**：`/api/export` 返回约 19KB Markdown（含发言记录、裁判裁决、**「模型性能与综合评分」表**、任务结果表、记忆快照），落盘 `data/discussions/e2e_export.md`。
 - **校验输出**：`ARCHITECTURE CHECKS PASS (state machine / budget / judge)`（budget 字样为旧版断言残留）、`STREAMING CHECKS PASS`，断言覆盖 `agent_scores / model_performance / composite_scores` 非空且 `winner ∈ (PRO, CON, DRAW)`。
 
-> 该验证同时覆盖了降级路径（本机无 Qdrant → `in-memory`；无 HF 网络 → 哈希向量）。无需服务器的快速回归见 `tests/test_ci_fast.py`（状态机 / **公平性治理 L1–L6** / 裁决分档 / 综合评分逻辑 / Token 遥测）与 `tests/test_api_flow.py`（HTTP 接口全链路 + 路径穿越防护，LLM 打桩）及 `tests/test_features_v2.py`（费用估算 / 收敛降级 / 工具可视化 / 结构化结论 / **论据句抽取 `ArgumentSnippetTest`** / **任务-辩论分离 `TaskDebateSeparationTest`** / **双模式合作 `CollaborationModeTest`** / **反思与自我修正 `ReflectionTest`**）。全量回归：`python -m unittest discover tests` → **94 tests OK**。
+> 该验证同时覆盖了降级路径（本机无 Qdrant → `in-memory`；无 HF 网络 → 哈希向量）。无需服务器的快速回归见 `tests/test_ci_fast.py`（状态机 / **公平性治理 L1–L6** / 裁决分档 / 综合评分逻辑 / Token 遥测）与 `tests/test_api_flow.py`（HTTP 接口全链路 + 路径穿越防护，LLM 打桩）及 `tests/test_features_v2.py`（费用估算 / 收敛降级 / 工具可视化 / 结构化结论 / **论据句抽取 `ArgumentSnippetTest`** / **任务-辩论分离 `TaskDebateSeparationTest`** / **双模式合作 `CollaborationModeTest`** / **反思与自我修正 `ReflectionTest`（含多轮循环 / 收敛提前终止 / mid-loop 失败保留修订）**）。全量回归：`python -m unittest discover tests` → **97 tests OK**。
 
 ---
 

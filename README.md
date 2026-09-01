@@ -47,7 +47,7 @@
 36. **任务与辩论回合分离（§5.8）**：协作 Agent 每轮拆为两个独立回合——`_task_turn`（只处理待办任务，结果回填 `shared_context` 并发布 `task_result`，**不写 `round_arguments` / 记忆**）与 `_debate_turn`（专职立论 / 反驳，正常记录发言）。任务输出不再污染收敛检测、RAG 事实核查与对手上下文，也避免任务细节泄露到辩论发言中。
 37. **RAG 证据按立场分桶（§5.3）**：每轮事实核查把证据按发言人立场分组存放（`round_evidence[round] = {stance: [...]}`），下一轮注入时 `_evidence_for_round(round, stance)` 只取**与本人立场对应**的证据桶（无立场 / 空桶回退默认桶）——辩手不会被对手立场的核查结果干扰。
 38. **双模式：辩论 / 合作（§12.17）**：同一编排器支持两种讨论模式（前端模式选择器 / `/api/configure` 的 `mode` 字段 / `.env` 的 `DISCUSSION_MODE` 兜底，默认 `debate`）。**辩论模式（debate）**为原主流程（主 Agent 主持、任务分派 + 辩论交锋、裁判四维裁决）；**合作模式（collaboration）**下主 Agent 用 `delegate_task` 把整体任务**拆分为子任务放入共享任务池**（`recipient` 留空），子 Agent 用 `claim_task` **主动认领（独占负责）**、完成后用 `report_result` 回报；**所有任务 `completed` 即提前收尾**（`max_rounds` 兜底），无裁判裁决，最终由主 Agent 输出三段式汇总（`## 核心结论 / ## 子任务与成果 / ## 遗留问题与后续建议`）。合作模式席位立场弱化：主位 HOST、其余一律 NEUTRAL，不参与对抗逻辑。
-39. **合作模式反思与自我修正（§12.18）**：仅 `collaboration` 模式生效。子 Agent 用 `report_result` 回报前，会**额外一次 LLM 调用**对照任务的 `expected_outcome` 自我批判（输出 `## 自我反思 / ## 修订后结果 / ## 修订说明` 三段），有修订才落库，并发布 `task_revised` 事件（前端实时标注「反思后已修订落库 / 维持草稿」）；反思调用不计入工具、不产生气泡，token 计入遥测。开关 `REFLECTION_ENABLED`（默认开）+ 单任务反思轮数上限 `REFLECTION_MAX_PASSES`（默认 1）双控；反思异常 / 输出无法解析时**保留草稿照常落库**，不阻塞任务完成。修订版同样受 L1 硬性字符上限截断。
+39. **合作模式反思与自我修正（§12.18）**：仅 `collaboration` 模式生效。子 Agent 用 `report_result` 回报前，会做**至多 N 轮反思 LLM 调用**对照任务的 `expected_outcome` 自我批判（输出 `## 自我反思 / ## 修订后结果 / ## 修订说明` 三段），每轮把上一轮修订版作为新草稿继续自评，直到达到轮数上限或**收敛（无修订 / 修订无变化）提前终止**；有修订才落库，并发布 `task_revised` 事件（前端实时标注「反思后已修订落库 / 维持草稿」）；反思调用不计入工具、不产生气泡，token 计入遥测。开关 `REFLECTION_ENABLED`（默认开）+ 单任务反思轮数上限 `REFLECTION_MAX_PASSES`（默认 2）双控；任一反思调用异常 / 输出无法解析时**保留当前最佳草稿照常落库**，不阻塞任务完成。修订版同样受 L1 硬性字符上限截断。
 
 ## 目录结构
 
@@ -137,7 +137,7 @@ pip install -r requirements.txt
 | `COST_INPUT_PER_1M` / `COST_OUTPUT_PER_1M` | 费用估算单价（P1-6，人民币 ¥/百万 token，默认 2.0 / 8.0；按供应商价格覆盖） |
 | `DISCUSSION_MODE` | 双模式服务端兜底：`debate`（辩论）/ `collaboration`（合作），默认 `debate`；前端 `/api/configure` / `/api/start` 可显式覆盖 |
 | `REFLECTION_ENABLED` | 合作模式反思与自我修正开关（§12.18，默认 1 开启；仅 `collaboration` 生效） |
-| `REFLECTION_MAX_PASSES` | 单个任务反思轮数上限（默认 1；0 表示完全跳过反思） |
+| `REFLECTION_MAX_PASSES` | 单个任务反思轮数上限（默认 2；每轮把上一轮修订版作新草稿继续自评，无修订即收敛提前终止；0 表示完全跳过反思） |
 | `FAIR_TEMPERATURE` / `FAIR_TOP_P` | 公平性 L5：辩论发言统一采样参数（默认 0.7 / 1.0） |
 | `FAIR_JUDGE_TEMPERATURE` / `FAIR_JUDGE_TOP_P` | 公平性 L5：辅助 LLM（裁判/摘要）统一采样参数（默认 0.3 / 1.0） |
 
@@ -186,13 +186,13 @@ HTTP 接口级测试（`httpx.ASGITransport` 直接驱动 FastAPI 应用，LLM �
 python -m unittest tests.test_api_flow -v
 ```
 
-多会话隔离与新特性测试（DebateManager 会话注册表 / 会话元数据 / 中断恢复；费用估算 / 收敛降级 / 工具调用可视化 / 结构化结论 / **论据句抽取** / **任务-辩论分离** / **双模式合作（任务池 / 认领独占 / 全完成收尾）** / **反思与自我修正（修订后落库 / 开关与上限 / 解析失败降级 / L1 截断）**，均无需服务器与真实模型）：
+多会话隔离与新特性测试（DebateManager 会话注册表 / 会话元数据 / 中断恢复；费用估算 / 收敛降级 / 工具调用可视化 / 结构化结论 / **论据句抽取** / **任务-辩论分离** / **双模式合作（任务池 / 认领独占 / 全完成收尾）** / **反思与自我修正（多轮循环 / 收敛提前终止 / mid-loop 失败保留修订 / 修订后落库 / 开关与上限 / 解析失败降级 / L1 截断）**，均无需服务器与真实模型）：
 
 ```bash
 python -m unittest tests.test_multi_session tests.test_features_v2 -v
 ```
 
-全量快速回归（无需服务器 / 真实模型）共 **94 项用例**：
+全量快速回归（无需服务器 / 真实模型）共 **97 项用例**：
 
 ```bash
 python -m unittest discover tests
