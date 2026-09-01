@@ -19,6 +19,7 @@ const state = {
   elapsedTimer: null,   // 实时耗时轮询定时器（讨论中每秒刷新）
   budgetEvents: [],     // 公平性/告警事件（结构化展示，保留最近 6 条）
   telemetry: { spent_tokens: 0, output_tokens: 0 },   // 最近一次 token 遥测快照（speech_end 实时刷新用）
+  mode: "debate",        // debate（辩论）/ collaboration（合作）
 };
 
 const STATUS_TEXT = {
@@ -27,7 +28,8 @@ const STATUS_TEXT = {
 };
 
 const PHASE_TEXT = {
-  idle: "空闲", preparing: "准备中", debating: "辩论中", judging: "裁决中", finished: "已完成",
+  idle: "空闲", preparing: "准备中", debating: "辩论中", collaborating: "协作中",
+  judging: "裁决中", finished: "已完成",
 };
 
 const STANCE_TEXT = { HOST: "主持人", PRO: "正方", CON: "反方", NEUTRAL: "中立" };
@@ -63,6 +65,7 @@ async function init() {
   refreshTemplateSelect();
   bindEvents();
   connectWS();
+  onModeChange();  // 初始化时按当前模式同步裁判块显隐与占位符
   // 检测服务器是否已有可继续的讨论（刷新页面 / 之前暂停未结束），此时"进入圆桌"应回到旧讨论
   try {
     const st = await fetch("/api/status" + sidQuery()).then(r => r.json());
@@ -96,6 +99,7 @@ function bindEvents() {
   $("btn-gen-agents").addEventListener("click", () =>
     generateAgentCards(parseInt($("agent-count").value, 10)));
   $("judge-provider").addEventListener("change", onJudgeProviderChange);
+  $("discussion-mode").addEventListener("change", onModeChange);
   $("btn-template-save").addEventListener("click", saveTemplate);
   $("btn-template-load").addEventListener("click", () => {
     const name = $("template-select").value;
@@ -229,6 +233,19 @@ function onProviderChange(card, cfg) {
   }
 }
 
+// ---------------- 讨论模式切换（辩论 / 合作） ----------------
+function onModeChange() {
+  const mode = $("discussion-mode").value;
+  const isCollab = mode === "collaboration";
+  // 合作模式无裁判：隐藏独立裁判设置块
+  const judgeBlock = $("judge-config-block");
+  if (judgeBlock) judgeBlock.classList.toggle("hidden", isCollab);
+  // 主题占位符随模式切换
+  $("topic").placeholder = isCollab
+    ? "例如：请设计一款面向学生的 AI 学习助手产品方案。"
+    : "例如：请各位协作设计一款面向学生的 AI 学习助手的产品方案。";
+}
+
 // ---------------- 独立裁判模型切换（展示/隐藏自定义字段） ----------------
 function onJudgeProviderChange() {
   const p = $("judge-provider").value;
@@ -285,6 +302,7 @@ function collectSetupConfig() {
   return {
     topic: $("topic").value,
     max_rounds: parseInt($("max-rounds").value, 10) || 8,
+    mode: $("discussion-mode").value,
     kb_text: $("kb-text").value,
     agents: collectAgentConfigsFromDOM(),
     judge: collectJudgeConfig(),
@@ -311,6 +329,10 @@ function applyTemplate(name) {
   $("agent-count").value = n;
   $("topic").value = tpl.topic || "";
   $("max-rounds").value = clamp(tpl.max_rounds || 8, 1, 30);
+  if (tpl.mode && ["debate", "collaboration"].includes(tpl.mode)) {
+    $("discussion-mode").value = tpl.mode;
+  }
+  onModeChange();
   $("kb-text").value = tpl.kb_text || "";
   $("template-name").value = name;
   // 独立裁判
@@ -414,6 +436,7 @@ async function startDiscussion() {
     judge,
     topic: $("topic").value.trim(),
     max_rounds: parseInt($("max-rounds").value, 10) || 8,
+    mode: $("discussion-mode").value,
   };
   const cfg = await fetch("/api/configure", {
     method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(payload),
@@ -423,6 +446,7 @@ async function startDiscussion() {
   state.agents = cfg.agents;
   state.tasks = [];
   state.ctx = {};
+  state.mode = cfg.mode || payload.mode || "debate";
   renderSeats(state.agents);
   $("transcript").innerHTML = "";
   $("conclusion-panel").classList.add("hidden");  // 新讨论开始时隐藏旧结论
@@ -454,6 +478,7 @@ async function startDiscussion() {
       session_id: getSessionId(),
       topic: payload.topic,
       max_rounds: payload.max_rounds,
+      mode: payload.mode,
     }),
   }).then(r => r.json());
   if (!st.ok) {
@@ -482,7 +507,7 @@ function renderSeats(agents) {
       <div class="avatar ${avatarClass(a.stance, i)}">${initialOf(a.name)}</div>
       <div class="sname">${a.name}</div>
       <div class="srole">${a.role || "机器人"}</div>
-      <div class="srole stance">${STANCE_TEXT[a.stance] || a.stance || ""}</div>
+      ${state.mode === "collaboration" ? "" : `<div class="srole stance">${STANCE_TEXT[a.stance] || a.stance || ""}</div>`}
       ${a.is_main ? '<div class="badge">主</div>' : ''}
     `;
     table.appendChild(seat);
@@ -663,10 +688,18 @@ function handleEvent(ev) {
       break;
     }
     case "task_assigned": {
-      addMsg(ev.from, `分派任务给 ${ev.to}：\n内容：${ev.content}\n期望：${ev.expected}\n变量：${ev.var}`, "task", null, ev.from);
-      state.tasks.push({ id: Date.now() + Math.random(), to: ev.to, content: ev.content, expected: ev.expected, var: ev.var, completed: false, value: "" });
+      const toTxt = ev.to ? ev.to : "任务池（待认领）";
+      addMsg(ev.from, `分派任务给 ${toTxt}：\n内容：${ev.content}\n期望：${ev.expected}\n变量：${ev.var}`, "task", null, ev.from);
+      state.tasks.push({ id: Date.now() + Math.random(), to: ev.to || "任务池", content: ev.content, expected: ev.expected, var: ev.var, completed: false, value: "" });
       state.ctx[ev.var] = { by: ev.from, value: "" };
       renderTasks(); renderCtx(); highlightSeat(ev.from);
+      break;
+    }
+    case "task_claimed": {
+      addMsg(ev.from, `已从任务池认领任务（变量 ${ev.var}），完成后将回报结果。`, "task", null, ev.from + " 认领");
+      const t = state.tasks.find(t => t.var === ev.var);
+      if (t) { t.to = ev.from; }
+      renderTasks(); highlightSeat(ev.from);
       break;
     }
     case "task_result": {

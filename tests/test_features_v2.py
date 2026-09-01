@@ -524,5 +524,202 @@ class TaskDebateSeparationTest(unittest.IsolatedAsyncioTestCase):
         orchestrator.event_bus.unsubscribe(q)
 
 
+class CollaborationModeTest(unittest.IsolatedAsyncioTestCase):
+    """双模式之合作模式（collaboration）：
+    - configure 模式透传、席位立场弱化（NEUTRAL）、无裁判；
+    - 任务池（recipient 留空 → pending）+ 主动认领（claim_task 独占）；
+    - 认领 + 同轮回报流程、任务状态机迁移；
+    - 所有任务 completed 即收尾（跳过裁判裁决）；
+    - _agent_turn 工具注入：合作子 Agent 见 claim_task/report_result，
+      主 Agent 见 delegate_task。
+    """
+    # 不带显式立场：验证合作模式自动弱化为 NEUTRAL
+    NO_STANCE_CFG = [
+        {"name": "统筹", "role": "统筹", "personality": "", "provider": "default"},
+        {"name": "助手A", "role": "执行", "personality": "", "provider": "default"},
+        {"name": "助手B", "role": "执行", "personality": "", "provider": "default"},
+    ]
+
+    async def _configure(self, cfgs=None, max_rounds=3, topic="合作模式测试"):
+        orchestrator.configure(cfgs or self.NO_STANCE_CFG,
+                               topic=topic, max_rounds=max_rounds,
+                               mode="collaboration")
+        q = orchestrator.event_bus.subscribe()
+        while True:
+            try:
+                await asyncio.wait_for(q.get(), timeout=0.1)
+            except asyncio.TimeoutError:
+                break
+        return q
+
+    @staticmethod
+    def _collab(name):
+        for c in orchestrator.collaborators:
+            if c.name == name:
+                return c
+        raise AssertionError(f"无 {name} 协作 Agent")
+
+    async def test_configure_sets_collaboration_mode(self):
+        await self._configure()
+        orch = orchestrator
+        self.assertEqual(orch.mode, "collaboration")
+        # 主位 HOST，其余席位一律 NEUTRAL（合作模式弱化立场）
+        self.assertEqual(orch.main.stance, "HOST")
+        for c in orch.collaborators:
+            self.assertEqual(c.stance, "NEUTRAL")
+        # 合作模式无辩论对抗，不构建独立裁判
+        self.assertIsNone(orch.judge)
+        # 状态同步透传模式
+        self.assertEqual(orch._status_sync()["mode"], "collaboration")
+
+    async def test_create_task_pending_without_recipient(self):
+        await self._configure([HOST_CFG, PRO_CFG, CON_CFG])
+        orch = orchestrator
+        orch.tasks.clear()
+        orch.shared_context.clear()
+        orch.task_counter = 0
+        # recipient 留空 → 放入任务池，状态 pending
+        t = orch._create_task({
+            "content": "调研就业数据", "expected_outcome": "给出关键数字",
+            "var_name": "research"})
+        self.assertEqual(t["status"], "pending")
+        self.assertEqual(t["recipient"], "")
+        self.assertFalse(t["completed"])
+        self.assertIn("research", orch.shared_context)
+        # 指定 recipient → 直接分派，状态 claimed
+        t2 = orch._create_task({
+            "recipient": PRO_CFG["name"], "content": "撰写报告",
+            "expected_outcome": "输出段落", "var_name": "report"})
+        self.assertEqual(t2["status"], "claimed")
+        self.assertEqual(t2["recipient"], PRO_CFG["name"])
+
+    async def test_claim_is_exclusive(self):
+        await self._configure([HOST_CFG, PRO_CFG, CON_CFG])
+        orch = orchestrator
+        orch.tasks.clear()
+        orch.task_counter = 0
+        t = orch._create_task({
+            "content": "独占任务", "expected_outcome": "结果",
+            "var_name": "v1"})
+        pro = self._collab(PRO_CFG["name"])
+        con = self._collab(CON_CFG["name"])
+        orch._apply_claim(pro, {"task_id": t["id"]})
+        self.assertEqual(t["status"], "claimed")
+        self.assertEqual(t["recipient"], pro.name)
+        self.assertEqual(t["rounds_waiting"], 0)
+        # 重复认领（他人尝试）被忽略：认领者独占
+        orch._apply_claim(con, {"task_id": t["id"]})
+        self.assertEqual(t["status"], "claimed")
+        self.assertEqual(t["recipient"], pro.name)
+        # 认领不存在的任务被忽略（不抛异常）
+        orch._apply_claim(con, {"task_id": 9999})
+
+    async def test_claim_and_report_in_same_turn(self):
+        await self._configure([HOST_CFG, PRO_CFG, CON_CFG])
+        orch = orchestrator
+        orch.tasks.clear()
+        orch.shared_context.clear()
+        orch.task_counter = 0
+        t = orch._create_task({
+            "content": "调研", "expected_outcome": "数据", "var_name": "research"})
+        pro = self._collab(PRO_CFG["name"])
+        orch.round = 1
+        orig = orch._agent_turn
+
+        async def fake_agent_turn(agent, user_msg, mode, allow_delegate=True, stream=False):
+            self.assertEqual(mode, "collab")  # 合作子 Agent 回合走 collab 模式
+            return {"content": "我来认领并完成", "delegate": [],
+                    "claim": [{"task_id": t["id"]}],
+                    "report": {"var_name": "research", "var_value": "8.0%",
+                               "completed": True, "message": "已查得数据"},
+                    "streamed": True, "token_cost": 0}
+
+        orch._agent_turn = fake_agent_turn
+        try:
+            await orch._collab_work_turn(pro)
+        finally:
+            orch._agent_turn = orig
+        # 同轮认领 + 回报：任务 completed、认领者落库、共享上下文回填
+        self.assertTrue(t["completed"])
+        self.assertEqual(t["status"], "completed")
+        self.assertEqual(t["recipient"], pro.name)
+        self.assertEqual(orch.shared_context["research"]["value"], "8.0%")
+        self.assertEqual(orch.shared_context["research"]["by"], orch.main.name)
+
+    async def test_all_tasks_complete_ends_loop_skip_judge(self):
+        await self._configure([HOST_CFG, PRO_CFG], max_rounds=5, topic="全完成收尾")
+        orch = orchestrator
+        orch.tasks.clear()
+        orch.task_counter = 0
+        orig = orch._agent_turn
+
+        async def fake_agent_turn(agent, user_msg, mode, allow_delegate=True, stream=False):
+            if agent.is_main and allow_delegate:
+                # 主 Agent 第 1 轮拆解整体任务入池
+                return {"content": "我来拆解任务", "delegate": [
+                    {"content": "调研A", "expected_outcome": "结果A", "var_name": "a"}],
+                    "report": None, "claim": [], "streamed": True, "token_cost": 0}
+            if agent.is_main and not allow_delegate:
+                # 最终汇总轮（allow_delegate=False）
+                return {"content":
+                        "## 核心结论\n\n整体任务完成\n\n"
+                        "## 子任务与成果\n\n- 任务#1：调研A ✅\n\n"
+                        "## 遗留问题与后续建议\n\n无\n",
+                        "delegate": [], "report": None, "claim": [],
+                        "streamed": True, "token_cost": 0}
+            # 子 Agent：认领并同轮回报
+            return {"content": "完成调研A", "delegate": [],
+                    "claim": [{"task_id": orch.tasks[0]["id"]}] if orch.tasks else [],
+                    "report": {"var_name": "a", "var_value": "结果A",
+                               "completed": True, "message": "完成"},
+                    "streamed": True, "token_cost": 0}
+
+        orch._agent_turn = fake_agent_turn
+        try:
+            await orch.run_discussion()
+        finally:
+            orch._agent_turn = orig
+        # 第 1 轮任务全完成即提前收尾：round 不再推进
+        self.assertEqual(orch.round, 1)
+        self.assertEqual(orch.status, "done")
+        self.assertEqual(orch.phase, "finished")
+        self.assertTrue(orch.tasks and all(t["completed"] for t in orch.tasks))
+        # 合作模式无裁判裁决
+        self.assertIsNone(orch.judgment)
+        # 三段式结论已产出（无裁判裁决：judge_ruling 空串）
+        self.assertIsNotNone(orch.conclusion)
+        self.assertEqual(orch.conclusion["judge_ruling"], "")
+        self.assertIn("整体任务完成", orch.conclusion["core"])
+
+    async def test_tool_injection_per_mode(self):
+        await self._configure([HOST_CFG, PRO_CFG, CON_CFG])
+        orch = orchestrator
+        seen_tools = []
+
+        async def fake_consume(messages, model_config, tools=None, on_delta=None,
+                               on_tool_start=None, **kwargs):
+            seen_tools[:] = [t.get("function", {}).get("name")
+                              for t in (tools or []) if t.get("function", {}).get("name")]
+            return {"content": "无工具调用", "tool_calls": [], "assistant_message": None,
+                    "usage": {"total_tokens": 1}, "tool_starts": []}
+
+        orig = orch._consume_stream
+        orch._consume_stream = fake_consume
+        try:
+            # 合作子 Agent（mode=collab）：认领 + 回报工具
+            pro = self._collab(PRO_CFG["name"])
+            await orch._agent_turn(pro, "请处理任务", mode="collab", stream=True)
+            self.assertIn("claim_task", seen_tools)
+            self.assertIn("report_result", seen_tools)
+            self.assertNotIn("delegate_task", seen_tools)
+            # 主 Agent（mode=collaboration，允许分派）：delegate_task
+            await orch._agent_turn(orch.main, "请拆解任务", mode="collaboration", stream=True)
+            self.assertIn("delegate_task", seen_tools)
+            self.assertNotIn("claim_task", seen_tools)
+            self.assertNotIn("report_result", seen_tools)
+        finally:
+            orch._consume_stream = orig
+
+
 if __name__ == "__main__":
     unittest.main()

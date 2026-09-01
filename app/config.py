@@ -174,6 +174,11 @@ class Settings:
     FAIR_JUDGE_TEMPERATURE = _float("FAIR_JUDGE_TEMPERATURE", 0.3)  # 辅助 LLM（裁判/摘要）统一温度
     FAIR_JUDGE_TOP_P = _float("FAIR_JUDGE_TOP_P", 1.0)              # 辅助 LLM 统一 top_p
 
+    # ---- 讨论模式（双模式） ----
+    # 服务端兜底模式：debate（辩论）/ collaboration（合作）；
+    # 前端 /api/configure 可显式覆盖。
+    DISCUSSION_MODE = _get("DISCUSSION_MODE", "debate")
+
 
 settings = Settings()
 

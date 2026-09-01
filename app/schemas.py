@@ -35,6 +35,8 @@ class ConfigureRequest(BaseModel):
     topic: str = ""
     max_rounds: int = 8
     judge: dict | None = None
+    # 讨论模式：debate（辩论，默认）/ collaboration（合作）
+    mode: str = "debate"
 
 
 class StartRequest(BaseModel):
@@ -42,6 +44,8 @@ class StartRequest(BaseModel):
     session_id: str | None = None
     topic: str = ""
     max_rounds: int | None = None
+    # 可覆盖 configure 时的模式；缺省（None）沿用 configure 值
+    mode: str | None = None
 
 
 class SessionRequest(BaseModel):

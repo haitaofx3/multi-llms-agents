@@ -45,6 +45,13 @@
         <label>最大讨论轮次</label>
         <input type="number" id="max-rounds" min="1" max="30" value="8" />
       </div>
+      <div class="row">
+        <label>讨论模式</label>
+        <select id="discussion-mode">
+          <option value="debate">辩论模式（立场对抗，裁判裁决）</option>
+          <option value="collaboration">合作模式（任务池认领，无裁判）</option>
+        </select>
+      </div>
 
       <div class="config-sub">
         <div class="config-sub-title">共享知识库</div>
@@ -63,7 +70,7 @@
         </div>
       </div>
 
-      <div class="config-sub">
+      <div class="config-sub" id="judge-config-block">
         <div class="config-sub-title">独立裁判设置（可选）</div>
         <div class="row">
           <label>裁判名称</label>

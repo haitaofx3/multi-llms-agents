@@ -28,22 +28,40 @@ from app.llm import chat, chat_stream, summarize_text
 from app.protocol import Judgment, new_trace_id, new_uuid, now_ms
 from app.rag import rag_service
 
-# ---- 专用工具 schema（任务分派 / 回报） ----
+# ---- 专用工具 schema（任务分派 / 认领 / 回报） ----
 DELEGATE_SCHEMA = {
     "type": "function",
     "function": {
         "name": "delegate_task",
-        "description": "把一项任务分派给某个协作 Agent。明确说明任务内容与期望效果，"
-                       "并提供用于接收结果的变量名(var_name)。",
+        "description": "把一项任务分派给某个协作 Agent（recipient 指定接收者），"
+                       "或放入共享任务池待协作 Agent 主动认领（recipient 留空）。"
+                       "明确说明任务内容与期望效果，并提供用于接收结果的变量名(var_name)。",
         "parameters": {
             "type": "object",
             "properties": {
-                "recipient": {"type": "string", "description": "接收任务的协作 Agent 名称"},
+                "recipient": {"type": "string",
+                              "description": "接收任务的协作 Agent 名称；留空 = 放入任务池待认领"},
                 "content": {"type": "string", "description": "任务内容说明"},
                 "expected_outcome": {"type": "string", "description": "期望达到的效果"},
                 "var_name": {"type": "string", "description": "用于接收结果的变量名(任务接收方变量)"},
             },
-            "required": ["recipient", "content", "expected_outcome", "var_name"],
+            "required": ["content", "expected_outcome", "var_name"],
+        },
+    },
+}
+
+CLAIM_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "claim_task",
+        "description": "从共享任务池认领一个未分配任务（task_id 为任务列表中的数字编号）；"
+                       "认领后由你独占负责，后续用 report_result 回报完成结果。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "task_id": {"type": "integer", "description": "任务编号（列表中的数字 id）"},
+            },
+            "required": ["task_id"],
         },
     },
 }
@@ -205,6 +223,7 @@ class Orchestrator:
         self.topic = ""
         self.status = "idle"          # idle/running/paused/done/stopped（UI 状态）
         self.phase = "idle"           # idle/preparing/debating/judging/finished（架构状态机）
+        self.mode = "debate"          # debate（辩论）/ collaboration（合作）
         self.trace_id = ""
         self.event_bus = EventBus()
         self.transcript = []          # 发言记录（用于导出 markdown）
@@ -235,9 +254,12 @@ class Orchestrator:
 
     # ---------------- 配置 ----------------
     def configure(self, agent_configs: list, topic: str = "", max_rounds: int = 8,
-                  judge_config: dict | None = None):
+                  judge_config: dict | None = None, mode: str = "debate"):
         if self.status == "running":
             raise ValueError("讨论进行中，请先结束或等待后再重新配置")
+        # 双模式：显式 mode 优先；未指定（含 None）回退 .env 的 DISCUSSION_MODE（默认 debate）
+        mode = mode or settings.DISCUSSION_MODE
+        self.mode = mode if mode in ("debate", "collaboration") else "debate"
         self.agents = []
         self.main = None
         self.judge = None
@@ -277,10 +299,14 @@ class Orchestrator:
                 cfg.get("api_key", ""),
                 cfg.get("model_id", ""),
             )
-            # 立场：显式指定优先；否则主位=主持人，其余按 PRO/CON 交替
+            # 立场：显式指定优先；否则主位=主持人，其余按 PRO/CON 交替（辩论模式）
+            # 合作模式弱化立场：主位 HOST、其余一律 NEUTRAL，不参与对抗逻辑
             stance = (cfg.get("stance", "") or "").upper()
             if not stance:
-                stance = "HOST" if i == 0 else ("PRO" if i % 2 == 1 else "CON")
+                if self.mode == "collaboration":
+                    stance = "HOST" if i == 0 else "NEUTRAL"
+                else:
+                    stance = "HOST" if i == 0 else ("PRO" if i % 2 == 1 else "CON")
             agent = Agent(
                 agent_id=cfg.get("agent_id", f"agent_{i+1}"),
                 name=cfg.get("name", f"Agent_{i+1}"),
@@ -296,11 +322,12 @@ class Orchestrator:
                 self.main = agent
             else:
                 self.collaborators.append(agent)
-        # 独立裁判 Agent（不占席位、不参与辩论，仅裁决阶段调用）
-        self.judge = self._build_judge(judge_config or {})
+        # 独立裁判 Agent（不占席位、不参与辩论，仅裁决阶段调用）；
+        # 合作模式无辩论对抗，不构建裁判
+        self.judge = None if self.mode == "collaboration" else self._build_judge(judge_config or {})
         self.status = "idle"
         self._persist_meta()
-        self._log(f"配置完成，席位 {len(self.agents)} 个"
+        self._log(f"配置完成，席位 {len(self.agents)} 个，模式：{self.mode}"
                   + (f"，独立裁判：{self.judge.name}" if self.judge else "，裁判回退使用主 Agent 模型"),
                   event="configure", level="info")
 
@@ -399,8 +426,16 @@ class Orchestrator:
             return "（暂无任务）"
         lines = []
         for t in self.tasks:
-            state = "✅已完成" if t["completed"] else "⏳进行中"
-            lines.append(f"- [{state}] 任务#{t['id']} → {t['recipient']} | "
+            if t.get("status") == "pending":
+                state = "🔵待认领"
+                recipient = "任务池"
+            elif t["completed"]:
+                state = "✅已完成"
+                recipient = t["recipient"] or "任务池"
+            else:
+                state = "⏳进行中"
+                recipient = t["recipient"] or "任务池"
+            lines.append(f"- [{state}] 任务#{t['id']} → {recipient} | "
                          f"变量:{t['var_name']}\n  内容：{t['content']}\n  期望：{t['expected_outcome']}")
         return "\n".join(lines)
 
@@ -521,12 +556,17 @@ class Orchestrator:
         tools = agent.mcp.schemas()
         if agent.is_main and allow_delegate:
             tools = [*tools, DELEGATE_SCHEMA]
-        elif (not agent.is_main) and mode == "task":
+        elif (not agent.is_main) and mode in ("task", "collab"):
+            # 双模式：task（辩论附属任务）/ collab（合作模式子任务）都注入回报工具；
+            # 合作模式额外注入认领工具（主动从任务池领取任务）
             tools = [*tools, REPORT_SCHEMA]
+            if mode == "collab":
+                tools = [*tools, CLAIM_SCHEMA]
 
         content = ""
         delegate = []
         report = None
+        claim = []
         token_cost = 0
         emitting = False  # 是否已开始向 UI 流式推送
         result = None
@@ -647,6 +687,10 @@ class Orchestrator:
                     report = tc["arguments"]
                     special = True
                     await _emit_tool_end(tc["name"], "回报任务结果")
+                elif (not agent.is_main) and tc["name"] == "claim_task":
+                    claim.append(tc["arguments"])
+                    special = True
+                    await _emit_tool_end(tc["name"], "认领任务")
                 else:
                     tool_result = await asyncio.to_thread(
                         agent.mcp.call, tc["name"], tc["arguments"])
@@ -664,8 +708,9 @@ class Orchestrator:
         # 公平性 L1 兜底：discussion 模式下即使 LLM 输出超长也按公平性字符上限截断。
         # PRO/CON 用相对上限（对手近 N 轮有效输出均值 × 比例，与硬上限取 min）；
         # HOST/NEUTRAL 无对手参照，用硬性字符上限兜底（同样抑制整体消耗）。
-        if mode == "discussion" and content:
-            if agent.stance in ("PRO", "CON"):
+        # 双模式：合作模式（collaboration/collab）无 PRO/CON 对称性，一律用硬上限。
+        if content and (mode == "discussion" or mode in ("collaboration", "collab")):
+            if mode == "discussion" and agent.stance in ("PRO", "CON"):
                 ceiling = self.governor.ceiling_for(
                     agent.stance, self.round,
                     self.governor.recent_opponent_chars(agent.stance))
@@ -709,7 +754,7 @@ class Orchestrator:
         if content:
             agent.append_history("assistant", content, round_no=self.round)
         return {"content": content, "delegate": delegate, "report": report,
-                "streamed": emitting, "token_cost": token_cost}
+                "claim": claim, "streamed": emitting, "token_cost": token_cost}
 
     # ---------------- 主 Agent 指令 ----------------
     def _main_directive(self, round, is_last, had_any_task, pending_exists):
@@ -1114,103 +1159,33 @@ class Orchestrator:
         })
         await self.event_bus.publish(self._status_sync())
 
-        had_any_task = False
         self.last_main_message = self.topic
 
         try:
-            while self.round < self.max_rounds:
-                # 暂停 / 结束 控制
-                await self._pause_event.wait()
-                if self.status == "stopped":
-                    break
+            # 双模式：debate（辩论主循环）/ collaboration（合作主循环）
+            if self.mode == "collaboration":
+                await self._run_collab_loop()
+            else:
+                await self._run_debate_loop()
 
-                self.round += 1
-                self.phase = "debating"
-                self._opponent_prep.clear()  # 每轮重新准备对手上轮发言上下文
-                is_last = (self.round >= self.max_rounds)
-                # 公平性治理：每轮发布各层状态（替代旧的预算规划）
-                self._log_fairness_report(f"[第{self.round}轮] ")
-                await self.event_bus.publish({
-                    "type": "round", "round": self.round, "max": self.max_rounds,
-                })
-                await self.event_bus.publish(self._status_sync())
-
-                pending_exists = any(not t["completed"] for t in self.tasks)
-                had_any_task = had_any_task or len(self.tasks) > 0
-
-                # 1) 主持人回合（第1轮分派任务，之后轮次抛疑追问）
-                directive = self._main_directive(self.round, is_last, had_any_task, pending_exists)
-                main_out = await self._agent_turn(self.main, directive, mode="discussion", stream=True)
-                if main_out["content"]:
-                    if not main_out["streamed"]:
-                        await self._emit_speech(self.main, main_out["content"])
-                    self.last_main_message = main_out["content"]
-                for d in main_out["delegate"]:
-                    task = self._create_task(d)
-                    if task is None:
-                        continue
-                    await self.event_bus.publish({
-                        "type": "task_assigned",
-                        "from": self.main.name,
-                        "to": task["recipient"],
-                        "content": task["content"],
-                        "expected": task["expected_outcome"],
-                        "var": task["var_name"],
-                        "task_id": task["task_id"],
-                        "timestamp": task["timestamp"],
-                    })
-                self._record_memory(self.main, main_out["content"])
-                self._record_argument(self.main.name, main_out["content"], self.round)
-
-                # 2) 协作 Agent 回合（§5.8 拆分：任务回合 → 辩论回合，两者完全分离）
-                # 2a) 任务回合：处理各辩手待办任务；任务输出不回填 round_arguments，
-                #     不污染收敛检测 / RAG 核查 / 对手上下文
-                if any(not t["completed"] for t in self.tasks):
-                    for c in self.collaborators:
-                        await self._task_turn(c)
-                # 2b) 辩论回合（严格交替：正方/反方轮流发言，其余立场排后）
-                if self.round == 1:
-                    # 第 1 轮并行立论（架构文档 §4.2 / §6.2）
-                    await asyncio.gather(
-                        *[self._debate_turn(c) for c in self.collaborators],
-                        return_exceptions=True,
-                    )
-                    # 确定第 2 轮首位发言人的"上一发言人"（交替顺序的末位）
-                    order = self._debate_order()
-                    if order:
-                        self.last_debate_speaker = order[-1].name
-                else:
-                    # 第 2 轮起严格交替串行发言：正/反方轮流，其余立场最后
-                    for c in self._debate_order():
-                        await self._debate_turn(c)
-
-                # 3) RAG 事实核查（注入下一轮上下文）
-                await self._rag_check_round()
-
-                # 4) 记忆转化与遗忘
-                await self._memory_housekeeping()
-
-                # 5) 收敛检测（架构文档 §4.3/4.4）
-                if await self._check_convergence():
-                    self._log(f"收敛检测触发：连续{self.convergence_streak}轮观点高度相似"
-                              "且无新证据，提前进入裁决",
-                              level="info", event="convergence.trigger")
-                    break
-
-                # 6) 达到最大轮次则结束（公平性治理下无预算熔断；轮次对称性由 L4 保证）
-                if is_last or self.round >= self.max_rounds:
-                    break
-
-                await self.event_bus.publish(self._status_sync())
-                await asyncio.sleep(0)
-
-            # ---- Judging：终止后单次调用裁判（架构文档 §4.1/§6.2） ----
+            # ---- Judging：终止后单次调用裁判（架构文档 §4.1/§6.2）。
+            #      stopped 分支两模式共享；合作模式无裁判，走 _collab_final_summary 直接收尾 ----
             if self.status == "stopped":
                 # 手动结束（end()）：跳过裁判裁决与主持人汇总，直接收尾，
                 # 避免旧 run 任务在重新配置/新讨论启动后继续污染编排器状态
                 self.phase = "idle"
                 await self.event_bus.publish({"type": "status", "status": "stopped", "phase": self.phase})
                 await self.event_bus.publish(self._status_sync())
+            elif self.mode == "collaboration":
+                # ---- Finished（合作模式）：主 Agent 三段式汇总，无裁判裁决 ----
+                self.phase = "finished"
+                summary = await self._collab_final_summary()
+                await self._emit_summary(summary)
+                self.status = "done"
+                await self.event_bus.publish({"type": "status", "status": "done", "phase": self.phase})
+                await self.event_bus.publish(self._status_sync())
+                self._persist_meta()
+                self._notify_done()
             else:
                 self.phase = "judging"
                 await self.event_bus.publish({"type": "status", "status": "running", "phase": self.phase})
@@ -1245,6 +1220,341 @@ class Orchestrator:
             self.phase = "idle"  # 异常熔断回到 Idle（架构文档 §4.1）
             self._persist_meta()
             await self.event_bus.publish({"type": "status", "status": "stopped", "phase": self.phase})
+
+    async def _run_debate_loop(self):
+        """辩论模式主循环（原 run_discussion while 循环体，行为逐字节不变）。"""
+        had_any_task = False
+        while self.round < self.max_rounds:
+            # 暂停 / 结束 控制
+            await self._pause_event.wait()
+            if self.status == "stopped":
+                break
+
+            self.round += 1
+            self.phase = "debating"
+            self._opponent_prep.clear()  # 每轮重新准备对手上轮发言上下文
+            is_last = (self.round >= self.max_rounds)
+            # 公平性治理：每轮发布各层状态（替代旧的预算规划）
+            self._log_fairness_report(f"[第{self.round}轮] ")
+            await self.event_bus.publish({
+                "type": "round", "round": self.round, "max": self.max_rounds,
+            })
+            await self.event_bus.publish(self._status_sync())
+
+            pending_exists = any(not t["completed"] for t in self.tasks)
+            had_any_task = had_any_task or len(self.tasks) > 0
+
+            # 1) 主持人回合（第1轮分派任务，之后轮次抛疑追问）
+            directive = self._main_directive(self.round, is_last, had_any_task, pending_exists)
+            main_out = await self._agent_turn(self.main, directive, mode="discussion", stream=True)
+            if main_out["content"]:
+                if not main_out["streamed"]:
+                    await self._emit_speech(self.main, main_out["content"])
+                self.last_main_message = main_out["content"]
+            for d in main_out["delegate"]:
+                task = self._create_task(d)
+                if task is None:
+                    continue
+                await self.event_bus.publish({
+                    "type": "task_assigned",
+                    "from": self.main.name,
+                    "to": task["recipient"],
+                    "content": task["content"],
+                    "expected": task["expected_outcome"],
+                    "var": task["var_name"],
+                    "task_id": task["task_id"],
+                    "timestamp": task["timestamp"],
+                })
+            self._record_memory(self.main, main_out["content"])
+            self._record_argument(self.main.name, main_out["content"], self.round)
+
+            # 2) 协作 Agent 回合（§5.8 拆分：任务回合 → 辩论回合，两者完全分离）
+            # 2a) 任务回合：处理各辩手待办任务；任务输出不回填 round_arguments，
+            #     不污染收敛检测 / RAG 核查 / 对手上下文
+            if any(not t["completed"] for t in self.tasks):
+                for c in self.collaborators:
+                    await self._task_turn(c)
+            # 2b) 辩论回合（严格交替：正方/反方轮流发言，其余立场排后）
+            if self.round == 1:
+                # 第 1 轮并行立论（架构文档 §4.2 / §6.2）
+                await asyncio.gather(
+                    *[self._debate_turn(c) for c in self.collaborators],
+                    return_exceptions=True,
+                )
+                # 确定第 2 轮首位发言人的"上一发言人"（交替顺序的末位）
+                order = self._debate_order()
+                if order:
+                    self.last_debate_speaker = order[-1].name
+            else:
+                # 第 2 轮起严格交替串行发言：正/反方轮流，其余立场最后
+                for c in self._debate_order():
+                    await self._debate_turn(c)
+
+            # 3) RAG 事实核查（注入下一轮上下文）
+            await self._rag_check_round()
+
+            # 4) 记忆转化与遗忘
+            await self._memory_housekeeping()
+
+            # 5) 收敛检测（架构文档 §4.3/4.4）
+            if await self._check_convergence():
+                self._log(f"收敛检测触发：连续{self.convergence_streak}轮观点高度相似"
+                          "且无新证据，提前进入裁决",
+                          level="info", event="convergence.trigger")
+                break
+
+            # 6) 达到最大轮次则结束（公平性治理下无预算熔断；轮次对称性由 L4 保证）
+            if is_last or self.round >= self.max_rounds:
+                break
+
+            await self.event_bus.publish(self._status_sync())
+            await asyncio.sleep(0)
+
+    async def _run_collab_loop(self):
+        """合作模式主循环：主 Agent 拆解任务入池 → 子 Agent 认领并完成。
+
+        结束判定：所有任务 completed 即收尾（防空任务误判：self.tasks and all(...)），
+        max_rounds 兜底。无裁判、无收敛检测、无立场对抗。
+        """
+        while self.round < self.max_rounds:
+            # 暂停 / 结束 控制
+            await self._pause_event.wait()
+            if self.status == "stopped":
+                break
+
+            self.round += 1
+            self.phase = "collaborating"
+            is_last = (self.round >= self.max_rounds)
+            await self.event_bus.publish({
+                "type": "round", "round": self.round, "max": self.max_rounds,
+            })
+            await self.event_bus.publish(self._status_sync())
+
+            # 1) 主 Agent 回合：拆解/补充子任务（delegate_task recipient 留空 → 任务池），或统筹协调
+            directive = self._collab_main_directive(self.round, is_last)
+            main_out = await self._agent_turn(self.main, directive, mode="collaboration",
+                                              stream=True)
+            if main_out["content"]:
+                if not main_out["streamed"]:
+                    await self._emit_speech(self.main, main_out["content"])
+                self.last_main_message = main_out["content"]
+            for d in main_out["delegate"]:
+                task = self._create_task(d)
+                if task is None:
+                    continue
+                await self.event_bus.publish({
+                    "type": "task_assigned",
+                    "from": self.main.name,
+                    "to": task["recipient"],  # 空 = 任务池（待认领）
+                    "content": task["content"],
+                    "expected": task["expected_outcome"],
+                    "var": task["var_name"],
+                    "task_id": task["task_id"],
+                    "timestamp": task["timestamp"],
+                })
+            self._record_memory(self.main, main_out["content"])
+
+            # 2) 子 Agent 回合：认领（claim_task）+ 完成回报（report_result）
+            for c in self.collaborators:
+                await self._collab_work_turn(c)
+
+            # 3) 结束判定：所有任务 completed 即收尾（防空任务误判）；max_rounds 兜底
+            if self.tasks and all(t["completed"] for t in self.tasks):
+                self._log("合作模式：所有任务已完成，提前收尾",
+                          level="info", event="collab.all_done")
+                break
+            if is_last or self.round >= self.max_rounds:
+                break
+
+            await self.event_bus.publish(self._status_sync())
+            await asyncio.sleep(0)
+
+    # ---------------- 合作模式：主 Agent 指令 / 子 Agent 回合 ----------------
+    def _collab_main_directive(self, round, is_last) -> str:
+        """合作模式主 Agent 指令：第 1 轮拆解整体任务入池，后续轮次统筹协调。"""
+        base = f"【整体任务】{self.topic}\n【轮次】第 {round}/{self.max_rounds} 轮（合作进行中）\n"
+        if round == 1:
+            base += ("这是合作第 1 轮。请作为主 Agent 拆解整体任务："
+                     "用 delegate_task 把子任务放入共享任务池（recipient 留空），"
+                     "明确任务内容、期望效果与接收结果的变量名(var_name)；"
+                     "你也可以先陈述整体思路与分工计划。")
+        else:
+            base += ("请作为主 Agent 统筹协调：审视任务池与各协作 Agent 的完成情况，"
+                     "用 delegate_task 补充或细化子任务（recipient 留空放入任务池），"
+                     "或对整体进展给出指引。若所有子任务均已完成，请直接宣布整体任务完成。")
+        return base
+
+    def _collab_work_prompt(self, collab: Agent, claimed: list, claimable: list) -> str:
+        """合作模式子 Agent 回合 prompt：并列「待办（需 report）」与「可认领（可 claim）」。"""
+        parts = [f"【当前轮次】第 {self.round}/{self.max_rounds} 轮（合作进行中）"]
+        if claimed:
+            todo = "\n".join(
+                f"- 任务#{t['id']}（变量 {t['var_name']}）：{t['content']}"
+                f"（期望：{t['expected_outcome']}）" for t in claimed)
+            parts.append(f"【你的待办任务（完成后必须用 report_result 回报）】\n{todo}")
+        else:
+            parts.append("【你的待办任务】当前没有已认领的任务。")
+        if claimable:
+            can = "\n".join(
+                f"- 任务#{t['id']}（变量 {t['var_name']}）：{t['content']}"
+                f"（期望：{t['expected_outcome']}）" for t in claimable)
+            parts.append(f"【任务池中可认领的任务（可用 claim_task 领取，认领后独占负责）】\n{can}")
+        else:
+            parts.append("【任务池】当前没有待认领的任务。")
+        parts.append("说明：优先完成你的待办任务并通过 report_result 回报；"
+                     "若任务池有可认领任务且你有余力，可先 claim_task 认领再完成回报。"
+                     "无需额外发言时保持简洁，直接使用工具即可。")
+        return "\n\n".join(parts)
+
+    async def _collab_work_turn(self, collab: Agent):
+        """合作模式子 Agent 回合：一轮单次 LLM 调用。
+
+        先解析 claim（认领），再解析 report（回报），支持同轮认领后立即回报；
+        未回报的任务累积 rounds_waiting，>=3 轮强制完成（超时兜底）。
+        """
+        claimed = [t for t in self.tasks
+                   if t.get("status") == "claimed" and t["recipient"] == collab.name
+                   and not t["completed"]]
+        claimable = [t for t in self.tasks if t.get("status") == "pending"]
+        umsg = self._collab_work_prompt(collab, claimed, claimable)
+        out = await self._agent_turn(collab, umsg, mode="collab", stream=True)
+
+        # 1) 认领（可多个）
+        for args in out["claim"]:
+            self._apply_claim(collab, args)
+
+        # 2) 回报：认领后可能同轮立即回报，故此处重新刷新 claimed
+        reported = None
+        if out["report"]:
+            task = self._find_task_by_var(out["report"].get("var_name") or "")
+            if task is not None and not task["completed"]:
+                if task.get("status") == "claimed" and task["recipient"] == collab.name:
+                    self._apply_report(task, out["report"])
+                    reported = task
+                elif task.get("status") == "pending":
+                    # 同轮「认领 + 回报」：先补认领再落库
+                    self._apply_claim(collab, {"task_id": task["id"]})
+                    self._apply_report(task, out["report"])
+                    reported = task
+        if reported is not None:
+            msg = reported.get("result_message", "")
+            if msg and not out["streamed"]:
+                await self._emit_speech(collab, msg)
+            await self.event_bus.publish({
+                "type": "task_result",
+                "from": collab.name,
+                "var": reported["var_name"],
+                "value": reported.get("result_value", ""),
+                "completed": bool(reported["completed"]),
+                "message": msg,
+                "task_id": reported["task_id"],
+                "timestamp": now_ms(),
+                "token_cost": out.get("token_cost", 0),
+            })
+        else:
+            # 未回报：仅流式展示过程输出；认领任务超时强制完成
+            if out["content"] and not out["streamed"]:
+                await self._emit_speech(collab, out["content"])
+            for t in self.tasks:
+                if t.get("status") == "claimed" and t["recipient"] == collab.name \
+                        and not t["completed"]:
+                    t["rounds_waiting"] = t.get("rounds_waiting", 0) + 1
+                    if t["rounds_waiting"] >= 3:
+                        t["completed"] = True
+                        t["status"] = "completed"
+                        if t["var_name"] in self.shared_context:
+                            self.shared_context[t["var_name"]]["value"] = "（超时未完成）"
+                        self._log(f"[任务超时] 任务#{t['id']} 由 {collab.name} 认领但多轮未回报，"
+                                  "强制标记完成", level="warning", event="task.timeout")
+
+    def _apply_claim(self, collab: Agent, args: dict):
+        """把任务池中的 pending 任务标记为 claimed（认领者独占负责）。"""
+        tid = args.get("task_id")
+        task = next((t for t in self.tasks
+                     if t.get("status") == "pending"
+                     and (t["id"] == tid or t["task_id"] == str(tid))), None)
+        if task is None:
+            self._log(f"[任务认领忽略] {collab.name} 认领的任务 #{tid} 不存在或已被认领",
+                      level="warning", event="task.claim_ignore")
+            return
+        task["recipient"] = collab.name
+        task["status"] = "claimed"
+        task["rounds_waiting"] = 0
+        self._log(f"[任务认领] {collab.name} 认领了任务#{task['id']}（{task['var_name']}）",
+                  level="info", event="task.claim")
+        _spawn_task(self.event_bus.publish({
+            "type": "task_claimed",
+            "from": collab.name,
+            "task_id": task["task_id"],
+            "var": task["var_name"],
+            "timestamp": now_ms(),
+        }))
+
+    def _find_task_by_var(self, var_name: str) -> dict | None:
+        for t in self.tasks:
+            if t["var_name"] == var_name:
+                return t
+        return None
+
+    # ---------------- 合作模式收尾 ----------------
+    async def _collab_final_summary(self) -> str:
+        """合作模式收尾：主 Agent 汇总三段式报告（无裁判裁决）。"""
+        task_lines = []
+        for t in self.tasks:
+            if t["completed"]:
+                state = "✅"
+            elif t.get("status") == "pending":
+                state = "🔵"
+            else:
+                state = "⏳"
+            owner = t["recipient"] or "任务池"
+            result = t.get("result_value") or t.get("result_message") or "未完成"
+            task_lines.append(f"- 任务#{t['id']}（{owner} {state}）：{t['content']} → {result}")
+        if not task_lines:
+            task_lines.append("- （本次协作未产生子任务）")
+        directive = (f"【整体任务】{self.topic}\n"
+                     "所有子任务已结束或已达最大轮次。请作为主 Agent 输出最终协作总结报告，"
+                     "严格按下面的 Markdown 模板组织，三个一级标题（##）必须全部保留且顺序不变：\n\n"
+                     "## 核心结论\n\n[整体任务是否完成、核心成果]\n\n"
+                     "## 子任务与成果\n\n" + "\n".join(task_lines) + "\n\n"
+                     "## 遗留问题与后续建议\n\n[未完成项、风险与后续建议]\n\n"
+                     "请直接输出报告文本，不要再次分派任务。")
+        out = await self._agent_turn(self.main, directive, mode="collaboration",
+                                     allow_delegate=False)
+        content = out["content"] or ""
+        if not content.strip():
+            return await self._fallback_collab_summary()
+        return await self._normalize_collab_conclusion(content)
+
+    async def _fallback_collab_summary(self) -> str:
+        """合作模式确定性兜底汇总：不调用 LLM，直接按任务记录拼装三段式报告。"""
+        report = await self._normalize_collab_conclusion("")
+        return ("> 注：本报告由系统按任务记录确定性生成（未调用主 Agent LLM 汇总）。\n\n"
+                + report)
+
+    async def _normalize_collab_conclusion(self, text: str) -> str:
+        """把合作总结文本规范为三段式（缺段补兜底），并发布 conclusion 事件。"""
+        sections = self._split_sections(text)
+        core = sections.get("核心结论", "整体任务已完成，各子任务结果由协作 Agent 回报。")
+        tasks_section = sections.get("子任务与成果", "（主 Agent 未给出子任务明细）")
+        pending = sections.get("遗留问题与后续建议", "暂无遗留问题。")
+        self.conclusion = {
+            "core": core,
+            "positions": tasks_section,      # 复用字段：合作模式下为子任务与成果
+            "judge_ruling": "",
+            "pending": pending,
+        }
+        await self.event_bus.publish({
+            "type": "conclusion",
+            "core": core,
+            "positions": tasks_section,
+            "judge_ruling": "",
+            "winner": None,
+            "round": self.round,
+        })
+        return (f"## 核心结论\n\n{core}\n\n"
+                f"## 子任务与成果\n\n{tasks_section}\n\n"
+                f"## 遗留问题与后续建议\n\n{pending}\n")
 
     # ---------------- Judge 裁决（架构文档 §2.4） ----------------
     def _build_debate_history_text(self) -> str:
@@ -1459,7 +1769,8 @@ class Orchestrator:
     # ---------------- 任务与变量 ----------------
     def _create_task(self, d: dict):
         recipient = d.get("recipient", "")
-        # P15：校验接收方存在，避免 _apply_report 中 get_agent 返回 None
+        # P15：校验接收方存在，避免 _apply_report 中 get_agent 返回 None。
+        # 双模式：recipient 留空 = 放入共享任务池（合作模式），跳过校验，由协作 Agent 主动认领。
         if recipient and self.get_agent(recipient) is None:
             self._log(f"[任务分派忽略] 接收方 {recipient} 不存在于当前席位",
                       level="warning", event="task.ignore")
@@ -1471,6 +1782,8 @@ class Orchestrator:
             "id": tid,
             "task_id": new_uuid(),          # 协议字段：UUID 全局唯一
             "recipient": recipient,
+            # 双模式状态机：recipient 非空 = 已指定分派（claimed）；为空 = 待认领（pending）
+            "status": "claimed" if recipient else "pending",
             "content": d.get("content", ""),
             "expected_outcome": d.get("expected_outcome", ""),
             "var_name": var_name,
@@ -1491,6 +1804,7 @@ class Orchestrator:
         var = report.get("var_name") or task["var_name"]
         val = report.get("var_value", "")
         task["completed"] = bool(report.get("completed", False))
+        task["status"] = "completed" if task["completed"] else task.get("status", "claimed")
         task["result_value"] = val
         task["result_message"] = report.get("message", "")
         task["token_cost"] = int(report.get("token_cost", 0) or 0)
@@ -1571,6 +1885,7 @@ class Orchestrator:
         return {
             "type": "status_sync",
             "trace_id": self.trace_id,
+            "mode": self.mode,
             "phase": self.phase,
             "current_round": self.round,
             "agent_states": {a.name: "IDLE" for a in self.agents},
@@ -1739,7 +2054,9 @@ class Orchestrator:
     # ---------------- 导出 Markdown ----------------
     def export_markdown(self) -> str:
         lines = []
-        lines.append("# 多 Agent 辩论记录\n")
+        # 双模式：标题按讨论模式切换
+        lines.append("# 多 Agent 辩论记录\n" if self.mode == "debate"
+                     else "# 多 Agent 协作记录\n")
         lines.append(f"- 主题：{self.topic}")
         lines.append(f"- 轮次：{self.round}/{self.max_rounds}")
         lines.append(f"- 状态：{self.status} / 阶段：{self.phase}")
@@ -1768,8 +2085,11 @@ class Orchestrator:
                           else "向量余弦相似度（嵌入模型）")
         lines.append(f"- 持续时间：{elapsed:.1f} 秒")
         lines.append(f"- 实际轮次：{self.round}/{self.max_rounds}")
-        lines.append(f"- 收敛触发：{conv_text}")
-        lines.append(f"- 收敛检测模式：{conv_mode_text}")
+        if self.mode == "debate":
+            lines.append(f"- 收敛触发：{conv_text}")
+            lines.append(f"- 收敛检测模式：{conv_mode_text}")
+        else:
+            lines.append("- 收敛触发：不适用（合作模式无收敛检测）")
         lines.append(f"- RAG 证据轮数：{len(self.round_evidence)}")
         lines.append(f"- 任务：{len(self.tasks)}（完成 {done_tasks}）")
         lines.append(f"- 历史压缩次数：{self.run_stats.get('compressions', 0)}")

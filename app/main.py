@@ -153,12 +153,13 @@ async def configure(payload: ConfigureRequest):
     judge_config = payload.judge or {}
     try:
         orch.configure(agents, topic=topic, max_rounds=max_rounds,
-                       judge_config=judge_config)
+                       judge_config=judge_config, mode=payload.mode)
     except ValueError as e:
         return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
     return {
         "ok": True,
         "session_id": orch.session_id,
+        "mode": orch.mode,
         "agents": [{"name": a.name, "role": a.role, "is_main": a.is_main,
                     "stance": a.stance,
                     "model_id": a.model_config["model_id"]} for a in orch.agents],
@@ -231,6 +232,9 @@ async def start(payload: StartRequest = None):
         return JSONResponse({"ok": False, "error": "请先配置 Agent"}, status_code=400)
     topic = payload.topic or orch.topic
     max_rounds = payload.max_rounds
+    # 双模式：start 时可按 payload.mode 覆盖 configure 时的模式；缺省沿用
+    if payload.mode is not None:
+        orch.mode = payload.mode if payload.mode in ("debate", "collaboration") else "debate"
     _spawn_task(orch.run_discussion(topic=topic, max_rounds=max_rounds))
     return {
         "ok": True,
@@ -273,6 +277,7 @@ async def status(session_id: str = "default"):
         "session_id": orch.session_id,
         "status": orch.status,
         "phase": orch.phase,
+        "mode": orch.mode,
         "trace_id": orch.trace_id,
         "round": orch.round,
         "max_rounds": orch.max_rounds,

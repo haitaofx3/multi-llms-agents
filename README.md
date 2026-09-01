@@ -46,6 +46,7 @@
 35. **质量基线评估脚本（P0-2）**：`scripts/eval_baseline.py` 对一场导出的讨论 Markdown 做**五维质量评分**（结构 0.20 / 完成度 0.25 / 参与度 0.25 / 公平性 0.20 / 效率 0.10，0–100 分），可与历史基线 JSON 对比，发现质量退化时以退出码 2 报回归——改 prompt / 换模型后的质量是否退化"一测便知"。
 36. **任务与辩论回合分离（§5.8）**：协作 Agent 每轮拆为两个独立回合——`_task_turn`（只处理待办任务，结果回填 `shared_context` 并发布 `task_result`，**不写 `round_arguments` / 记忆**）与 `_debate_turn`（专职立论 / 反驳，正常记录发言）。任务输出不再污染收敛检测、RAG 事实核查与对手上下文，也避免任务细节泄露到辩论发言中。
 37. **RAG 证据按立场分桶（§5.3）**：每轮事实核查把证据按发言人立场分组存放（`round_evidence[round] = {stance: [...]}`），下一轮注入时 `_evidence_for_round(round, stance)` 只取**与本人立场对应**的证据桶（无立场 / 空桶回退默认桶）——辩手不会被对手立场的核查结果干扰。
+38. **双模式：辩论 / 合作（§12.17）**：同一编排器支持两种讨论模式（前端模式选择器 / `/api/configure` 的 `mode` 字段 / `.env` 的 `DISCUSSION_MODE` 兜底，默认 `debate`）。**辩论模式（debate）**为原主流程（主 Agent 主持、任务分派 + 辩论交锋、裁判四维裁决）；**合作模式（collaboration）**下主 Agent 用 `delegate_task` 把整体任务**拆分为子任务放入共享任务池**（`recipient` 留空），子 Agent 用 `claim_task` **主动认领（独占负责）**、完成后用 `report_result` 回报；**所有任务 `completed` 即提前收尾**（`max_rounds` 兜底），无裁判裁决，最终由主 Agent 输出三段式汇总（`## 核心结论 / ## 子任务与成果 / ## 遗留问题与后续建议`）。合作模式席位立场弱化：主位 HOST、其余一律 NEUTRAL，不参与对抗逻辑。
 
 ## 目录结构
 
@@ -84,7 +85,7 @@ mini_test/
 │   ├── test_ci_fast.py   快速单元测试（状态机 / 公平性 / 裁决）
 │   ├── test_api_flow.py  HTTP 接口级测试（ASGITransport，无需服务器 / 无需真实 LLM）
 │   ├── test_multi_session.py  多会话隔离测试（DebateManager / 会话元数据 / 中断恢复）
-│   └── test_features_v2.py    新特性测试（费用估算 / 收敛降级 / 工具可视化 / 结构化结论 / 论据句抽取 / 任务-辩论分离）
+│   └── test_features_v2.py    新特性测试（费用估算 / 收敛降级 / 工具可视化 / 结构化结论 / 论据句抽取 / 任务-辩论分离 / 双模式合作）
 ├── docs/
 │   └── CODE_LOGIC.md     代码逻辑详解（模块职责 → 关键函数 → 数据流）
 ├── data/                 运行时数据（自动生成，不提交到版本库）
@@ -133,6 +134,7 @@ pip install -r requirements.txt
 | `CONVERGENCE_SIMILARITY` / `CONVERGENCE_ROUNDS` / `CONVERGENCE_PER_SPEAKER` | 收敛检测：语义余弦相似度阈值（默认 0.85）、连续相似轮数（默认 2）、按发言者逐人计算开关（默认 1 开启，§5.7） |
 | `CONVERGENCE_TEXT_SIMILARITY` | 收敛检测降级（P0-3）：嵌入不可用时文本相似度阈值（默认 0.6，difflib SequenceMatcher） |
 | `COST_INPUT_PER_1M` / `COST_OUTPUT_PER_1M` | 费用估算单价（P1-6，人民币 ¥/百万 token，默认 2.0 / 8.0；按供应商价格覆盖） |
+| `DISCUSSION_MODE` | 双模式服务端兜底：`debate`（辩论）/ `collaboration`（合作），默认 `debate`；前端 `/api/configure` / `/api/start` 可显式覆盖 |
 | `FAIR_TEMPERATURE` / `FAIR_TOP_P` | 公平性 L5：辩论发言统一采样参数（默认 0.7 / 1.0） |
 | `FAIR_JUDGE_TEMPERATURE` / `FAIR_JUDGE_TOP_P` | 公平性 L5：辅助 LLM（裁判/摘要）统一采样参数（默认 0.3 / 1.0） |
 
@@ -181,13 +183,13 @@ HTTP 接口级测试（`httpx.ASGITransport` 直接驱动 FastAPI 应用，LLM �
 python -m unittest tests.test_api_flow -v
 ```
 
-多会话隔离与新特性测试（DebateManager 会话注册表 / 会话元数据 / 中断恢复；费用估算 / 收敛降级 / 工具调用可视化 / 结构化结论 / **论据句抽取** / **任务-辩论分离**，均无需服务器与真实模型）：
+多会话隔离与新特性测试（DebateManager 会话注册表 / 会话元数据 / 中断恢复；费用估算 / 收敛降级 / 工具调用可视化 / 结构化结论 / **论据句抽取** / **任务-辩论分离** / **双模式合作（任务池 / 认领独占 / 全完成收尾）**，均无需服务器与真实模型）：
 
 ```bash
 python -m unittest tests.test_multi_session tests.test_features_v2 -v
 ```
 
-全量快速回归（无需服务器 / 真实模型）共 **82 项用例**：
+全量快速回归（无需服务器 / 真实模型）共 **88 项用例**：
 
 ```bash
 python -m unittest discover tests
@@ -247,6 +249,7 @@ P0 / P1 优化项已实施落地：
 - **P0-3 收敛检测降级**：`is_fallback()` 时 `_check_convergence` 切换到 `_text_similarity`（difflib，阈值 `CONVERGENCE_TEXT_SIMILARITY`=0.6），保证离线哈希向量模式仍能收敛提前终止（详见 `docs/CODE_LOGIC.md` §12.10）。
 - **P1-6 费用估算展示（¥）**：`_estimate_cost_rmb` 只读遥测随 `speech_end`/`status_sync`/导出展示（详见 `docs/CODE_LOGIC.md` §12.16）。
 - **P1-5 配置模板**：前端 `localStorage` 模板保存 / 载入 / 删除。
+- **双模式（辩论 / 合作）**：`run_discussion` 按 `mode` 分派 `_run_debate_loop`（原 while 循环体原样搬入，行为逐字节不变）与 `_run_collab_loop`（主 Agent `delegate_task` 拆任务入池 → 子 Agent `claim_task` 认领 + `report_result` 回报 → 全 completed 提前收尾）；post-loop 按模式三分支（stopped / collaboration 走 `_collab_final_summary` 三段式 / debate 走 `_judge_round`）；`_agent_turn` 按 `mode` 注入 `delegate_task` / `claim_task` / `report_result` 专用工具并拦截，任务状态机 `pending → claimed → completed`；合作模式席位立场弱化（主位 HOST、其余 NEUTRAL）、无裁判（详见 `docs/CODE_LOGIC.md` §12.17）。
 - **P0-2 质量基线**：`scripts/eval_baseline.py` 五维评分 + 基线对比（详见 `docs/CODE_LOGIC.md` §21）。
 - **P2 分析与方案**：详见 [`P2优化方案.md`](P2优化方案.md)——平台化主干（A10 多实例 / A11 人工审核 / A12 知识库后台 / A13 模板与快照）+ 增补议题（裁判增强 / 日志落盘与检索 / 前端测试与 CI / 鉴权与网络安全 / 数据治理 / 完整会话恢复）。
 

@@ -48,14 +48,22 @@ class Agent:
                      "保持人设一致，不得脱离角色，也不得声明自己是大语言模型或 AI。"
                      "只有在用户明确修改了你的角色/性格描述时，才允许改变。")
         lines.append("")
-        lines.append("【讨论形式】本场为辩论式多轮协作讨论：由主持人引导与追问，各 Agent 基于自身立场立论、"
-                     "辩护与交锋，最终由裁判评分并汇总。请始终维持你的人设与立场。")
+        # 双模式：合作模式（collaboration/collab）为合作式协作；其余为辩论式
+        if mode in ("collaboration", "collab"):
+            lines.append("【讨论形式】本场为合作式多轮协作：主 Agent 将整体任务拆分为子任务放入共享任务池，"
+                         "各协作 Agent 主动认领并完成子任务，将结果回报给主 Agent，"
+                         "最终由主 Agent 汇总整体成果。请始终维持你的人设。")
+        else:
+            lines.append("【讨论形式】本场为辩论式多轮协作讨论：由主持人引导与追问，各 Agent 基于自身立场立论、"
+                         "辩护与交锋，最终由裁判评分并汇总。请始终维持你的人设与立场。")
         lines.append("")
         # 立场约束（架构文档 §2.2/2.3：Pro/Con 严格立场，禁止倒戈）
-        stance_line = self._stance_declaration()
-        if stance_line:
-            lines.append(stance_line)
-            lines.append("")
+        # 合作模式弱化立场：无 PRO/CON 对抗，跳过立场强制声明
+        if mode not in ("collaboration", "collab"):
+            stance_line = self._stance_declaration()
+            if stance_line:
+                lines.append(stance_line)
+                lines.append("")
         # 记忆
         mem = self.memory.context_text("", top_k=4)
         lines.append("【你的记忆】\n" + mem)
@@ -80,16 +88,30 @@ class Agent:
             lines.append("")
         # 模式指令
         if self.is_main:
-            lines.append("【你的职责（主持人 / Supervisor 视角）】你主持一场辩论："
-                         "第1轮为协作 Agent 分派调研 / 立论任务并陈述你的开场立场；之后的轮次针对各方观点抛出质疑、"
-                         "要求论据、指出分歧，推动多轮交锋；最终综合各方观点与裁判裁决进行总结。"
-                         "请用 delegate_task 分派 / 追问任务，说明任务内容(content)、"
-                         "期望效果(expected_outcome)与接收结果的变量名(var_name)。"
-                         "你只做主持与分派，不亲自执行任务。")
+            if mode in ("collaboration", "collab"):
+                lines.append("【你的职责（主 Agent / 统筹者）】你负责把整体任务拆解为可独立完成的子任务，"
+                             "用 delegate_task 将子任务放入共享任务池（recipient 留空），"
+                             "说明任务内容(content)、期望效果(expected_outcome)与接收结果的变量名(var_name)；"
+                             "统筹各协作 Agent 的认领与完成情况，最终汇总整体成果。"
+                             "你只负责拆解与统筹，不亲自执行子任务。")
+            else:
+                lines.append("【你的职责（主持人 / Supervisor 视角）】你主持一场辩论："
+                             "第1轮为协作 Agent 分派调研 / 立论任务并陈述你的开场立场；之后的轮次针对各方观点抛出质疑、"
+                             "要求论据、指出分歧，推动多轮交锋；最终综合各方观点与裁判裁决进行总结。"
+                             "请用 delegate_task 分派 / 追问任务，说明任务内容(content)、"
+                             "期望效果(expected_outcome)与接收结果的变量名(var_name)。"
+                             "你只做主持与分派，不亲自执行任务。")
             if collaborators:
                 lines.append("可指派的协作 Agent：" + "、".join(c["name"] for c in collaborators))
         else:
-            if mode == "task":
+            if mode in ("collaboration", "collab"):
+                lines.append("【你的职责（协作 Agent）】你是一名协作成员。"
+                             "可从任务池用 claim_task 认领未分配的子任务（认领后由你独占负责），"
+                             "完成后用 report_result 回报【最终结果】与【是否完成(completed)】，"
+                             "并将结果填入主 Agent 指定的变量(var_name)。"
+                             "可调用 knowledge_search / web_search / memory_recall 等工具获取信息；"
+                             "严禁返回中间思考或检索过程。")
+            elif mode == "task":
                 lines.append("【你的职责（协作 Agent）】你收到一项任务。可调用 knowledge_search / "
                              "web_search / memory_recall 等工具获取信息，但只需通过 report_result "
                              "工具返回【最终结果】与【是否完成(completed)】，"

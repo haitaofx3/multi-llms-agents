@@ -332,18 +332,19 @@ Agent(agent_id, name, role, personality, model_config, is_main, forget_config, s
 ## 12. 编排器 — `orchestrator.py`（核心，Supervisor 实现）
 
 ### 12.1 全局结构
-- `DELEGATE_SCHEMA` / `REPORT_SCHEMA`：任务分派/回报的 function-calling 定义。
-- `STANCE_LABEL`：立场显示名；`PHASES = ("idle", "preparing", "debating", "judging", "finished")` 架构状态机（§4.1）。
+- `DELEGATE_SCHEMA` / `CLAIM_SCHEMA` / `REPORT_SCHEMA`：任务分派 / 认领 / 回报的 function-calling 定义（双模式，§12.17）。
+- `STANCE_LABEL`：立场显示名；`PHASES = ("idle", "preparing", "debating", "judging", "finished")` 架构状态机（§4.1；合作模式额外使用 `collaborating` 阶段值）。
 - `EventBus`：基于 `asyncio.Queue` 的发布/订阅。
 - `Orchestrator` 实例统一由 `DebateManager` 注册表持有（§12.15 / §1.3 解耦：**不再存在模块级 `orchestrator` 单例**，测试与入口均走 `manager.get_or_create("default")`）。关键状态：
-  - `agents / main / collaborators`、`shared_context`、`tasks`、`round / max_rounds`、`topic`；
-  - `status`（idle/running/paused/done/stopped，UI 状态）与 `phase`（idle/preparing/debating/judging/finished，**架构状态机**）；
+  - `mode`（`debate` / `collaboration`，双模式）、`agents / main / collaborators`、`shared_context`、`tasks`、`round / max_rounds`、`topic`；
+  - `status`（idle/running/paused/done/stopped，UI 状态）与 `phase`（idle/preparing/debating/collaborating/judging/finished）；
   - `trace_id`、`spent / output_tokens`（token 用量，**只读遥测**，不再做约束）、`governor`（FairnessGovernor 公平性治理器，每场全新）、`convergence_streak`、`round_arguments / latest_arguments / round_evidence`（RAG 证据按立场分桶，§12.11）、`judgment`、`_pause_event`。
 
-### 12.2 配置 `configure()`
+### 12.2 配置 `configure(agent_configs, topic, max_rounds, judge_config, mode)`
 - 校验 status 非 running；重置全部状态并生成新 `trace_id`。
-- 逐个 `resolve_model_config` 构造 `Agent`；**立场**：显式指定优先，否则主位=HOST、其余按 PRO/CON 交替（i 为奇数为 PRO，偶数为 CON）。
-- `_build_judge`：`resolve_provider("JUDGE", ...)` 合并前端显式字段与 `.env` 的 `JUDGE_*` 默认值（§1.4），再交 `resolve_model_config` 解析预设；完全未配置返回 `None`（`_judge_round` 回退主 Agent 模型）。裁判不进入 `agents / collaborators`，不占席位、不参与辩论、不接收任务。
+- **双模式（§12.17）**：`mode` 显式指定优先；未指定（含 `None`，如 `/api/configure` 未传 `mode` 字段）回退 `.env` 的 `DISCUSSION_MODE`（默认 `debate`），非法值一律落回 `debate`。
+- 逐个 `resolve_model_config` 构造 `Agent`；**立场**：显式指定优先，否则主位=HOST、其余按 PRO/CON 交替（i 为奇数为 PRO，偶数为 CON）；**合作模式弱化立场**：无显式立场时主位 HOST、其余一律 `NEUTRAL`（不参与对抗逻辑）。
+- `_build_judge`：`resolve_provider("JUDGE", ...)` 合并前端显式字段与 `.env` 的 `JUDGE_*` 默认值（§1.4），再交 `resolve_model_config` 解析预设；完全未配置返回 `None`（`_judge_round` 回退主 Agent 模型）。裁判不进入 `agents / collaborators`，不占席位、不参与辩论、不接收任务。**合作模式无辩论对抗，直接不构建裁判**（`self.judge = None`）。
 - 首个为 `main`，其余进 `collaborators`。
 
 ### 12.3 控制 `pause() / resume() / end()`
@@ -352,16 +353,16 @@ Agent(agent_id, name, role, personality, model_config, is_main, forget_config, s
 ### 12.4 单 Agent 回合 `_agent_turn(agent, user_msg, mode, allow_delegate, stream)`
 封装"工具调用循环"（上限 5 次）：
 1. 构建 `messages = [system] + history + [user]`；`system_prompt` 内部会做记忆检索（`memory.context_text`），经 `asyncio.to_thread` 卸载到线程执行，避免阻塞事件循环（§2.4）；
-2. 工具集 = `mcp.schemas()`，主 Agent 追加 `DELEGATE_SCHEMA`（除非 `allow_delegate=False`），协作任务模式追加 `REPORT_SCHEMA`；
+2. 工具集 = `mcp.schemas()`，按模式注入专用工具：主 Agent + `allow_delegate` 追加 `DELEGATE_SCHEMA`；非主 Agent 且 `mode ∈ (task, collab)` 追加 `REPORT_SCHEMA`（`collab` 额外追加 `CLAIM_SCHEMA`，双模式 §12.17）；
 3. **流式**：`_consume_stream()` 在后台线程运行 `chat_stream`，通过 `asyncio.Queue` + `loop.call_soon_threadsafe` 把增量桥接回事件循环；整体受 `settings.STREAM_TIMEOUT` 约束；流式异常时**回退非流式重试调用**。**工具调用可视化（P1-4）**：流式期间把 `tool_call_start` / `tool_call_args` 事件转发前端（气泡显示"正在调用工具 X…"），`_consume_stream` 返回 `result["tool_starts"]`（已发过 `tool_call_start` 的工具索引集合）供调用方去重——`_agent_turn` 对未流式发出索引的工具补发 `tool_call_start`（同样先补 `speech_start` 保证纯工具回合气泡存在），已发出的不再重复发；
 4. **性能实测**：流式结果携带 `metrics = {ttft_s, gen_s, chars}`（在 `_consume_stream` 的 `_drain` 内实测首 token 延迟与生成耗时），回合末尾按辩手聚合进 `agent_metrics`（calls / ttft_sum / gen_sum / chars），供裁判**模型质量评分**使用；**非流式回退不计入**；
 5. **非流式**：`_run_llm_retry()` 对 429/5xx/超时做指数退避重试（`LLM_RETRY_DELAYS` = 1s、3s）；
 6. 每次调用 `_apply_usage(result)` 累加 `spent` / `output_tokens`（只读遥测）；
 7. 收到首个文本增量即推送 `speech_start`，随后逐个 `speech_delta`；
-8. 工具调用循环：主 Agent `delegate_task` → 收集 `delegate`；协作 Agent `report_result` → 收集 `report`；普通工具 → `mcp.call` 并把 tool 消息回传，继续循环；
-9. **输出字数约束（需求 5，公平性 L1）**：`mode=="discussion"` 时按 `ceiling = self.governor.ceiling_for(stance, round, 对手近N轮有效输出均值)` 得到字符上限（立论/无参照用 `opening_char_limit`），超限保留头尾截断（`truncate_output`，事件 `fairness.output_truncate`）——提示词字数要求失效时仍受事后硬截断兜底；不再把 `max_tokens` 下发给 API；
+8. 工具调用循环：主 Agent `delegate_task` → 收集 `delegate`；协作 Agent `report_result` → 收集 `report`；协作 Agent `claim_task`（合作模式认领任务池任务）→ 收集 `claim`；以上均为"特殊工具"，执行后本回合提前结束；普通工具 → `mcp.call` 并把 tool 消息回传，继续循环；
+9. **输出字数约束（需求 5，公平性 L1）**：`mode=="discussion"` 时按 `ceiling = self.governor.ceiling_for(stance, round, 对手近N轮有效输出均值)` 得到字符上限（立论/无参照用 `opening_char_limit`），超限保留头尾截断（`truncate_output`，事件 `fairness.output_truncate`）——提示词字数要求失效时仍受事后硬截断兜底；不再把 `max_tokens` 下发给 API；**双模式**：`mode ∈ (discussion, collaboration, collab)` 一律按 L1 截断，但合作模式无 PRO/CON 对称性，一律用 `hard_char_ceiling` 兜底；
 10. 回合结束若发生过流式发言，补发 `speech_end`（携带完整文本 + **最新 `output_tokens` 与 `cost_rmb` 费用估算**）并写入 transcript；
-11. 把 user/assistant 写入 `history`（带 `round_no=self.round`，与 `history_rounds` 平行），返回 `{content, delegate, report, streamed, token_cost}`。
+11. 把 user/assistant 写入 `history`（带 `round_no=self.round`，与 `history_rounds` 平行），返回 `{content, delegate, report, claim, streamed, token_cost}`（`claim` 为合作模式认领参数列表，辩论/任务模式恒为 `[]`）。
 
 **`_consume_stream`**：后台线程 + `asyncio.Queue` 桥接，`wait_for` 整体超时（`STREAM_TIMEOUT`）；`_drain` 消费 chunk 时实测 `ttft_s`（首 token 延迟）/ `gen_s` / `chars`，随结果返回 `metrics`。
 **`_run_llm_retry`**：`asyncio.to_thread(chat, ...)` 包装，指数退避重试。
@@ -372,6 +373,9 @@ Agent(agent_id, name, role, personality, model_config, is_main, forget_config, s
 - 存在未完成任务时附加"请先审视进展"提示。
 
 ### 12.6 讨论主循环 `run_discussion()`
+**双模式分派（§12.17）**：`mode == "collaboration"` 时进入 `_run_collab_loop()`（合作循环，见 §12.17）；否则进入 `_run_debate_loop()`（下文的原辩论循环体，**行为与拆分前逐字节一致**）。两模式共用 `preparing → running` 启动、`stopped` 熔断分支与异常兜底；post-loop 按模式三分支：`stopped` → idle 收尾；`collaboration` → `_collab_final_summary()`（三段式汇总，无裁判）；否则 → `_judge_round()` + `_final_summary(judgment)`。
+
+辩论模式循环（`_run_debate_loop`）：
 ```
 phase = preparing → status = running（发布 status 事件 + StatusSync）
 while round < max_rounds:
@@ -428,8 +432,9 @@ while round < max_rounds:
 **论据句抽取 `_extract_argument_sentences(text, max_chars)`（模块级函数，§5.4）**：按 `。！？!?;\n` 切句后，只保留带**序号标记**（首先/其次/最后/第一/1.…）或**论据性关键词**（指出/表明/因为/因此/证据/数据…）的句子（标记 3 分 / 关键词各 1 分，长句同分靠前），无任何命中回退最长句；按分数降序拼接，超出 `max_chars` 整体截断。保证摘要轮辩手仍能看到对方的具体论点，逐条回应而非泛泛反驳。
 
 ### 12.9 任务与变量
-- `_create_task(d)`：**校验 recipient 存在**（P15 修复，非法则忽略并记日志）；生成任务 `{id, task_id(UUID), recipient, content, expected_outcome, var_name, completed, rounds_waiting, timestamp(ms), token_cost}`，并在 `shared_context[var_name]` 登记。
-- `_apply_report(task, report)`：回填变量、标记完成，结果以 `importance=0.85` 写入该 Agent **长期记忆**。
+- `_create_task(d)`：**校验 recipient 存在**（P15 修复，非法则忽略并记日志）；生成任务 `{id, task_id(UUID), recipient, content, expected_outcome, var_name, completed, status, rounds_waiting, timestamp(ms), token_cost}`，并在 `shared_context[var_name]` 登记。**双模式状态机**：`recipient` 非空 = 直接分派 → `status="claimed"`；`recipient` 留空 = 放入**共享任务池**（合作模式）→ `status="pending"`，跳过存在性校验，由协作 Agent 主动认领（§12.17）。
+- `_apply_claim(collab, args)`（合作模式）：按 `task_id`（兼容数字 `id` 与 UUID `task_id`）在 **pending** 任务中查找，命中则置 `recipient=collab.name`、`status="claimed"`、`rounds_waiting=0` 并发布 `task_claimed` 事件；不存在或已被认领则忽略（事件 `task.claim_ignore`）——认领者独占负责。
+- `_apply_report(task, report)`：回填变量、按 `report["completed"]` 置 `status="completed"`（未完成保持 `claimed`），结果以 `importance=0.85` 写入该 Agent **长期记忆**。
 
 ### 12.10 收敛检测 `_check_convergence()`（架构文档 §4.4）
 - `round >= 2` 时计算本轮 vs 上一轮发言的相似度：嵌入可用（`is_fallback() == False`）用 `embed_query` 余弦相似度，阈值 `CONVERGENCE_SIMILARITY`（0.85）；**嵌入不可用（P0-3 降级）**时切换为 `_text_similarity()`——difflib `SequenceMatcher` 对去空白文本计算相似度，阈值 `CONVERGENCE_TEXT_SIMILARITY`（0.6），保证离线哈希向量模式仍能收敛提前终止；
@@ -458,7 +463,7 @@ while round < max_rounds:
 - `export_markdown()`：主题/轮次/时间/Trace ID/**Token 用量（只读遥测：累计 + 输出）**/**预估费用（P1-6，≈ ¥）**/**公平性治理报告（`ok` + 各层 L1–L6 状态与详情）**/Agent → 发言记录 → 裁判裁决（`scores` + `agent_scores` + 胜方）→ **「模型性能与综合评分」表**（辩手/平均TTFT/平均生成速率/模型质量分/综合评分）→ 任务结果表 → **结构化结论（四段式）** → 各 Agent 记忆快照。
 
 ### 12.14 状态同步 `_status_sync()`（架构文档 §3.5）
-发布 `status_sync` 事件：`trace_id / phase / current_round / agent_states / spent_tokens / output_tokens / fairness / cost_rmb / elapsed_time_ms`。其中 `spent_tokens`（累计 token 用量）与 `output_tokens`（累计输出 token）为**只读遥测**，`cost_rmb` 为 **P1-6 费用估算（¥，`_estimate_cost_rmb`）**；`fairness` 为 `governor.report()`（L1–L6 各层状态），替代旧的 `budget_plan` 视图。
+发布 `status_sync` 事件：`trace_id / mode / phase / current_round / agent_states / spent_tokens / output_tokens / fairness / cost_rmb / elapsed_time_ms`。其中 `mode` 为当前讨论模式（双模式，§12.17）；`spent_tokens`（累计 token 用量）与 `output_tokens`（累计输出 token）为**只读遥测**，`cost_rmb` 为 **P1-6 费用估算（¥，`_estimate_cost_rmb`）**；`fairness` 为 `governor.report()`（L1–L6 各层状态），替代旧的 `budget_plan` 视图。
 
 ### 12.15 多会话管理 — `app/manager.py`（P1-7）
 
@@ -483,6 +488,20 @@ while round < max_rounds:
 2. `费用 ≈ input/1e6 × COST_INPUT_PER_1M + output/1e6 × COST_OUTPUT_PER_1M`（默认 ¥2 / ¥8 每百万 token，`.env` 可覆盖）。
 
 暴露位置：`speech_end`（每轮发言后）、`status_sync` 与 `/api/status`（状态面板）、`export_markdown` 运行摘要（`- 预估费用（P1-6）：≈ ¥x.xxxx`）。**只读遥测**，不参与任何约束。
+
+### 12.17 双模式：辩论 / 合作
+
+同一编排器支持两种讨论模式，模式来源优先级：前端模式选择器 → `/api/configure` 的 `mode` 字段 → `.env` 的 `DISCUSSION_MODE` 兜底（默认 `debate`），`/api/start` 也可按 `payload.mode` 覆盖；非法值一律落回 `debate`。
+
+**辩论模式（debate）**：原主流程（§12.6 的 `_run_debate_loop`），主 Agent 主持、任务分派 + 辩论交锋、裁判四维裁决。
+
+**合作模式（collaboration）**：
+- **主循环 `_run_collab_loop()`**：每轮 ① 主 Agent 回合（`mode="collaboration"`，指令由 `_collab_main_directive` 生成：第 1 轮拆解整体任务入池、后续轮统筹协调）→ 收到的 `delegate_task`（`recipient` 留空）经 `_create_task` 放入**共享任务池**并发布 `task_assigned`（`to` 为空 = 待认领）；② 各子 Agent 回合 `_collab_work_turn()`；③ **结束判定**：`self.tasks and all(t["completed"] for t in self.tasks)` 即**提前收尾**（防空任务误判），`max_rounds` 兜底。无收敛检测、无立场对抗。
+- **子 Agent 回合 `_collab_work_turn(collab)`**（`mode="collab"`，`_collab_work_prompt` 并列"待办（需 report）"与"可认领（可 claim）"）：一轮单次 LLM 调用，**先解析 `claim`（`_apply_claim`，可多个）再解析 `report`（`_apply_report`）**，支持**同轮认领后立即回报**（report 时若任务仍 `pending`，先补认领再落库）；未回报的任务 `rounds_waiting` 累积，`>=3` 轮强制标记完成（事件 `task.timeout`）。回报路径发布 `task_result`，并把结果写入该 Agent 长期记忆。
+- **收尾 `_collab_final_summary()`**：无裁判裁决，主 Agent 输出**三段式** Markdown（`## 核心结论 / ## 子任务与成果 / ## 遗留问题与后续建议`），经 `_normalize_collab_conclusion` 规范并发布 `conclusion` 事件（`judge_ruling=""`、`winner=None`，前端按空值跳过裁决面板）；LLM 汇总失败回退确定性 `_fallback_collab_summary`（按任务记录拼装，注明"未调用主 Agent LLM 汇总"）。
+- **状态机**：`pending`（任务池，`recipient=""`）→ `claimed`（被 `claim_task` 认领，`recipient=认领者`，独占）→ `completed`（`report_result` 回报）。
+- **席位立场弱化**：合作模式无显式立场时主位 `HOST`、其余一律 `NEUTRAL`（§12.2）；`system_prompt` 按 `mode ∈ (collaboration, collab)` 切换到合作式职责描述，并跳过 `_stance_declaration()`。
+- **公平性 L1**：合作模式无 PRO/CON 对称性，`mode ∈ (collaboration, collab)` 一律用 `hard_char_ceiling` 兜底截断（§12.4 步骤 9）。
 
 ---
 
