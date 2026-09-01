@@ -179,6 +179,11 @@ class Settings:
     # 前端 /api/configure 可显式覆盖。
     DISCUSSION_MODE = _get("DISCUSSION_MODE", "debate")
 
+    # ---- 合作模式子 Agent 反思与自我修正（仅 collaboration/collab 生效） ----
+    # 子 Agent 回报任务前额外一次 LLM 调用，对照 expected_outcome 自我批判并修订后再落库。
+    REFLECTION_ENABLED = _int("REFLECTION_ENABLED", 1) == 1    # 是否启用
+    REFLECTION_MAX_PASSES = _int("REFLECTION_MAX_PASSES", 1)   # 单任务反思轮数上限（0=完全跳过）
+
 
 settings = Settings()
 

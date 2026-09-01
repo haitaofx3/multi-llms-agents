@@ -118,6 +118,48 @@ def _estimate_cost_rmb(total_tokens, output_tokens):
             + output / 1e6 * settings.COST_OUTPUT_PER_1M)
 
 
+# ---- 合作模式反思与自我修正（§12.18）：纯函数，便于单测直接 import ----
+def _reflection_prompt(task: dict, draft: str) -> str:
+    """构建反思 prompt：要求对照期望效果对草稿自我批判并输出修订版。
+
+    强制三个 Markdown 二级标题（顺序不变），解析方按关键词容错取段。
+    """
+    return (f"【任务内容】{task.get('content', '')}\n"
+            f"【期望效果】{task.get('expected_outcome', '')}\n"
+            f"【你的任务结果草稿】\n{draft or '（空）'}\n\n"
+            "请对照期望效果对上述草稿做一次自我批判与修订：指出缺失、错误或不够严谨之处；"
+            "若已完全达标可保持原样，并在修订说明中说明理由。"
+            "严格按以下三个 Markdown 二级标题输出（顺序不变）：\n"
+            "## 自我反思\n[对草稿的不足/达标分析]\n"
+            "## 修订后结果\n[修订后的最终内容，若无需修改则原样保留草稿]\n"
+            "## 修订说明\n[改了什么、为什么]")
+
+
+def _parse_reflection(text: str) -> dict:
+    """解析反思输出为 {reflection, revision, explanation}；缺失段回退空串。
+
+    按「自我反思 / 修订后结果 / 修订说明」关键词匹配 Markdown 标题（# 或 ##），
+    与 _split_sections 相比增加「标题含前后缀容错 + 缺段回退」语义。
+    """
+    out = {"reflection": "", "revision": "", "explanation": ""}
+    cur = None
+    for line in (text or "").splitlines():
+        m = re.match(r"^#{1,2}\s+(.+)$", line.strip())
+        if m:
+            key = m.group(1).strip()
+            if "自我反思" in key:
+                cur = "reflection"
+            elif "修订后结果" in key:
+                cur = "revision"
+            elif "修订说明" in key:
+                cur = "explanation"
+            else:
+                cur = None
+        elif cur is not None:
+            out[cur] = (out[cur] + "\n" + line).strip()
+    return out
+
+
 # P0-1 结构化结论：最终报告固定四段式模板（主持人 LLM 必须保留每个一级标题）
 CONCLUSION_TEMPLATE = (
     "## 核心结论\n"
@@ -1425,16 +1467,19 @@ class Orchestrator:
 
         # 2) 回报：认领后可能同轮立即回报，故此处重新刷新 claimed
         reported = None
+        reflected = None  # 反思元信息（None=未反思/失败；dict=本次执行了反思）
         if out["report"]:
             task = self._find_task_by_var(out["report"].get("var_name") or "")
             if task is not None and not task["completed"]:
                 if task.get("status") == "claimed" and task["recipient"] == collab.name:
-                    self._apply_report(task, out["report"])
+                    rep, reflected = await self._reflect_report(collab, task, out["report"])
+                    self._apply_report(task, rep)
                     reported = task
                 elif task.get("status") == "pending":
-                    # 同轮「认领 + 回报」：先补认领再落库
+                    # 同轮「认领 + 回报」：先补认领再反思修订、落库
                     self._apply_claim(collab, {"task_id": task["id"]})
-                    self._apply_report(task, out["report"])
+                    rep, reflected = await self._reflect_report(collab, task, out["report"])
+                    self._apply_report(task, rep)
                     reported = task
         if reported is not None:
             msg = reported.get("result_message", "")
@@ -1451,6 +1496,18 @@ class Orchestrator:
                 "timestamp": now_ms(),
                 "token_cost": out.get("token_cost", 0),
             })
+            # 反思修订事件（§12.18）：仅在实际执行了反思时发布
+            if reflected is not None:
+                await self.event_bus.publish({
+                    "type": "task_revised",
+                    "from": collab.name,
+                    "var": reported["var_name"],
+                    "task_id": reported["task_id"],
+                    "value": reported.get("result_value", ""),
+                    "reflections": reflected["reflections"],
+                    "revised": reflected["revised"],
+                    "timestamp": now_ms(),
+                })
         else:
             # 未回报：仅流式展示过程输出；认领任务超时强制完成
             if out["content"] and not out["streamed"]:
@@ -1791,6 +1848,8 @@ class Orchestrator:
             "result_value": "",
             "result_message": "",
             "rounds_waiting": 0,
+            "reflections": 0,          # 已执行的自我反思轮数（合作模式 §12.18）
+            "reflection_log": [],      # [{"pass","summary","revision","revised","timestamp"}]
             "timestamp": now_ms(),
             "token_cost": 0,
         }
@@ -1799,6 +1858,57 @@ class Orchestrator:
             "by": self.main.name, "value": "", "task_id": tid,
         }
         return task
+
+    async def _reflect_report(self, collab: Agent, task: dict, report: dict):
+        """合作模式反思与自我修正（§12.18）：对照期望效果自评草稿并输出修订版。
+
+        返回 (report, meta)：
+          - meta=None  未反思（被禁用 / 已达上限 / 反思调用异常），report 保持原草稿；
+          - meta={"revised": bool, "reflections": int, "token_cost": int} 已执行一次反思。
+        反思调用异常或输出无法解析时保留草稿照常落库，不阻塞任务完成。
+        """
+        if not (settings.REFLECTION_ENABLED
+                and task["reflections"] < settings.REFLECTION_MAX_PASSES):
+            return report, None
+        draft = report.get("var_value", "") or report.get("message", "")
+        try:
+            # 非主 Agent + mode="collaboration" → 不注入任何工具（§12.4），非流式不产生气泡；
+            # _apply_usage 自动把本次调用计入 spent/output_tokens 遥测，_run_llm_retry 内置重试。
+            out = await self._agent_turn(collab, _reflection_prompt(task, draft),
+                                         mode="collaboration", allow_delegate=False,
+                                         stream=False)
+            parsed = _parse_reflection(out["content"])
+            revision = (parsed.get("revision") or "").strip()
+            if revision:
+                # 公平性 L1：修订版同样按硬性字符上限截断
+                revision, _ = self.governor.truncate_output(
+                    revision, self.governor.hard_char_ceiling)
+            task["reflections"] += 1
+            revised = bool(revision) and revision != draft
+            if revised:
+                report = {**report, "var_value": revision,
+                          "message": parsed.get("explanation")
+                          or report.get("message", "")}
+                self._record_memory(collab, f"任务#{task['id']}({task['var_name']}) 反思修订："
+                                            f"{parsed.get('explanation','')[:100]}")
+                self._log(f"[反思修订] 任务#{task['id']} 反思后修订结果",
+                          level="info", event="reflection.revised")
+            else:
+                self._log(f"[反思通过] 任务#{task['id']} 反思后维持草稿",
+                          level="info", event="reflection.passed")
+            task["reflection_log"].append({
+                "pass": task["reflections"],
+                "summary": parsed.get("reflection", "")[:200],
+                "revision": (revision or draft)[:200],
+                "revised": revised,
+                "timestamp": now_ms(),
+            })
+            return report, {"revised": revised, "reflections": task["reflections"],
+                            "token_cost": out.get("token_cost", 0)}
+        except Exception as e:
+            self._log(f"[反思失败] 任务#{task['id']}: {e}，保留草稿落库",
+                      level="warning", event="reflection.fail")
+            return report, None
 
     def _apply_report(self, task, report: dict):
         var = report.get("var_name") or task["var_name"]

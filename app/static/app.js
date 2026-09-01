@@ -711,6 +711,18 @@ function handleEvent(ev) {
       renderTasks(); renderCtx(); highlightSeat(ev.from);
       break;
     }
+    case "task_revised": {
+      // 合作模式反思与自我修正（§12.18）：回报前子 Agent 自评修订
+      const note = ev.revised
+        ? `反思后已修订落库（第 ${ev.reflections} 轮）`
+        : `反思后维持草稿（第 ${ev.reflections} 轮）`;
+      addMsg(ev.from, `任务（变量 ${ev.var}）：${note}`, "task", null, ev.from + " 反思");
+      const t = state.tasks.find(t => t.var === ev.var);
+      if (t && ev.value) { t.value = ev.value; }
+      if (state.ctx[ev.var] && ev.value) state.ctx[ev.var].value = ev.value;
+      renderTasks(); renderCtx();
+      break;
+    }
     case "summary":
       addMsg(ev.speaker, ev.text, "summary", ev.round, "最终总结");
       break;

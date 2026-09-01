@@ -540,6 +540,15 @@ class CollaborationModeTest(unittest.IsolatedAsyncioTestCase):
         {"name": "助手B", "role": "执行", "personality": "", "provider": "default"},
     ]
 
+    def setUp(self):
+        # 存量用例不涉及反思（§12.18）：关闭开关，避免回报后触发额外 LLM 调用
+        # 打断「工作回合 mode==collab」的断言（反思调用 mode==collaboration）。
+        self._reflect_patch = patch.object(settings, "REFLECTION_ENABLED", False)
+        self._reflect_patch.start()
+
+    def tearDown(self):
+        self._reflect_patch.stop()
+
     async def _configure(self, cfgs=None, max_rounds=3, topic="合作模式测试"):
         orchestrator.configure(cfgs or self.NO_STANCE_CFG,
                                topic=topic, max_rounds=max_rounds,
@@ -719,6 +728,260 @@ class CollaborationModeTest(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("report_result", seen_tools)
         finally:
             orch._consume_stream = orig
+
+
+class ReflectionTest(unittest.IsolatedAsyncioTestCase):
+    """合作模式子 Agent 反思与自我修正（§12.18）：
+    - 回报前对照期望效果自评修订，修订版才落库，并发布 task_revised 事件；
+    - REFLECTION_ENABLED=False / REFLECTION_MAX_PASSES=0 时完全跳过；
+    - 反思输出无法解析 / LLM 异常时保留草稿降级落库（不阻塞任务）；
+    - 修订版同样受 L1 硬性字符上限截断。
+    """
+    CFG = [
+        {"name": "统筹", "role": "统筹", "personality": "", "provider": "default"},
+        {"name": "助手A", "role": "执行", "personality": "", "provider": "default"},
+    ]
+
+    async def _configure(self, max_rounds=3, topic="反思测试"):
+        orchestrator.configure(self.CFG, topic=topic, max_rounds=max_rounds,
+                               mode="collaboration")
+        q = orchestrator.event_bus.subscribe()
+        while True:
+            try:
+                await asyncio.wait_for(q.get(), timeout=0.1)
+            except asyncio.TimeoutError:
+                break
+        return q
+
+    @staticmethod
+    def _collab(name):
+        for c in orchestrator.collaborators:
+            if c.name == name:
+                return c
+        raise AssertionError(f"无 {name} 协作 Agent")
+
+    @staticmethod
+    async def _drain(q):
+        events = []
+        while True:
+            try:
+                events.append(await asyncio.wait_for(q.get(), timeout=0.1))
+            except asyncio.TimeoutError:
+                break
+        return events
+
+    def _new_task(self):
+        """清空任务池并创建一条待认领任务，返回 (orch, task, agent)。"""
+        orch = orchestrator
+        orch.tasks.clear()
+        orch.shared_context.clear()
+        orch.task_counter = 0
+        t = orch._create_task({
+            "content": "调研就业数据", "expected_outcome": "给出带来源的关键数字",
+            "var_name": "research"})
+        return orch, t, self._collab("助手A")
+
+    # 工作回合返回：认领 + 草稿回报
+    @staticmethod
+    def _work_result(task_id):
+        return {"content": "我来认领并完成", "delegate": [],
+                "claim": [{"task_id": task_id}],
+                "report": {"var_name": "research", "var_value": "8.0%",
+                           "completed": True, "message": "已查得数据"},
+                "streamed": True, "token_cost": 0}
+
+    async def test_reflection_revises_before_persist(self):
+        await self._configure()
+        orch, t, pro = self._new_task()
+        orch.round = 1
+        orig = orch._agent_turn
+        calls = 0
+
+        async def fake_agent_turn(agent, user_msg, mode, allow_delegate=True, stream=False):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                self.assertEqual(mode, "collab")  # 工作回合
+                return self._work_result(t["id"])
+            # 反思调用：非主 Agent + collaboration → 无工具注入模式
+            self.assertEqual(mode, "collaboration")
+            self.assertIn("自我批判", user_msg)
+            self.assertIn("期望效果", user_msg)
+            return {"content":
+                    "## 自我反思\n草稿缺少数据来源，不够严谨\n"
+                    "## 修订后结果\n8.0%（国家统计局2025）\n"
+                    "## 修订说明\n补充了数据来源",
+                    "delegate": [], "report": None, "claim": [],
+                    "streamed": False, "token_cost": 5}
+
+        orch._agent_turn = fake_agent_turn
+        try:
+            q = orchestrator.event_bus.subscribe()
+            await orch._collab_work_turn(pro)
+            events = await self._drain(q)
+        finally:
+            orch.event_bus.unsubscribe(q)
+            orch._agent_turn = orig
+        # 工作 + 反思共两次 LLM 调用；修订版落库
+        self.assertEqual(calls, 2)
+        self.assertTrue(t["completed"])
+        self.assertEqual(t["result_value"], "8.0%（国家统计局2025）")
+        self.assertEqual(t["reflections"], 1)
+        self.assertEqual(len(t["reflection_log"]), 1)
+        self.assertTrue(t["reflection_log"][0]["revised"])
+        self.assertIn("缺少数据来源", t["reflection_log"][0]["summary"])
+        self.assertEqual(orch.shared_context["research"]["value"], "8.0%（国家统计局2025）")
+        # task_revised 事件已发布（revised=True）
+        revised = [e for e in events if e["type"] == "task_revised"]
+        self.assertEqual(len(revised), 1)
+        self.assertTrue(revised[0]["revised"])
+        self.assertEqual(revised[0]["reflections"], 1)
+
+    async def test_reflection_disabled_skips(self):
+        with patch.object(settings, "REFLECTION_ENABLED", False):
+            await self._configure()
+            orch, t, pro = self._new_task()
+            orch.round = 1
+            orig = orch._agent_turn
+            calls = 0
+
+            async def fake_agent_turn(agent, user_msg, mode, allow_delegate=True,
+                                      stream=False):
+                nonlocal calls
+                calls += 1
+                self.assertEqual(mode, "collab")
+                return self._work_result(t["id"])
+
+            orch._agent_turn = fake_agent_turn
+            try:
+                await orch._collab_work_turn(pro)
+            finally:
+                orch._agent_turn = orig
+        # 仅 1 次调用：反思被禁用，草稿原样落库
+        self.assertEqual(calls, 1)
+        self.assertEqual(t["reflections"], 0)
+        self.assertEqual(t["reflection_log"], [])
+        self.assertEqual(t["result_value"], "8.0%")
+
+    async def test_max_passes_zero_skips(self):
+        with patch.object(settings, "REFLECTION_MAX_PASSES", 0):
+            await self._configure()
+            orch, t, pro = self._new_task()
+            orch.round = 1
+            orig = orch._agent_turn
+            calls = 0
+
+            async def fake_agent_turn(agent, user_msg, mode, allow_delegate=True,
+                                      stream=False):
+                nonlocal calls
+                calls += 1
+                self.assertEqual(mode, "collab")
+                return self._work_result(t["id"])
+
+            orch._agent_turn = fake_agent_turn
+            try:
+                await orch._collab_work_turn(pro)
+            finally:
+                orch._agent_turn = orig
+        self.assertEqual(calls, 1)
+        self.assertEqual(t["reflections"], 0)
+        self.assertEqual(t["result_value"], "8.0%")
+
+    async def test_reflection_parse_failure_keeps_draft(self):
+        await self._configure()
+        orch, t, pro = self._new_task()
+        orch.round = 1
+        orig = orch._agent_turn
+        calls = 0
+
+        async def fake_agent_turn(agent, user_msg, mode, allow_delegate=True, stream=False):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return self._work_result(t["id"])
+            # 反思输出无标题 → 解析为空，维持草稿
+            return {"content": "这段输出没有任何 Markdown 标题",
+                    "delegate": [], "report": None, "claim": [],
+                    "streamed": False, "token_cost": 2}
+
+        orch._agent_turn = fake_agent_turn
+        try:
+            q = orchestrator.event_bus.subscribe()
+            await orch._collab_work_turn(pro)
+            events = await self._drain(q)
+        finally:
+            orch.event_bus.unsubscribe(q)
+            orch._agent_turn = orig
+        self.assertEqual(calls, 2)
+        self.assertEqual(t["result_value"], "8.0%")  # 草稿保留
+        self.assertEqual(t["reflections"], 1)
+        self.assertFalse(t["reflection_log"][0]["revised"])
+        # task_revised 事件仍发布，但 revised=False
+        revised = [e for e in events if e["type"] == "task_revised"]
+        self.assertEqual(len(revised), 1)
+        self.assertFalse(revised[0]["revised"])
+
+    async def test_reflection_llm_exception_keeps_draft(self):
+        await self._configure()
+        orch, t, pro = self._new_task()
+        orch.round = 1
+        orig = orch._agent_turn
+        calls = 0
+
+        async def fake_agent_turn(agent, user_msg, mode, allow_delegate=True, stream=False):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return self._work_result(t["id"])
+            raise RuntimeError("LLM 调用失败")
+
+        orch._agent_turn = fake_agent_turn
+        try:
+            q = orchestrator.event_bus.subscribe()
+            await orch._collab_work_turn(pro)  # 不应向上抛异常
+            events = await self._drain(q)
+        finally:
+            orch.event_bus.unsubscribe(q)
+            orch._agent_turn = orig
+        self.assertEqual(calls, 2)
+        self.assertEqual(t["result_value"], "8.0%")  # 草稿降级落库
+        self.assertEqual(t["reflections"], 0)        # 反思未计入
+        self.assertEqual(t["reflection_log"], [])
+        # 反思失败不发布 task_revised
+        self.assertNotIn("task_revised", [e["type"] for e in events])
+
+    async def test_reflection_revision_truncated_to_ceiling(self):
+        # 注意：必须在 configure() 之后、对实际运行的 orch.governor 打 patch——
+        # start() 每次都会重置为全新 FairnessGovernor（orchestrator.py:1191），
+        # 提前 patch 模块级 orchestrator.governor 会被覆盖。
+        await self._configure()
+        orch, t, pro = self._new_task()
+        orch.round = 1
+        orig = orch._agent_turn
+        calls = 0
+        long_revision = "修订后内容" * 100  # 远超 50 字
+
+        async def fake_agent_turn(agent, user_msg, mode, allow_delegate=True,
+                                  stream=False):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return self._work_result(t["id"])
+            return {"content":
+                    f"## 自我反思\n过长\n## 修订后结果\n{long_revision}\n"
+                    "## 修订说明\n内容很长需要截断",
+                    "delegate": [], "report": None, "claim": [],
+                    "streamed": False, "token_cost": 2}
+
+        orch._agent_turn = fake_agent_turn
+        with patch.object(orch.governor, "hard_char_ceiling", 50):
+            try:
+                await orch._collab_work_turn(pro)
+            finally:
+                orch._agent_turn = orig
+        # L1 硬性字符上限截断：修订版长度 ≤ 50
+        self.assertLessEqual(len(t["result_value"]), 50)
+        self.assertEqual(t["reflections"], 1)
 
 
 if __name__ == "__main__":

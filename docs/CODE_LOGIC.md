@@ -432,7 +432,7 @@ while round < max_rounds:
 **论据句抽取 `_extract_argument_sentences(text, max_chars)`（模块级函数，§5.4）**：按 `。！？!?;\n` 切句后，只保留带**序号标记**（首先/其次/最后/第一/1.…）或**论据性关键词**（指出/表明/因为/因此/证据/数据…）的句子（标记 3 分 / 关键词各 1 分，长句同分靠前），无任何命中回退最长句；按分数降序拼接，超出 `max_chars` 整体截断。保证摘要轮辩手仍能看到对方的具体论点，逐条回应而非泛泛反驳。
 
 ### 12.9 任务与变量
-- `_create_task(d)`：**校验 recipient 存在**（P15 修复，非法则忽略并记日志）；生成任务 `{id, task_id(UUID), recipient, content, expected_outcome, var_name, completed, status, rounds_waiting, timestamp(ms), token_cost}`，并在 `shared_context[var_name]` 登记。**双模式状态机**：`recipient` 非空 = 直接分派 → `status="claimed"`；`recipient` 留空 = 放入**共享任务池**（合作模式）→ `status="pending"`，跳过存在性校验，由协作 Agent 主动认领（§12.17）。
+- `_create_task(d)`：**校验 recipient 存在**（P15 修复，非法则忽略并记日志）；生成任务 `{id, task_id(UUID), recipient, content, expected_outcome, var_name, completed, status, rounds_waiting, reflections, reflection_log, timestamp(ms), token_cost}`，并在 `shared_context[var_name]` 登记。`reflections`（已执行反思轮数，初始 0）与 `reflection_log`（反思明细列表，初始 `[]`）为合作模式反思机制（§12.18）的字段。**双模式状态机**：`recipient` 非空 = 直接分派 → `status="claimed"`；`recipient` 留空 = 放入**共享任务池**（合作模式）→ `status="pending"`，跳过存在性校验，由协作 Agent 主动认领（§12.17）。
 - `_apply_claim(collab, args)`（合作模式）：按 `task_id`（兼容数字 `id` 与 UUID `task_id`）在 **pending** 任务中查找，命中则置 `recipient=collab.name`、`status="claimed"`、`rounds_waiting=0` 并发布 `task_claimed` 事件；不存在或已被认领则忽略（事件 `task.claim_ignore`）——认领者独占负责。
 - `_apply_report(task, report)`：回填变量、按 `report["completed"]` 置 `status="completed"`（未完成保持 `claimed`），结果以 `importance=0.85` 写入该 Agent **长期记忆**。
 
@@ -497,11 +497,35 @@ while round < max_rounds:
 
 **合作模式（collaboration）**：
 - **主循环 `_run_collab_loop()`**：每轮 ① 主 Agent 回合（`mode="collaboration"`，指令由 `_collab_main_directive` 生成：第 1 轮拆解整体任务入池、后续轮统筹协调）→ 收到的 `delegate_task`（`recipient` 留空）经 `_create_task` 放入**共享任务池**并发布 `task_assigned`（`to` 为空 = 待认领）；② 各子 Agent 回合 `_collab_work_turn()`；③ **结束判定**：`self.tasks and all(t["completed"] for t in self.tasks)` 即**提前收尾**（防空任务误判），`max_rounds` 兜底。无收敛检测、无立场对抗。
-- **子 Agent 回合 `_collab_work_turn(collab)`**（`mode="collab"`，`_collab_work_prompt` 并列"待办（需 report）"与"可认领（可 claim）"）：一轮单次 LLM 调用，**先解析 `claim`（`_apply_claim`，可多个）再解析 `report`（`_apply_report`）**，支持**同轮认领后立即回报**（report 时若任务仍 `pending`，先补认领再落库）；未回报的任务 `rounds_waiting` 累积，`>=3` 轮强制标记完成（事件 `task.timeout`）。回报路径发布 `task_result`，并把结果写入该 Agent 长期记忆。
+- **子 Agent 回合 `_collab_work_turn(collab)`**（`mode="collab"`，`_collab_work_prompt` 并列"待办（需 report）"与"可认领（可 claim）"）：一轮单次 LLM 调用，**先解析 `claim`（`_apply_claim`，可多个）再解析 `report`**（支持**同轮认领后立即回报**，report 时若任务仍 `pending`，先补认领再落库）；落库前经 `_reflect_report` 做**反思与自我修正**（§12.18），其后发布 `task_result`（若反思有修订再发布 `task_revised`）并把结果写入该 Agent 长期记忆；未回报的任务 `rounds_waiting` 累积，`>=3` 轮强制标记完成（事件 `task.timeout`）。
 - **收尾 `_collab_final_summary()`**：无裁判裁决，主 Agent 输出**三段式** Markdown（`## 核心结论 / ## 子任务与成果 / ## 遗留问题与后续建议`），经 `_normalize_collab_conclusion` 规范并发布 `conclusion` 事件（`judge_ruling=""`、`winner=None`，前端按空值跳过裁决面板）；LLM 汇总失败回退确定性 `_fallback_collab_summary`（按任务记录拼装，注明"未调用主 Agent LLM 汇总"）。
 - **状态机**：`pending`（任务池，`recipient=""`）→ `claimed`（被 `claim_task` 认领，`recipient=认领者`，独占）→ `completed`（`report_result` 回报）。
 - **席位立场弱化**：合作模式无显式立场时主位 `HOST`、其余一律 `NEUTRAL`（§12.2）；`system_prompt` 按 `mode ∈ (collaboration, collab)` 切换到合作式职责描述，并跳过 `_stance_declaration()`。
 - **公平性 L1**：合作模式无 PRO/CON 对称性，`mode ∈ (collaboration, collab)` 一律用 `hard_char_ceiling` 兜底截断（§12.4 步骤 9）。
+
+### 12.18 合作模式反思与自我修正
+
+**定位**：仅 `collaboration/collab` 生效，辩论模式行为不变。子 Agent 在 `report_result` 落库之前增加**一次反思 LLM 调用**，对照任务 `expected_outcome` 自我批判并输出修订版，有修订才落库。
+
+**触发与开关**：
+- `_reflect_report(collab, task, report)`（`_collab_work_turn` 的 report 分支内、`_apply_report` 之前调用）：先检查 `settings.REFLECTION_ENABLED`（默认开）与 `task["reflections"] < settings.REFLECTION_MAX_PASSES`（默认 1）；任一不满足 → 直接返回 `(report, None)`，草稿照常落库。`REFLECTION_MAX_PASSES=0` 时 `reflections(0) < 0` 恒 False，整段跳过。
+
+**反思调用**：
+- 取草稿 `report.get("var_value","") or report.get("message","")`，经 `_reflection_prompt(task, draft)`（模块级纯函数）拼出三段式提示词；
+- 经 `_agent_turn(collab, prompt, mode="collaboration", allow_delegate=False, stream=False)` 调用：**非主 Agent + `"collaboration"`** → 不注入任何工具（§12.4），非流式不产生 speech 气泡，`_apply_usage` 自动计入 spent/output_tokens 遥测，L1 截断自动生效。
+
+**输出解析**：
+- `_parse_reflection(text)`（模块级纯函数）按 `re.match(r"^#{1,2}\s+(.+)$")` 匹配 Markdown 标题，按「自我反思 / 修订后结果 / 修订说明」关键词映射段名，缺段回退空串，返回 `{"reflection", "revision", "explanation"}`。不复用 `_split_sections`（其按标题精确取段、无缺失容错）。
+
+**落库语义**：
+- `revision` 非空 → 经 `self.governor.truncate_output(revision, hard_char_ceiling)` **L1 截断**；`revised = bool(revision) and revision != draft`；
+- 修订时：更新 report 的 `var_value`/`message`、写该 Agent 长期记忆（`importance` 沿用 `_record_memory` 默认）、发布事件 `reflection.revised`；否则事件 `reflection.passed`；
+- 每次成功反思写 `task["reflection_log"].append({pass, summary, revision, revised, timestamp})`，`task["reflections"] += 1`；返回 `(report, meta={"revised","reflections","token_cost"})`。
+
+**降级与事件**：
+- 反思 LLM 异常 / 输出无法解析 → **保留草稿照常落库** + warning 日志（`reflection.fail`），不阻塞任务完成（meta 返回 `None`）；
+- `_collab_work_turn` 在发布 `task_result` 之后、仅当 `reflected is not None` 时发布 **`task_revised`** 事件：`{type, from, var, task_id, value, reflections, revised, timestamp}`；前端仿 `task_result` 消费，展示「反思后已修订落库（第 N 轮）/ 反思后维持草稿（第 N 轮）」并同步 `state.tasks` 与 `state.ctx` 的值。
+- 配置：`REFLECTION_ENABLED` / `REFLECTION_MAX_PASSES`（`app/config.py` 经 `_int` 读取，`.env` 可覆盖，仅整数布尔语义）。
 
 ---
 
