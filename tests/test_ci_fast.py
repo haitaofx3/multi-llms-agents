@@ -19,11 +19,11 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
-from app.config import settings
-from app.fairness import FairnessGovernor
-from app.manager import manager
-from app.memory import MemorySystem
-from app.protocol import Judgment
+from muti_llm_agent.config import settings
+from muti_llm_agent.fairness import FairnessGovernor
+from muti_llm_agent.manager import manager
+from muti_llm_agent.memory import MemorySystem
+from muti_llm_agent.protocol import Judgment
 
 # §1.3 解耦：会话实例统一由 DebateManager 注册表持有，不再导入模块级单例。
 orchestrator = manager.get_or_create("default")
@@ -256,7 +256,7 @@ class FairnessGovernorTest(unittest.IsolatedAsyncioTestCase):
         rep = g.report()
         self.assertEqual(self._layer(rep, "L2")["status"], "warning")
         # 有效回答占比只统计剥离思考后的正文
-        from app.fairness import effective_answer_chars, think_chars
+        from muti_llm_agent.fairness import effective_answer_chars, think_chars
         raw = "<think>很长的推理</think>这是有效论证"
         self.assertEqual(think_chars(raw), len("<think>很长的推理</think>"))
         self.assertEqual(effective_answer_chars(raw), len("这是有效论证"))
@@ -512,7 +512,7 @@ class DebateMechanismTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(prep["round"], 1)
         self.assertEqual(len(prep["text"]), settings.OPPONENT_SNIPPET_MAX_CHARS)
         # 第 3 轮：LLM 摘要（mock summarize_text），并缓存
-        from app import orchestrator as orch_mod
+        from muti_llm_agent import orchestrator as orch_mod
         orchestrator.round = 3
         orchestrator.round_arguments[2] = {con.name: "C" * 1000}
         calls = []
@@ -584,7 +584,7 @@ class DebateMechanismTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_summarize_text_fallback_truncates(self):
         """LLM 摘要失败时确定性头尾截断回退，绝不超过 max_chars。"""
-        from app.llm import summarize_text
+        from muti_llm_agent.llm import summarize_text
         text = "甲乙丙丁" * 200  # 800 字
         s, usage = await summarize_text({}, text, max_chars=100)
         self.assertIsNone(usage)
@@ -680,7 +680,7 @@ class MemorySummarizeTest(unittest.IsolatedAsyncioTestCase):
         orchestrator.spent = 100
         orchestrator.run_stats = {"compressions": 0}
         fake_usage = {"total_tokens": 42}
-        with patch("app.orchestrator.summarize_text",
+        with patch("muti_llm_agent.orchestrator.summarize_text",
                    new=AsyncMock(return_value=("LLM 压缩摘要", fake_usage))):
             await a.memory.summarize_short_to_context(
                 orchestrator._memory_summarizer(a))

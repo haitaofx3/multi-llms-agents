@@ -22,9 +22,9 @@ from unittest.mock import patch
 
 import httpx
 
-from app import main as main_module
-from app.manager import DebateManager
-from app.protocol import Judgment
+from muti_llm_agent import main as main_module
+from muti_llm_agent.manager import DebateManager
+from muti_llm_agent.protocol import Judgment
 
 HOST_CFG = {"name": "主持", "role": "主持", "personality": "",
             "provider": "default", "stance": "HOST"}
@@ -84,7 +84,7 @@ class DebateManagerTest(unittest.IsolatedAsyncioTestCase):
 
         注册表是会话的唯一持有者；模块外直接 new 出来的实例不共享 session_id 身份。
         """
-        from app.orchestrator import Orchestrator
+        from muti_llm_agent.orchestrator import Orchestrator
         mgr = DebateManager()
         orch = Orchestrator(session_id="custom_sid")
         self.assertIsNone(mgr.get("custom_sid"))
@@ -107,16 +107,18 @@ class DebateManagerTest(unittest.IsolatedAsyncioTestCase):
     # ---------------- 元数据持久化 ----------------
 
     def test_meta_path_sanitizes_unsafe_ids(self):
-        from app.manager import _SAFE_SID
-        self.assertTrue(_SAFE_SID.match("abc_123.def-xyz"))
-        self.assertFalse(_SAFE_SID.match("../evil"))
-        self.assertFalse(_SAFE_SID.match("a/b"))
-        self.assertFalse(_SAFE_SID.match("a\\b"))
-        self.assertFalse(_SAFE_SID.match(""))
+        # 清洗逻辑已收敛到 config.safe_path_component（manager / memory 共用）
+        from muti_llm_agent.config import safe_path_component
+        self.assertEqual(safe_path_component("abc_123.def-xyz"), "abc_123.def-xyz")
+        self.assertEqual(safe_path_component("../evil"), "default")
+        self.assertEqual(safe_path_component("a/b"), "default")
+        self.assertEqual(safe_path_component("a\\b"), "default")
+        self.assertEqual(safe_path_component(""), "default")
+        self.assertEqual(safe_path_component(".."), "default")
 
     def test_save_and_load_meta_roundtrip(self):
         with tempfile.TemporaryDirectory() as td:
-            with patch("app.manager.SESSIONS_DIR", Path(td)):
+            with patch("muti_llm_agent.manager.SESSIONS_DIR", Path(td)):
                 mgr = DebateManager()
                 snap = mgr.save_meta(_StubOrch("s1"))
                 self.assertEqual(snap["session_id"], "s1")
@@ -133,7 +135,7 @@ class DebateManagerTest(unittest.IsolatedAsyncioTestCase):
 
     def test_unsafe_session_id_meta_written_to_default(self):
         with tempfile.TemporaryDirectory() as td:
-            with patch("app.manager.SESSIONS_DIR", Path(td)):
+            with patch("muti_llm_agent.manager.SESSIONS_DIR", Path(td)):
                 mgr = DebateManager()
                 snap = mgr.save_meta(_StubOrch("../evil"))
                 self.assertEqual(snap["session_id"], "../evil")
@@ -164,7 +166,7 @@ class DebateManagerTest(unittest.IsolatedAsyncioTestCase):
                             "phase": "finished"}),
                 encoding="utf-8")
             (d / "bad.json").write_text("not json", encoding="utf-8")
-            with patch("app.manager.SESSIONS_DIR", d):
+            with patch("muti_llm_agent.manager.SESSIONS_DIR", d):
                 mgr = DebateManager()
                 marked = mgr.mark_interrupted()
                 names = sorted(m["session_id"] for m in marked)
@@ -186,7 +188,7 @@ class DebateManagerTest(unittest.IsolatedAsyncioTestCase):
                 json.dumps({"session_id": "x", "status": "interrupted",
                             "phase": "idle", "topic": "中断会话"}),
                 encoding="utf-8")
-            with patch("app.manager.SESSIONS_DIR", d):
+            with patch("muti_llm_agent.manager.SESSIONS_DIR", d):
                 mgr = DebateManager()
                 self.assertEqual([m["session_id"] for m in mgr.interrupted_metas()],
                                  ["x"])

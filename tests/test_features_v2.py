@@ -17,12 +17,13 @@ test_features_v2.py — P0/P1 新特性确定性测试（无需真实 LLM）
 import asyncio
 import re
 import unittest
+from typing import ClassVar
 from unittest.mock import patch
 
-from app.config import settings
-from app.manager import manager
-from app.orchestrator import _estimate_cost_rmb, _extract_argument_sentences, _text_similarity
-from app.protocol import Judgment
+from muti_llm_agent.config import settings
+from muti_llm_agent.manager import manager
+from muti_llm_agent.orchestrator import _estimate_cost_rmb, _extract_argument_sentences, _text_similarity
+from muti_llm_agent.protocol import Judgment
 
 # §1.3 解耦：会话实例统一由 DebateManager 注册表持有，不再导入模块级单例。
 orchestrator = manager.get_or_create("default")
@@ -154,7 +155,7 @@ class ConvergenceFallbackTest(unittest.IsolatedAsyncioTestCase):
         orch.round_arguments[1] = {"正方": "应该赋予机器人权利"}
         orch.round_arguments[2] = {"反方": "应该赋予机器人权利"}
         orch.round_evidence = {}
-        with patch("app.embeddings.is_fallback", return_value=True):
+        with patch("muti_llm_agent.embeddings.is_fallback", return_value=True):
             triggered = await orch._check_convergence()
         self.assertEqual(orch.convergence_mode, "text-similarity")
         self.assertEqual(orch.convergence_streak, 1)
@@ -169,7 +170,7 @@ class ConvergenceFallbackTest(unittest.IsolatedAsyncioTestCase):
         orch.round_arguments[2] = {"正方": "应该赋予机器人权利"}
         orch.round_arguments[3] = {"反方": "应该赋予机器人权利"}
         orch.round_evidence = {}
-        with patch("app.embeddings.is_fallback", return_value=True):
+        with patch("muti_llm_agent.embeddings.is_fallback", return_value=True):
             triggered = await orch._check_convergence()
         self.assertTrue(triggered)
         self.assertEqual(orch.convergence_streak, settings.CONVERGENCE_ROUNDS)
@@ -184,7 +185,7 @@ class ConvergenceFallbackTest(unittest.IsolatedAsyncioTestCase):
         orch.round_arguments[2] = {"反方": "应该赋予机器人权利"}
         # 本轮 RAG 返回了新证据 → 不视为无效循环
         orch.round_evidence = {2: {"default": ["新证据"]}}
-        with patch("app.embeddings.is_fallback", return_value=True):
+        with patch("muti_llm_agent.embeddings.is_fallback", return_value=True):
             triggered = await orch._check_convergence()
         self.assertFalse(triggered)
         self.assertEqual(orch.convergence_streak, 0)
@@ -497,7 +498,7 @@ class TaskDebateSeparationTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_round3_opponent_prep_includes_argument_snippets(self):
         q = await self._configure()
-        import app.orchestrator as orch_mod
+        import muti_llm_agent.orchestrator as orch_mod
         pro = self._collab("PRO")
         con = self._collab("CON")
         orch = orchestrator
@@ -534,7 +535,7 @@ class CollaborationModeTest(unittest.IsolatedAsyncioTestCase):
       主 Agent 见 delegate_task。
     """
     # 不带显式立场：验证合作模式自动弱化为 NEUTRAL
-    NO_STANCE_CFG = [
+    NO_STANCE_CFG: ClassVar[list] = [
         {"name": "统筹", "role": "统筹", "personality": "", "provider": "default"},
         {"name": "助手A", "role": "执行", "personality": "", "provider": "default"},
         {"name": "助手B", "role": "执行", "personality": "", "provider": "default"},
@@ -738,7 +739,7 @@ class ReflectionTest(unittest.IsolatedAsyncioTestCase):
     - 反思输出无法解析 / LLM 异常时保留当前最佳草稿降级落库（不阻塞任务）；
     - 修订版同样受 L1 硬性字符上限截断。
     """
-    CFG = [
+    CFG: ClassVar[list] = [
         {"name": "统筹", "role": "统筹", "personality": "", "provider": "default"},
         {"name": "助手A", "role": "执行", "personality": "", "provider": "default"},
     ]

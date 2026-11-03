@@ -1,0 +1,246 @@
+/* studio.css — 多模型协同工作台的新增 UI 样式
+ *
+ * 只承载「协同配方 / 中途纠偏 / 运行摘要 / 补充材料续轮」四块新增界面，
+ * 与既有 style.css 解耦：这样后续调新增模块的视觉不会牵动原有圆桌页面。
+ */
+
+/* ---------------- 协同配方 ---------------- */
+.recipe-box {
+  margin-top: 16px;
+  padding-top: 14px;
+  border-top: 1px dashed #d7dde3;
+}
+.recipe-box h3 {
+  font-size: 14px;
+  margin: 0;
+  color: #2b6cb0;
+}
+.recipe-box .row {
+  gap: 8px;
+}
+#recipe-select {
+  flex: 1;
+  min-width: 220px;
+}
+#recipe-hint {
+  font-size: 12px;
+}
+.roster-box {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 10px;
+}
+.roster-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 9px;
+  border-radius: 12px;
+  font-size: 12px;
+  background: #eef2f7;
+  color: #44505c;
+  border: 1px solid #dfe6ee;
+}
+.roster-chip.on {
+  background: #e8f5ec;
+  border-color: #bfe3c9;
+  color: #1f6b39;
+}
+.roster-chip.off {
+  opacity: 0.55;
+  text-decoration: line-through;
+}
+.roster-chip.warn {
+  background: #fdecec;
+  border-color: #f5c2c0;
+  color: #b42318;
+}
+.roster-chip .dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #9aa7b4;
+}
+.roster-chip.on .dot {
+  background: #2f9e56;
+}
+.roster-chip.warn .dot {
+  background: #d64541;
+}
+
+/* ---------------- 中途注入纠偏 ---------------- */
+.steer-box .row {
+  gap: 6px;
+}
+.steer-box select,
+.steer-box textarea {
+  font-size: 12.5px;
+}
+.steer-box textarea {
+  width: 100%;
+  margin: 8px 0;
+  resize: vertical;
+  border: 1px solid #d7dde3;
+  border-radius: 8px;
+  padding: 8px 10px;
+  font-family: inherit;
+}
+.steer-box .inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  color: #5b6672;
+}
+.badge {
+  display: inline-block;
+  min-width: 18px;
+  padding: 0 5px;
+  margin-left: 6px;
+  border-radius: 9px;
+  background: #f0a35e;
+  color: #fff;
+  font-size: 11px;
+  text-align: center;
+  line-height: 17px;
+}
+.steer-list {
+  margin-top: 8px;
+  max-height: 168px;
+  overflow: auto;
+  font-size: 12px;
+}
+.steer-item {
+  padding: 6px 8px;
+  margin-bottom: 5px;
+  border-left: 3px solid #9aa7b4;
+  background: #f7f9fb;
+  border-radius: 0 6px 6px 0;
+  line-height: 1.5;
+}
+.steer-item .meta {
+  color: #7b8794;
+  font-size: 11px;
+}
+.steer-item.applied {
+  border-left-color: #2f9e56;
+}
+.steer-item.pending {
+  border-left-color: #e0a13c;
+}
+.steer-item.cancelled {
+  border-left-color: #c9d1d9;
+  opacity: 0.6;
+}
+.steer-item .kind {
+  font-weight: 600;
+  margin-right: 5px;
+}
+
+/* ---------------- 运行摘要 ---------------- */
+#summary-panel .sum-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 2px 0;
+}
+#summary-panel .sum-k {
+  color: #7b8794;
+}
+#summary-panel .sum-v {
+  color: #1f2933;
+  font-weight: 500;
+  text-align: right;
+  word-break: break-all;
+}
+#summary-panel .sum-hl {
+  margin: 6px 0 0;
+  padding-left: 16px;
+  color: #44505c;
+}
+#summary-panel .sum-hl li {
+  margin: 1px 0;
+}
+#summary-panel .sum-model {
+  display: flex;
+  justify-content: space-between;
+  font-size: 12px;
+  padding: 2px 0;
+  border-bottom: 1px dotted #eef1f4;
+}
+.mini-btn {
+  float: right;
+  font-size: 11px;
+  padding: 1px 7px;
+  border: 1px solid #d7dde3;
+  border-radius: 6px;
+  background: #fff;
+  color: #5b6672;
+  cursor: pointer;
+}
+.mini-btn:hover {
+  border-color: #2b6cb0;
+  color: #2b6cb0;
+}
+
+/* ---------------- 补充材料续轮 ---------------- */
+.followup-panel {
+  margin: 10px 0 0;
+  padding: 16px 18px;
+  background: #fff;
+  border: 1px solid #dfe6ee;
+  border-radius: 12px;
+  box-shadow: 0 2px 10px rgba(31, 41, 51, 0.06);
+}
+.followup-panel.hidden {
+  display: none;
+}
+.followup-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-weight: 600;
+  color: #2b6cb0;
+  margin-bottom: 10px;
+}
+.followup-panel textarea {
+  width: 100%;
+  resize: vertical;
+  border: 1px solid #d7dde3;
+  border-radius: 8px;
+  padding: 9px 11px;
+  font-family: inherit;
+  font-size: 13px;
+}
+.followup-panel .row {
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 8px;
+}
+.followup-panel input[type="text"],
+.followup-panel input:not([type]) {
+  flex: 1;
+  min-width: 200px;
+  border: 1px solid #d7dde3;
+  border-radius: 8px;
+  padding: 6px 10px;
+}
+#followup-rounds {
+  width: 68px;
+}
+#followup-hint {
+  display: block;
+  margin-top: 8px;
+  color: #2f9e56;
+}
+#followup-hint.error {
+  color: #c0392b;
+}
+
+/* ---------------- 顶栏链接 ---------------- */
+.topbar-right a.ghost-btn {
+  text-decoration: none;
+  display: inline-flex;
+  align-items: center;
+}

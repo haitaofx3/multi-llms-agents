@@ -1,7 +1,7 @@
 """
 eval_baseline.py — 讨论质量基线评估脚本（P0-2）
 
-对一场导出的讨论 Markdown（app/orchestrator.export_markdown 的输出格式）进行
+对一场导出的讨论 Markdown（muti_llm_agent/orchestrator.export_markdown 的输出格式）进行
 **可复现的质量评估**，输出多维质量报告（0-100），并可与历史基线 JSON 对比，
 用于回归测试：代码或提示词改动后，质量是否退化一测便知。
 

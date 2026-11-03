@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>接口控制台 · muti_llm_agent</title>
+  <link rel="stylesheet" href="/static/console.css" />
+</head>
+<body class="logs-open">
+  <div class="app">
+    <!-- ============ 顶部环境栏（固定） ============ -->
+    <header class="envbar">
+      <div class="brand">
+        <h1 class="brand-title">接口控制台</h1>
+        <span class="brand-sub">muti_llm_agent · 接口级调试</span>
+      </div>
+
+      <label class="env-field" for="c-session" title="会话隔离标识，会自动写入 localStorage（debate.session_id）">
+        <span>session_id</span>
+        <input id="c-session" type="text" autocomplete="off" spellcheck="false" placeholder="default" />
+      </label>
+
+      <label class="env-field" for="c-token" title="访问令牌，所有请求自动附加 Authorization: Bearer（debate.auth_token）">
+        <span>token</span>
+        <input id="c-token" type="password" autocomplete="off" spellcheck="false" placeholder="可选 · Bearer" />
+      </label>
+
+      <div class="env-actions">
+        <button id="c-refresh" type="button">刷新接口清单</button>
+        <button id="c-smoke" type="button">一键冒烟</button>
+        <button id="c-openapi" type="button">载入 openapi</button>
+      </div>
+
+      <div class="env-status">
+        <span class="stat"><b id="c-ep-count">—</b> 个接口</span>
+        <span class="stat status-line" role="status" aria-live="polite">
+          <i id="c-status-dot" class="dot idle"></i>
+          <span id="c-status-text">检测中…</span>
+        </span>
+      </div>
+    </header>
+
+    <div class="layout">
+      <!-- ============ 左侧模块导航 ============ -->
+      <aside class="col col-nav">
+        <section class="card nav-card">
+          <div class="card-head">
+            <h2>模块导航</h2>
+            <span id="c-mod-count" class="muted"></span>
+          </div>
+
+          <div class="search-wrap">
+            <input id="c-search" type="search" autocomplete="off" spellcheck="false"
+                   placeholder="搜索 path / summary…" aria-label="搜索接口" />
+          </div>
+
+          <nav id="c-modules" class="mod-list" aria-label="接口模块">
+            <div class="muted pad">尚未加载接口</div>
+          </nav>
+
+          <details class="side-box" id="c-history-box" open>
+            <summary>调用历史 <span id="c-history-count" class="count">0</span></summary>
+            <div id="c-history" class="history-list">
+              <div class="muted pad">暂无记录</div>
+            </div>
+          </details>
+
+          <div class="nav-foot">
+            <a href="/" class="back-link">← 返回圆桌 UI</a>
+          </div>
+        </section>
+      </aside>
+
+      <!-- ============ 中间接口列表 ============ -->
+      <main class="col col-main">
+        <section id="c-smoke-panel" class="card smoke-panel hidden" aria-live="polite"></section>
+
+        <section id="c-integrations-panel" class="card integrations-panel hidden"></section>
+
+        <section class="card list-card">
+          <div class="card-head">
+            <h2>接口清单</h2>
+            <span id="c-list-count" class="muted"></span>
+            <span class="head-actions">
+              <button id="c-integrations-btn" type="button" class="ghost-btn small">集成状态</button>
+              <button id="c-manual" type="button" class="ghost-btn small">＋ 手动调用</button>
+            </span>
+          </div>
+
+          <div id="c-alert" class="alert hidden" role="alert"></div>
+
+          <ul id="c-endpoints" class="ep-list" aria-label="接口列表">
+            <li class="muted pad">正在加载接口清单…</li>
+          </ul>
+        </section>
+      </main>
+
+      <!-- ============ 右侧调用面板 ============ -->
+      <aside class="col col-side">
+        <section id="c-panel" class="card panel-card" aria-label="接口调用面板">
+          <div class="empty-state">
+            <div class="empty-title">选择一个接口开始调试</div>
+            <p>从中间列表点击任意接口，或使用「＋ 手动调用」手填 Path 调用后端。</p>
+            <p class="hint">接口清单来自 <code>GET /api/dev/endpoints</code>，请求经由 <code>POST /api/dev/invoke</code> 转发。</p>
+          </div>
+        </section>
+      </aside>
+    </div>
+  </div>
+
+  <!-- ============ 底部日志面板（可折叠） ============ -->
+  <section class="logdock" id="c-logdock" aria-label="日志面板">
+    <header class="logdock-head">
+      <button id="c-log-toggle" type="button" class="toggle-btn" aria-expanded="true"
+              aria-label="展开 / 收起日志" title="展开 / 收起日志">▾</button>
+      <strong class="logdock-title">日志</strong>
+      <span id="c-log-count" class="muted">0 条</span>
+      <span id="c-log-hint" class="log-live muted" role="status" aria-live="polite"></span>
+      <div class="log-actions">
+        <label class="log-field" for="c-log-level">
+          <span>级别</span>
+          <select id="c-log-level">
+            <option value="">全部</option>
+            <option value="error">error</option>
+            <option value="warning">warning</option>
+            <option value="info">info</option>
+          </select>
+        </label>
+        <input id="c-log-trace" class="log-trace" type="text" autocomplete="off" spellcheck="false"
+               placeholder="trace_id（可选）" aria-label="按 trace_id 拉取日志" />
+        <button id="c-log-pull" type="button">拉取服务端日志</button>
+        <button id="c-log-pause" type="button">暂停</button>
+        <button id="c-log-clear" type="button" class="ghost-btn">清空</button>
+      </div>
+    </header>
+    <div id="c-logbody" class="logdock-body">
+      <div class="muted pad log-empty">暂无日志</div>
+    </div>
+  </section>
+
+  <noscript>
+    <div class="noscript">接口控制台需要启用 JavaScript 才能工作。</div>
+  </noscript>
+
+  <script src="/static/console.js" defer></script>
+</body>
+</html>

@@ -4,3 +4,5 @@ __pycache__/
 data/
 .idea/
 .ci_venv/
+# 本地跑服务时的 stdout 重定向（含结构化日志，属运行产物）
+server-*.log

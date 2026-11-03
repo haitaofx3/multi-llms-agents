@@ -1,268 +1,318 @@
-# 多 Agent 圆桌辩论系统
+# muti_llm_agent · 多模型协同工作台
 
-一个支持多个 LLM Agent 围绕"圆桌"进行**辩论式多轮协作讨论**的 Web 项目。
+**一句话定位**：一个人用的多模型协同工作台 —— 你出题、定方向、做判断，DeepSeek / Qwen / MiMo 等**真实不同的模型**按「规划 · 研究 · 撰写 · 审核」分工推进；你可以在运行**中途纠偏**，结束后**补材料续轮**，最后把整场运行导出成可复盘的材料。
 
-- **统一架构**：所有 Agent 共享同一套框架——相同的记忆系统（短期/长期/情境 + 遗忘机制）、共享同一个向量知识库。
-- **独立模型**：每个 Agent 可单独挂载不同的基础模型（DeepSeek / Qwen / MiMo / 自定义，默认取 `.env` 的 `LLM_*` 配置，当前为 MiMo）。除基础模型外架构完全一致，便于观察 Agent 对话逻辑、对比不同基础模型的辩论能力。
-- **主持人机制**：首个 Agent 担任辩论主持人，负责任务分派与多轮追问；其余 Agent 立论、辩护、交锋并回报结果；达到最大轮次后由主持人综合总结。
-- **流式输出**：所有发言以 token 增量实时推送到界面，覆盖普通发言与任务协作模式，显著降低首字等待时间。
+## 与旧项目的关系：迁移 + 转型
 
-## 功能特性
+本次不是「给旧系统加功能」，而是**迁移 + 转型**：
 
-1. **环境变量**：读取 `.env`（内置健壮解析器，兼容不规范写法）。
-2. **多 Agent 对话**：支持 2–6 个 Agent 同时对话，每个 Agent 独立绑定基础模型。
-3. **共享向量库 + 记忆系统**：所有 Agent 共享同一向量知识库（Qdrant，不可用时降级为内存库）；每个 Agent 拥有短期 / 长期 / 情境三类记忆，支持互相转化与可配置的遗忘机制。
-4. **记忆向量检索（混合召回）**：记忆检索采用向量语义检索，综合 **语义余弦相似度（50%）+ 关键词命中覆盖率（30%）+ 有效重要度（20%）** 加权排序；内置中文友好的分词器（ASCII 词 + 中文单字），无需外部分词依赖。
-5. **结构化日志治理**：统一 JSON 结构化日志（`app/logger.py`），支持 `trace_id` 全链路追踪、按事件类型（`embeddings.fallback` / `vector_store.fallback` / `judge.result` 等）归类；前端实时接收 `{"type":"log"}` 事件，Markdown 导出包含 `## 运行摘要` 统计段。
-6. **任务协作分配**：首个 Agent 为主 Agent（主持人），只做任务分派（内容 + 期望效果）；协作 Agent 只回报最终结果与是否完成，不反馈中间过程；任务模式同样流式输出。
-7. **MCP 工具对象**：每个 Agent 拥有自己的 MCP 注册表，可"搜索工具"完成检索 / 联网 / 记忆回忆。
-8. **上下文变量**：主 Agent 分派时提供"任务接收方变量"，协作 Agent 回填后反馈给分派方。
-9. **多轮辩论**：轮次未达上限时持续多轮，主持人逐轮抛出质疑、要求论据、指出分歧，协作 Agent 辩护 / 反驳。
-10. **角色 / 性格约束**：对话严格遵循用户设定的角色与性格，未填写则按"机器人"角色带入。
-11. **流式输出**：发言实时流式推送，剥离 `<think>` 思考片段，结束以完整文本收尾。
-12. **上下文压缩与长对话管理**：当历史上下文超过阈值时自动调用 LLM 摘要压缩（不可用时回退确定性裁剪），保留最近轮次原文，压缩摘要注入系统提示，防止长对话上下文溢出。
-13. **圆桌 UI（简约大气）**：席位按数量等分，可配置角色 / 性格 / 立场、发布讨论、暂停 / 继续 / 结束；界面采用低饱和深色 + 暖金点缀的克制设计语言，避免"AI 感"。
-14. **聊天气泡式发言**：每次发言以独立气泡弹出（带弹出动画），只展示当前发言内容，不拼接历史；并发流式时多个 Agent 各自独立气泡同时滚动。
-15. **首字母文字头像**：Agent 头像按立场配色（主持人暖金、正方鼠尾草绿、反方灰玫瑰、中立石板蓝），不依赖 emoji，降低"AI 味"。
-16. **历史讨论记忆检索**：每场讨论的题目 + 元信息自动记忆化保存至 `data/discussions/index.json`（按 filename 去重，保留最近 200 条）；前端提供历史面板，支持关键词搜索题目 / trace_id、查看完整 Markdown 与一键下载。
-17. **默认仅本地访问**：`start.py` 默认绑定 `127.0.0.1`，避免远端暴露 / 长期挂载；需要局域网访问时用 `HOST=0.0.0.0` 显式覆盖。
-18. **文件上传解析**：共享知识库支持直接上传文档（`txt/md/csv/log`、`docx`、`xlsx`、`pdf`、图片 OCR），后端解析文本后按段注入共享向量库，方便把本地资料作为全体 Agent 的知识背景。
-19. **裁判纯内容判定**：辩论结束后独立裁判对**每位辩手**分别按四维（逻辑 / 证据 / 反驳 / 清晰度）打分；全局综合得分 `scores` 由后端按各辩手分数逐维取均值**确定性计算**（避免"综合得分照抄某辩手分数"），**胜方仅由内容四维均分决定**（内容并列最高取 DRAW，**纯内容判定**）；系统同时实测各辩手流式发言的 **TTFT 与生成速率**产出模型质量分，与内容分合成综合评分（权重经 `.env` 可调）**仅作展示、不参与胜负**。评分范围仅限两位辩手，主持人发言不参与评分。
-20. **REST 请求体校验**：所有写接口（`configure` / `start` / `ingest` / `save_markdown`）改用 pydantic 请求体模型（`app/schemas.py`），类型 / 形状非法时 FastAPI 返回 `422`；业务语义校验（Agent 数量、讨论状态冲突等）保留在各端点内，维持前端依赖的既有 `{ok, error}` `400` 契约，并自动生成 OpenAPI 文档。
-21. **导出与落盘安全加固**：`save_markdown` 文件名经 `Path(fname).name` 清洗（只保留 basename、强制 `.md`、空名回退自动时间戳），彻底防路径穿越；讨论完成自动落盘失败不再静默吞掉，改为结构化日志 + 幂等重试（1, 2 次）。
-22. **工程化与质量门禁**：`pyproject.toml` 统一 ruff / mypy / coverage 配置；`requirements-dev.txt` 提供开发依赖；新增 `tests/test_api_flow.py` 接口级测试（`httpx.ASGITransport` 直接驱动应用 + LLM 调用点打桩），无需服务器 / 真实模型即可在 CI 全量覆盖 HTTP 链路，与 `test_ci_fast` 一并构成快速回归门禁。
-23. **公平性治理（FairnessGovernor L1–L6）**：以「字符数 + 相对比例」为跨模型公平的度量单位（Token 数非跨模型公平度量），替代旧的全局 Token 预算总控——L1 输出上限（相对对手近 N 轮有效输出均值 × 比例 + 硬性字符安全上限，超限事后截断）、L2 有效回答比例（剥离 `<think>` 统计）、L3 输入对称性（双方可见对手轮数一致）、L4 轮次对称性（每模型每轮至多一次发言）、L5 采样参数对齐（辩论/裁判统一 temperature / top_p）、L6 长度中性评审（裁判不以长度论优劣）。详见 `app/fairness.py`。
-24. **实时状态面板（遥测 + 公平性）**：讨论页侧栏实时展示运行时长（`elapsed_time_ms`）、Token 用量（累计 `spent_tokens` / 输出 `output_tokens`，**只读遥测**，不做任何约束）与公平性治理报告（L1–L6 各层状态 + 截断/思考占比/可见轮数等指标）；前端每秒轮询 + `status_sync` 事件推送。
-25. **对手定向反驳（辩论机制）**：第 1 轮基于角色/性格立论；第 2 轮引用**对手上轮发言原文**（截断至 `OPPONENT_SNIPPET_MAX_CHARS` 字）逐条反驳；第 3 轮起引用对手上轮发言的 **LLM 摘要**（`OPPONENT_SUMMARY_MAX_CHARS` 字，按 `(对手,轮次)` 缓存防重复调用，usage 计入只读遥测）——PRO↔CON 互为对手，NEUTRAL/HOST 无固定对手时回退「上一发言人」逻辑。第 3 轮起额外抽取对手发言中的**关键论据句**（`OPPONENT_ARGUMENT_SNIPPET_MAX_CHARS` 字，`_extract_argument_sentences` 按序号/论据关键词启发式，§5.4）随摘要一起注入 prompt，并要求「逐条回应，不要遗漏」——弥补 LLM 摘要丢失具体论点导致的泛泛反驳。
-26. **输出字数约束（需求 5，公平性 L1）**：每轮发言受 `FairnessGovernor.ceiling_for` 字符上限约束（立论/无参照时 `FAIR_OPENING_CHAR_LIMIT`，否则相对对手近 N 轮有效输出均值 × `FAIR_OUTPUT_RATIO`，再与硬上限 `FAIR_HARD_CHAR_CEILING` 取 min）——提示词显式给出字数要求，LLM 仍超长时按字符硬截断兜底（`fairness.output_truncate` 告警）；不再把 `max_tokens` 下发给 API。
-27. **按轮历史强压缩（长对话管理）**：`compress_history(keep_rounds=N)` 支持只保留最近 N 个不同轮次的原文、更早轮次经 LLM 摘要压入 `compressed_summary`（由系统提示注入）；`history` 与 `history_rounds` 平行维护、三处裁剪同步。轮次边界由 `_memory_housekeeping` 调用默认 A9 压缩（`CONTEXT_COMPRESS_THRESHOLD` 触发），保持长对话输入成本可控。
-28. **记忆 LLM 摘要压缩**：记忆管家偶数轮把短期记忆聚合为一条情境记忆时，调用 `summarize_text` 生成 LLM 摘要（上限 `MEMORY_SUMMARY_MAX_CHARS` 字，usage 计入只读遥测；LLM 失败回退确定性拼接），替代原来的简单 `"近期要点："` 拼接，情境记忆更精炼、可检索性更好。
-29. **多会话隔离（P1-7）**：`app/manager.py` 的 `DebateManager` 按 `session_id` 管理**独立 Orchestrator 实例**，不同浏览器 / 客户端互不干扰；前端每个浏览器在 `localStorage` 持久化一个稳定 `session_id`；会话元数据落盘 `data/sessions/{sid}.json`，进程重启后把遗留 `running/paused` 会话标记为 `interrupted` 并在前端展示「上次讨论中断」横幅。会话实例统一经 `get_or_create(session_id)` 惰性创建并持有（§1.3 解耦：已移除模块级 `orchestrator` 单例与 `register()` 双入口）。
-30. **工具调用可视化（P1-4）**：流式通道新增 `tool_call_start` / `tool_call_args` 事件，前端发言气泡内实时显示"正在调用工具 X…"；`_agent_turn` 自动去重（流式已发出的工具开始事件不再重复发），纯工具回合补发 `speech_start`/`speech_end` 保证气泡不悬空——消除工具调用的"黑盒等待"。
-31. **结构化结论（P0-1）**：讨论结束的最终报告固定**四段式**——「核心结论 / 各方立场与论点摘要 / 裁判裁决 / 分歧与待办」；模型输出的裁决段被权威数据（`_judge_ruling_text`）**确定性重写**，其余段缺失时确定性补齐；前端「核心结论」面板实时展示 `conclusion` 事件。
-32. **费用估算展示（P1-6）**：按 token 遥测估算本场费用并展示为**人民币 ¥**（`_estimate_cost_rmb`：输入 = 累计 − 输出，单价 `COST_INPUT_PER_1M`（默认 ¥2） / `COST_OUTPUT_PER_1M`（默认 ¥8）每百万 token，可按供应商在 `.env` 覆盖）；作为**只读遥测**随 `speech_end` / `status_sync` / `/api/status` / 导出文档展示，不参与任何约束。
-33. **收敛检测降级回退（P0-3）**：语义嵌入不可用（`is_fallback()`，如离线哈希向量模式）时，收敛检测自动切换到**文本相似度**（difflib `SequenceMatcher`，阈值 `CONVERGENCE_TEXT_SIMILARITY` 默认 0.6），连续 `CONVERGENCE_ROUNDS` 轮高度相似且无新证据即提前结束——嵌入缺失不再让"收敛提前终止"失效。`CONVERGENCE_PER_SPEAKER`（默认开）启用时按**连续两轮都有发言的共同辩手逐人计算相似度再取平均**（§5.7），避免拼接全文时单一长文本主导而误判收敛。
-34. **讨论模板持久化（P1-5）**：前端支持把当前席位配置保存为模板（`localStorage`，`debate.templates.v1`），一键载入 / 删除，重复配置零成本。
-35. **质量基线评估脚本（P0-2）**：`scripts/eval_baseline.py` 对一场导出的讨论 Markdown 做**五维质量评分**（结构 0.20 / 完成度 0.25 / 参与度 0.25 / 公平性 0.20 / 效率 0.10，0–100 分），可与历史基线 JSON 对比，发现质量退化时以退出码 2 报回归——改 prompt / 换模型后的质量是否退化"一测便知"。
-36. **任务与辩论回合分离（§5.8）**：协作 Agent 每轮拆为两个独立回合——`_task_turn`（只处理待办任务，结果回填 `shared_context` 并发布 `task_result`，**不写 `round_arguments` / 记忆**）与 `_debate_turn`（专职立论 / 反驳，正常记录发言）。任务输出不再污染收敛检测、RAG 事实核查与对手上下文，也避免任务细节泄露到辩论发言中。
-37. **RAG 证据按立场分桶（§5.3）**：每轮事实核查把证据按发言人立场分组存放（`round_evidence[round] = {stance: [...]}`），下一轮注入时 `_evidence_for_round(round, stance)` 只取**与本人立场对应**的证据桶（无立场 / 空桶回退默认桶）——辩手不会被对手立场的核查结果干扰。
-38. **双模式：辩论 / 合作（§12.17）**：同一编排器支持两种讨论模式（前端模式选择器 / `/api/configure` 的 `mode` 字段 / `.env` 的 `DISCUSSION_MODE` 兜底，默认 `debate`）。**辩论模式（debate）**为原主流程（主 Agent 主持、任务分派 + 辩论交锋、裁判四维裁决）；**合作模式（collaboration）**下主 Agent 用 `delegate_task` 把整体任务**拆分为子任务放入共享任务池**（`recipient` 留空），子 Agent 用 `claim_task` **主动认领（独占负责）**、完成后用 `report_result` 回报；**所有任务 `completed` 即提前收尾**（`max_rounds` 兜底），无裁判裁决，最终由主 Agent 输出三段式汇总（`## 核心结论 / ## 子任务与成果 / ## 遗留问题与后续建议`）。合作模式席位立场弱化：主位 HOST、其余一律 NEUTRAL，不参与对抗逻辑。
-39. **合作模式反思与自我修正（§12.18）**：仅 `collaboration` 模式生效。子 Agent 用 `report_result` 回报前，会做**至多 N 轮反思 LLM 调用**对照任务的 `expected_outcome` 自我批判（输出 `## 自我反思 / ## 修订后结果 / ## 修订说明` 三段），每轮把上一轮修订版作为新草稿继续自评，直到达到轮数上限或**收敛（无修订 / 修订无变化）提前终止**；有修订才落库，并发布 `task_revised` 事件（前端实时标注「反思后已修订落库 / 维持草稿」）；反思调用不计入工具、不产生气泡，token 计入遥测。开关 `REFLECTION_ENABLED`（默认开）+ 单任务反思轮数上限 `REFLECTION_MAX_PASSES`（默认 2）双控；任一反思调用异常 / 输出无法解析时**保留当前最佳草稿照常落库**，不阻塞任务完成。修订版同样受 L1 硬性字符上限截断。
+| | 旧项目（`mini_test`，包名 `app`） | 本项目（`Muti_LLM_Agent`，包名 `muti_llm_agent`） |
+| --- | --- | --- |
+| 定位 | 单模型扮多角色的**圆桌辩论演示** | 单用户个人级的**真实多模型协同工作台** |
+| 模型 | 一个模型扮演正方 / 反方 / 主持人 / 裁判 | 不同供应商的模型各干擅长的活（也可切回辩论模式） |
+| 运行期干预 | 只能暂停 / 继续 / 结束 | 中途注入纠偏指令；结束后补材料续轮 |
+| 接口 | 15 个（14 HTTP + 1 WebSocket），全部挤在 `main.py` | 49 个，按 7 个模块拆到 `api/router_*.py` |
+| 可观测性 | `trace_id` + 散落的 print 日志 | 结构化 JSON 日志（三条出口）+ 运行事件日志 + 运行摘要 + 复盘导出 |
+| 对外集成 | 无 | 飞书入站 / 出站、DSH 工具调用、通用 webhook、SSE |
+
+辩论能力没丢：`MODE=debate` 仍是原来的圆桌辩论 + 独立裁判；`MODE=collaboration` 是本项目的主用法。迁移细节（包名批量替换、pyproject / CI / start.py、以及三个测试的 patch 目标为什么变了）见 [docs/MIGRATION.md](docs/MIGRATION.md)；49 个接口的完整参考见 [docs/API.md](docs/API.md)。
+
+## 快速开始
+
+```powershell
+# 1) 环境（本机固定用 agent_env，Python 3.10）
+conda activate agent_env
+pip install -r requirements.txt          # 首次；质量工具另装 requirements-dev.txt
+
+# 2) 配置：项目根目录 .env（已存在，不要提交）
+#    最少要填 LLM_MODEL_ID / LLM_API_KEY / LLM_BASE_URL；
+#    想真正「多模型」，再把 QWEN_* / DEEPSEEK_* / MIMO_* 三组 Key 填上
+
+# 3) 启动
+python start.py                          # 默认 http://127.0.0.1:8000
+```
+
+三个入口（均已在运行中的实例上实测返回 200）：
+
+| 入口 | 用途 |
+| --- | --- |
+| `/` | 圆桌 UI（WebSocket 实时流式 + 协同配方 / 中途纠偏 / 运行摘要 / 补充材料续轮面板） |
+| `/console` | 接口控制台（49 个接口按模块自动生成表单，可一键冒烟） |
+| `/docs` | FastAPI 自动生成的 OpenAPI 文档 |
+
+- **端口与绑定**：`start.py` 读环境变量 `HOST`（默认 `127.0.0.1`）与 `PORT`（默认 `8000`）。例：`$env:PORT=8123; python start.py`。默认只绑回环。
+- **健康检查**：`GET /healthz` → `{"ok":true,"service":"muti_llm_agent","workspace":...,"sessions":N,"auth_required":false}`。
+- **一旦对外暴露**（`HOST=0.0.0.0`）：**必须**在 `.env` 设置 `AUTH_TOKEN`，否则任何能访问该端口的人都能改写配置、发起消耗真实模型额度的运行。注意白名单只有 `/`、`/favicon.ico`、`/console`、`/static/*`——设了 `AUTH_TOKEN` 之后，`/healthz`、`/docs`、`/openapi.json` **也要带令牌**，探活脚本要相应加 `Authorization: Bearer`（或 `?token=`）。
+- `start.py` 关掉了 uvicorn 访问日志（`access_log=False`）：本项目自己输出带 `trace_id` 的 JSON 日志，两套日志并存反而难对齐。
+
+## 六项能力现状
+
+### 1. 单用户个人级 + 多模型协同
+
+**做了什么**：把「模型」当可编排资源列出来（花名册），把「谁干什么」固化成 5 个可直接套用的配方；配方写的是**供应商意图**，下发时按你当前配好的 Key 自动改派。
+
+**在哪个文件**：`muti_llm_agent/models_registry.py`（`PROVIDER_LABELS` / `provider_status()` / `roster()` / `RECIPES` / `build_agent_configs()`）。
+
+**怎么用**：
+
+- `GET /api/models` → 花名册：每个供应商是否已配置 Key（脱敏，不含 api_key）、默认配方、配方列表。
+- `GET /api/recipes` → 配方列表；`GET /api/recipes/{name}` → 直接生成 `/api/configure` 可用的 `agents`（含 `judge`、`notes` 改派说明、`available_providers`）。
+- 5 个配方：`collab-4`（规划/研究/撰写/审核，默认）、`collab-3`（极速三席）、`panel-5`（五模型多视角评审）、`debate-3`（三方辩论 + 独立裁判）、`dual-2`（双模型对练，适合联调）。
+- 讨论模式：`debate`（辩论，原能力）/ `collaboration`（合作）。三处可设，优先级从高到低：`POST /api/configure` 的 `mode` → `POST /api/start` 的 `mode`（可覆盖）→ `.env` 的 `DISCUSSION_MODE`（默认 `debate`）；非法值一律落回 `debate`。
+
+```bash
+curl -s http://127.0.0.1:8000/api/recipes/collab-4
+curl -s -X POST http://127.0.0.1:8000/api/configure -H 'Content-Type: application/json' \
+  -d '{"session_id":"demo","mode":"collaboration","topic":"写一份上线检查单","max_rounds":4,"agents":[...]}'
+```
+
+**注意**：`PERSONAL_MODE=1` 目前只是**定位标记**（`/api/defaults`、`/api/models`、`/api/workspace` 与启动日志会带出 `personal_mode`），它**不会**改变会话上限——上限始终是 `MAX_SESSIONS`（个人级默认已收敛到 8）。系统里没有租户概念，所以谈不上「隔离」，只能靠只绑回环 + `AUTH_TOKEN` 保护。
+
+### 2. 流式 UI + 复盘导出 + trace_id + 结构化日志 + 运行摘要
+
+**做了什么**：把「一场运行发生过什么」拆成四层可查的证据，并给每次请求 / 每次运行一个可对齐的 `trace_id`。
+
+| 层 | 文件 | 出口 |
+| --- | --- | --- |
+| 实时流 | `api/router_stream.py` + `orchestrator.py`（`EventBus`） | `WS /ws`（浏览器 UI）、`GET /api/stream`（SSE，给外部集成用） |
+| 诊断日志 | `logger.py` | 三条出口同时生效：stdout（JSON 行）、`data/logs/app-YYYYMMDD.jsonl`（按天滚动）、进程内环形缓冲；查询用 `GET /api/logs` |
+| 运行事件日志 | `runlog.py` | `data/runs/{trace_id}.jsonl`（一事件一行 JSON，带单调 `seq`）+ `data/runs/index.json`；查询用 `GET /api/runs`、`GET /api/runs/{trace_id}`、`GET /api/timeline` |
+| 运行摘要 | `summary.py` | `GET /api/summary`（各席位发言数 / 字符数 / TTFT / 速率、token 与费用、裁判、纠偏统计、异常、`highlights`） |
+| 复盘 | `review.py` | `GET /api/review`（结构化）、`GET /api/review/export`（`format` 取 `md` / `json` / `html`）、`POST /api/review/save` → `data/reviews/review_{trace_id}.{ext}` |
+
+**怎么用**：先拿 `X-Trace-Id`（任何请求的响应头都有，另附 `X-Elapsed-Ms`），再一条命令把「事件 + 日志 + 索引」全捞出来：
+
+```bash
+curl -s -i http://127.0.0.1:8000/api/status          # 响应头里看 X-Trace-Id
+curl -s http://127.0.0.1:8000/api/trace/<trace_id>    # 事件 + 日志 + 索引一次拿全
+curl -s 'http://127.0.0.1:8000/api/logs?level=error&limit=50'
+curl -s 'http://127.0.0.1:8000/api/stream?session_id=default&replay=1'
+```
+
+`GET /api/export` 仍是旧契约（默认返回 `{"markdown": "..."}`）；新增的 `format=json|html`、`download=1`、`mode=review` 都是**追加**参数。
+
+### 3. 接口级测试与模块化
+
+**做了什么**：`main.py` 只做装配，业务端点按 7 个模块拆开；每个路由模块带 `MODULE_NAME` / `MODULE_TITLE` / `MODULE_DESC` 三个模块级常量，`api/__init__.py` 的 `ALL_MODULES` 是模块清单的**唯一事实来源**——接口控制台、冒烟、OpenAPI 分组都从它推出来，新增模块只需登记一次。
+
+**七个模块**：`setup`（配置与模型）、`kb`（共享知识库）、`run`（运行控制）、`stream`（实时推送与可观测）、`export`（导出与复盘）、`dev`（接口调试）、`integration`（对外集成）。
+
+**怎么用**：
+
+- `GET /api/dev/endpoints`：49 个接口按模块分组导出，带请求 JSON Schema 与示例请求体（控制台据此自动生成表单）。
+- `GET /api/dev/modules`：模块导航（每模块接口数与路径清单）。
+- `POST /api/dev/invoke`：通用调用器 `{method,path,query,body,headers,timeout_ms}`，走 `httpx.ASGITransport` 的**进程内真实 ASGI 链路**——中间件、鉴权、依赖注入全生效，所以「控制台调通 = 外部调通」。
+- `POST /api/dev/smoke`：一键跑 10 个只读接口（不消耗额度、不改状态、不需要先配置席位），返回逐项耗时与 `passed/failed`。
+- `/console`：接口控制台页面（`static/console.html` + `console.js` + `console.css`）。
+- `DEV_API_ENABLED=0` 可整组关闭（403）；对外暴露服务时建议关掉。
+
+`scripts/api_smoke.py` 补的是另一件事：连**真实端口**验证部署形态（静态页、SSE 是否真的在流、中间件响应头、鉴权），这些在进程内 `ASGITransport` 里测不出来。
+
+### 4. 中途注入纠偏（steering）
+
+**做了什么**：运行中把「人的判断」以**指令对象**插进正在跑的编排循环，而不是等跑完再重开一场。
+
+**在哪个文件**：`muti_llm_agent/steering.py`（`Directive` / `SteeringQueue`）；注入点在 `Orchestrator._agent_turn`（`orchestrator.py`）。
+
+**语义**：5 种 `kind` × 3 种 `scope` × 2 种优先级。
+
+| 维度 | 取值 |
+| --- | --- |
+| `kind` | `correct`（方向纠偏）/ `constrain`（新增约束）/ `fact`（补充事实）/ `redirect`（焦点转向）/ `stop`（禁止方向） |
+| `scope` | `all`（全员，默认）/ `main`（仅主持人）/ `agent`（指定 `target=席位名`；给了 agent 却没给 target 会退化为 `all` 而不是静默丢弃） |
+| `priority` | `normal`（命中即消费）/ `high`（本轮内每个席位都注入，轮末统一消费） |
+
+**怎么用**：
+
+```bash
+curl -s -X POST http://127.0.0.1:8000/api/steer -H 'Content-Type: application/json' \
+  -d '{"session_id":"demo","text":"只保留 3 个可落地方案，不要展开理论","kind":"constrain","scope":"main","priority":"normal"}'
+curl -s 'http://127.0.0.1:8000/api/steer?session_id=demo'          # 看队列与统计
+curl -s -X DELETE 'http://127.0.0.1:8000/api/steer/<directive_id>?session_id=demo'
+```
+
+注入后发生三件事：① 指令文本追加到该席位本回合 user 消息末尾（带「与既有方向冲突时以指令为准」的显式声明），随历史留在该席位上下文里，后续轮次不会忘；② 写进 transcript（`type=directive`）；③ 写运行事件（`directive_added` / `directive_applied`）并广播 `directive` 事件——复盘时能看到「第几轮、对谁、生效了哪条」。
+
+**边界**：单回合最多注入 5 条（`MAX_INJECT_PER_TURN`）；待生效队列上限 `STEERING_MAX_PENDING=20`；单条文本上限 1000 字（超出截断）；`STEERING_ENABLED=0` 时端点 403。
+
+### 5. 会话结束后补充材料续轮（followup）
+
+**做了什么**：一场跑完发现是「缺料」而不是「跑错」时，带着新材料在上一轮结论之上做**增量优化**，而不是重开一场把老结论再贴一遍。续轮做成一次受控的**迭代**。
+
+**在哪个文件**：`muti_llm_agent/followup.py`（`normalize_materials` / `validate_followup` / `build_carryover` / `build_seed_block` / `snapshot_iteration`）+ `Orchestrator.start_followup()`。
+
+**流程**：归档当前迭代快照 → `iterations.append(snap)` → 生成**承接包**（上一轮核心结论 / 各方立场 / 裁判裁决 / 遗留分歧 / 末轮发言要点 / 已交付任务结果）→ 清运行态但**保留席位与模型** → 承接包只在第 1 轮注入每个席位 → `iteration_no + 1`。
+
+**怎么用**：
+
+```bash
+curl -s -X POST http://127.0.0.1:8000/api/followup -H 'Content-Type: application/json' \
+  -d '{"session_id":"demo","materials":["访谈记录：…","竞品报价：…"],"focus":"收敛成可报价的版本","auto_start":true}'
+curl -s 'http://127.0.0.1:8000/api/iterations?session_id=demo'   # 迭代链 + 当前一轮
+```
+
+- `materials` 接受字符串 / 字符串数组 / `[{"source","text"}]`（前端文件解析结果可直接透传）；`auto_start=false` 只准备承接包不发车。
+- 只允许在终态续轮（`done` / `stopped` / `interrupted` / `idle`）；运行中或暂停中续轮返回 400。
+- 上限 `MAX_ITERATIONS=5`（含首发那一轮）；`FOLLOWUP_ENABLED=0` 时返回 403。
+
+**边界**：承接包是**按字符截断**（各段上限按 `FOLLOWUP_CARRYOVER_CHARS` 的比例切分，末尾标注「已按上限截断」），**不是语义压缩**——料特别多时，先自己写成摘要再传。
+
+### 6. 对外集成
+
+**做了什么**：让本系统能被外部系统驱动、也能把结果推出去。三个子模块在 `muti_llm_agent/integrations/`，只依赖标准库，不 import FastAPI（脚本 / CI 可直接 import）。
+
+| 模块 | 职责 |
+| --- | --- |
+| `integrations/feishu.py` | 飞书协议适配：事件解析、卡片 / 文本构造（`FEISHU_TEXT_LIMIT=28000` 截断）、群机器人推送 |
+| `integrations/dsh.py` | DSH 工具清单 `TOOL_SPECS` + 参数校验规整 `validate_arguments` |
+| `integrations/dispatch.py` | 通用出站 webhook：`post_json_webhook` / `dispatch_run_summary` / `summary_sentence` |
+
+**怎么用**：
+
+- **飞书入站**：`POST /api/integrations/feishu/webhook`。`url_verification` 握手原样返回 `{"challenge": ...}`；普通消息默认只回执，`FEISHU_AUTO_RUN=1` 时用默认配方以消息文本为主题自动发起（会话 `feishu`，轮次 `FEISHU_AUTO_RUN_MAX_ROUNDS=3`）。畸形请求体也只返回 `{"code":0}` 或明确错误，不抛 500。
+- **飞书出站**：`POST /api/integrations/feishu/push`（`{session_id, webhook_url, as_card, text}`；不给 url 就用 `.env` 的 `FEISHU_WEBHOOK_URL`）；`FEISHU_PUSH_ON_DONE=1` 时运行结束自动推。
+- **DSH**：`GET /api/integrations/dsh/manifest` 拿 7 个工具（`collab_start` / `collab_status` / `collab_steer` / `collab_followup` / `collab_summary` / `collab_export` / `collab_history`），再用 `POST /api/integrations/dsh/invoke` 的 `{tool, arguments}` 驱动；未知工具 / 坏参数是 400 不是 500。
+- **通用 webhook**：`POST /api/integrations/webhooks/dispatch`（推当前运行摘要）与 `POST /api/integrations/webhooks/test`（连通性测试）；地址在 `WEBHOOK_URLS`（逗号 / 分号 / 换行分隔），`WEBHOOK_ON_DONE=1` 时结束自动推。
+- **SSE**：`GET /api/stream` 是最省事的集成出口，`curl` / 脚本 / 网关都能消费。
+- `GET /api/integrations` 一次看清三条集成路径的配置状态（不含密钥）。
 
 ## 目录结构
 
 ```
-mini_test/
-├── start.py              启动入口（uvicorn）
-├── requirements.txt      依赖清单（含版本下限约束）
-├── requirements-dev.txt  开发 / 质量工具依赖（ruff / mypy / coverage）
-├── pyproject.toml        工程化配置（ruff / mypy / coverage）
-├── .env                  环境变量配置（不提交到版本库）
-├── app/                  核心应用包
-│   ├── __init__.py
-│   ├── config.py         环境变量与配置（Settings 单例、PROJECT_ROOT）
-│   ├── schemas.py        REST 请求体 pydantic 模型（configure/start/ingest/save_markdown）
-│   ├── llm.py            LLM 统一接入（OpenAI 兼容 + function calling + 流式）
-│   ├── embeddings.py     文本向量化（sentence-transformers；本地无缓存模型时秒级降级哈希向量，不卡启动）
-│   ├── vector_store.py   共享向量知识库（Qdrant，TCP 探活失败降级内存库，网络探测不阻塞请求线程）
-│   ├── memory.py         每个 Agent 的记忆系统（三类记忆 + 转化 + 遗忘 + 混合向量检索）
-│   ├── logger.py         结构化 JSON 日志（trace_id 追踪、事件归类）
-│   ├── tools.py          每个 Agent 的 MCP 工具注册表 + 内置工具
-│   ├── agent.py          Agent 定义（角色/性格/模型/记忆/MCP/上下文构建 + 历史压缩）
-│   ├── orchestrator.py   圆桌编排器（辩论主循环、任务回合/辩论回合分离、任务分派/回报、停止判定、运行摘要）
-│   ├── manager.py        多会话管理器（DebateManager 会话注册表 + 元数据持久化 + 中断恢复；会话统一经 get_or_create 持有）
-│   ├── bgtasks.py        后台 asyncio 任务强引用集合（RUF006；main/orchestrator 统一复用 spawn()，防 GC 提前回收）
-│   ├── history.py        历史讨论记忆索引（data/discussions/index.json + 检索 + Markdown 读取，防路径穿越）
-│   ├── file_parser.py    上传文件文本提取（txt/md/docx/xlsx/pdf/图片 OCR，懒加载依赖 + 大小/字符上限）
-│   ├── main.py           FastAPI 应用（REST + WebSocket + 静态服务）
-│   └── static/           前端 UI
-│       ├── index.html    页面骨架（配置区 + 讨论区 + 历史面板）
-│       ├── style.css     设计变量 / 圆桌席位 / 聊天气泡 / 首字母头像 / 历史面板
-│       └── app.js        前端逻辑（配置、席位等分、WebSocket 事件、并发流式气泡、历史检索）
-├── scripts/
-│   └── eval_baseline.py 质量基线评估脚本（五维评分 0-100 + 基线对比，P0-2）
-├── tests/
-│   ├── test_e2e.py       端到端集成测试（需先启动服务器）
-│   ├── test_ci_fast.py   快速单元测试（状态机 / 公平性 / 裁决）
-│   ├── test_api_flow.py  HTTP 接口级测试（ASGITransport，无需服务器 / 无需真实 LLM）
-│   ├── test_multi_session.py  多会话隔离测试（DebateManager / 会话元数据 / 中断恢复）
-│   └── test_features_v2.py    新特性测试（费用估算 / 收敛降级 / 工具可视化 / 结构化结论 / 论据句抽取 / 任务-辩论分离 / 双模式合作）
+Muti_LLM_Agent/
+├── start.py                    启动入口（uvicorn，默认 127.0.0.1:8000，关掉访问日志）
+├── pyproject.toml              工程化配置（ruff / mypy / coverage）
+├── .env                        本地密钥与开关（gitignore，不提交）
 ├── docs/
-│   └── CODE_LOGIC.md     代码逻辑详解（模块职责 → 关键函数 → 数据流）
-├── data/                 运行时数据（自动生成，不提交到版本库）
-│   ├── discussions/      自动保存的 Markdown 结果
-│   ├── sessions/         各会话元数据快照（data/sessions/{session_id}.json）
-│   └── memories/         各 Agent 记忆持久化（json）
-└── README.md             本文档
+│   ├── API.md                  接口参考：49 个接口 + 横切约定 + SSE/WS 事件
+│   ├── MIGRATION.md            从 mini_test 迁到本项目的说明
+│   ├── CODE_LOGIC.md           代码逻辑详解（迁移前的辩论主体逻辑，仍可参考）
+│   └── DELIVERY_READINESS.md   可交付性评估
+├── muti_llm_agent/             核心包（旧项目的 app/）
+│   ├── main.py                 FastAPI 装配：静态目录、中间件、页面、lifespan、完成回调
+│   ├── api/                    路由层（一个模块一件事）
+│   │   ├── __init__.py         模块注册表 ALL_MODULES（唯一事实来源）
+│   │   ├── deps.py             共享依赖：session 归一、状态快照、鉴权、DSH 密钥
+│   │   ├── router_setup.py     配置与模型花名册
+│   │   ├── router_kb.py        共享知识库（注入 / 上传解析 / 统计）
+│   │   ├── router_run.py       运行控制 / 纠偏 / 续轮 / 摘要
+│   │   ├── router_stream.py    WebSocket、SSE、日志与 trace 检索
+│   │   ├── router_export.py    导出 / 历史 / 复盘
+│   │   ├── router_dev.py       接口清单 / 通用调用 / 冒烟 / console 页面
+│   │   └── router_integration.py  飞书 / DSH / webhook
+│   ├── models_registry.py      模型花名册 + 5 个协同配方（含自动改派）
+│   ├── steering.py             中途注入纠偏（指令对象 + 会话级队列）
+│   ├── followup.py             补充材料续轮（承接包 + 迭代快照）
+│   ├── summary.py              运行摘要（一次运行的聚合视图）
+│   ├── runlog.py               运行事件日志（复盘时间线的唯一事实来源）
+│   ├── review.py               复盘导出（md / json / 自包含 html）
+│   ├── logger.py               结构化日志（stdout / 按天文件 / 环形缓冲）
+│   ├── integrations/           对外集成层（feishu / dsh / dispatch）
+│   ├── orchestrator.py         编排器：状态机、回合驱动、纠偏注入点、迭代切换
+│   ├── manager.py              会话注册表（LRU 淘汰 + 元数据落盘 + 中断标记）
+│   ├── agent.py / memory.py / llm.py / tools.py / rag.py / fairness.py / prompts.py
+│   ├── events.py               事件总线（有界队列 512 + 背压）
+│   ├── static/                 前端
+│   │   ├── index.html+app.js+style.css           圆桌 UI（既有实时流式界面，1134 行 app.js）
+│   │   ├── studio.js+studio.css                  增量层：配方 / 纠偏 / 摘要 / 续轮面板
+│   │   └── console.html+console.js+console.css   接口控制台
+├── scripts/
+│   ├── api_smoke.py            对已运行服务做接口冒烟（两种用法见下）
+│   └── eval_baseline.py        讨论质量基线评测
+├── tests/                      9 个测试文件、206 个用例（ASGITransport + LLM 打桩）
+└── data/                       运行期产物（gitignore）：discussions / runs / reviews / logs / sessions / memories
 ```
 
-## 快速开始
+**前端为什么是「叠加」而不是重写**：`static/app.js` 是既有的圆桌 UI（1134 行）。`static/studio.js`（529 行）用 IIFE 包住新代码，**包装全局 `handleEvent`** 来追加处理 `directive` / `run_summary` / `iteration` 三类事件，并复用 `getSessionId()` / `generateAgentCards()` / `addMsg()` 等既有函数——旧界面一个 DOM id 都没动，新面板是外挂上去的。
 
-### 1. 安装依赖
+## 配置项
 
-```bash
-# 建议使用 conda 环境（Python 3.10+）
-conda create -n agent_env python=3.10
-conda activate agent_env
-pip install -r requirements.txt
-```
+**旧有键**（`LLM_*`、`QWEN_*`、`DEEPSEEK_*`、`MIMO_*`、`JUDGE_*`、`FAIR_*`、`CONVERGENCE_*`、`CONTEXT_*`、`REFLECTION_*`、`QDRANT_*`、`EMBED_*`、`AUTH_TOKEN`、`MAX_SESSIONS` 等）**不在这里重复**，含义与默认值见仓库 `.env` 文件里的分组注释与 `muti_llm_agent/config.py`。
 
-### 2. 配置 .env
+下表是本次新增的那批键。⚠ 它们**没有**预置在仓库的 `.env` 模板里——所有键都由 `config.py` 的 `_get/_int/_float` 从 `.env` 读取并带默认值，想改就在 `.env` 里自己加一行（`键=值`），不加就用默认值。
 
-复制 `.env`（项目根目录）中的模板，填入：
+| 键 | 默认值 | 作用 |
+| --- | --- | --- |
+| `PERSONAL_MODE` | `1` | 单用户个人级的定位标记；`/api/defaults`、`/api/models`、`/api/workspace` 与启动日志会带出 `personal_mode`。**不改会话上限、不做隔离** |
+| `OWNER_NAME` | `本机用户` | 工作区主人名，出现在 `/api/models`、`/api/workspace` |
+| `WORKSPACE_NAME` | `多模型协同工作台` | 工作区名，出现在 `/healthz`、`/api/workspace`、启动日志 |
+| `DEFAULT_RECIPE` | `collab-4` | 默认协同配方：`/api/recipes` 的 `is_default`、`/api/defaults`、DSH `collab_start`、飞书自动发起都用它 |
+| `MAX_ITERATIONS` | `5` | 单场运行允许的最大迭代次数（首发 1 轮 + 续轮）；超过后 `/api/followup` 返回 400 |
+| `LOG_TO_FILE` | `1` | 诊断日志是否写 `data/logs/app-YYYYMMDD.jsonl`（按天滚动） |
+| `LOG_RING_SIZE` | `2000` | 进程内环形缓冲条数，`/api/logs` 只查这个缓冲（不读盘） |
+| `LOG_LEVEL` | `info` | 最小日志级别（`debug`/`info`/`warning`/`error`），低于它的日志不进任何出口 |
+| `RUNLOG_ENABLED` | `1` | 是否写运行事件日志 `data/runs/{trace_id}.jsonl`；关掉后 `/api/timeline`、`/api/trace` 的事件部分会空 |
+| `RUNLOG_MAX_EVENTS` | `20000` | 单场事件条数上限；超出后停止写事件（防止异常循环把磁盘写满），运行索引另受 `runlog.MAX_INDEX=300` 条限制 |
+| `STEERING_ENABLED` | `1` | 中途纠偏总开关；`0` 时 `POST /api/steer` 返回 403 |
+| `STEERING_MAX_PENDING` | `20` | 待生效指令队列上限，满后 `add` 抛 ValueError（400） |
+| `STEERING_TEXT_MAX_CHARS` | `1000` | 单条指令文本上限，超出截断并加 `…` |
+| `FOLLOWUP_ENABLED` | `1` | 补充材料续轮总开关；`0` 时 `/api/followup` 返回 403 |
+| `FOLLOWUP_MAX_MATERIAL_CHARS` | `12000` | 补充材料字符上限，超出截断并追加「已截断」提示 |
+| `FOLLOWUP_CARRYOVER_CHARS` | `4000` | 承接包总长度上限（核心结论 / 立场 / 裁决 / 遗留 / 末轮要点按比例切分） |
+| `SSE_KEEPALIVE_SEC` | `15.0` | SSE 心跳间隔：空闲时发一行注释 `: keep-alive`，防中间层掐断长连接 |
+| `SSE_REPLAY_MAX` | `200` | `/api/stream?replay=1` 连上后回放的历史事件条数上限 |
+| `FEISHU_WEBHOOK_URL` | 空 | 飞书群机器人出站地址；`/api/integrations/feishu/push` 不给 url 时用它 |
+| `FEISHU_VERIFICATION_TOKEN` | 空 | 入站事件校验 token；非空时校验 `body.token` 或 `body.header.token` |
+| `FEISHU_PUSH_ON_DONE` | `0` | 运行结束自动把摘要推到飞书（需同时配 `FEISHU_WEBHOOK_URL`） |
+| `FEISHU_AUTO_RUN` | `0` | 入站消息是否自动发起一场协同；默认关，避免误触消耗额度 |
+| `FEISHU_AUTO_RUN_MAX_ROUNDS` | `3` | 自动发起时的最大轮次 |
+| `WEBHOOK_URLS` | 空 | 通用出站地址，逗号 / 分号 / 换行分隔，只接受 `http(s)://` |
+| `WEBHOOK_ON_DONE` | `0` | 运行结束自动向 `WEBHOOK_URLS` 推送结构化摘要 |
+| `WEBHOOK_TIMEOUT` | `8.0` | 所有出站 HTTP（飞书 / webhook）的超时秒数 |
+| `DSH_ENABLED` | `1` | DSH 集成开关；`0` 时 `dsh/manifest` 与 `dsh/invoke` 返回 403 |
+| `DSH_SHARED_SECRET` | 空 | DSH 专用共享密钥（`Authorization: Bearer` 或 `?secret=`）；与 `AUTH_TOKEN` 分开，生命周期通常更长 |
+| `DSH_BASE_URL` | 空 | manifest 里 `base_url` 的缺省值（也可 `?base_url=` 临时指定） |
+| `DEV_API_ENABLED` | `1` | `/api/dev/*` 与 `/console` 的开关；`0` 时统一 403，对公网暴露时建议关 |
+| `DEV_API_TIMEOUT_MS` | `60000` | `/api/dev/invoke` 的默认超时（毫秒），超时返回 504 |
 
-| 配置 | 说明 |
-| --- | --- |
-| `LLM_MODEL_ID` / `LLM_API_KEY` / `LLM_BASE_URL` / `LLM_TIMEOUT` | 默认基础模型（OpenAI 兼容协议，当前默认 MiMo `mimo-v2.5`）；`LLM_TIMEOUT` 为请求超时秒数（默认 300） |
-| `QWEN_API_KEY` / `QWEN_BASE_URL` / `QWEN_MODEL_ID` | Qwen 独立配置（DashScope compatible-mode，默认 `qwen3.7-plus`） |
-| `DEEPSEEK_API_KEY` / `DEEPSEEK_BASE_URL` / `DEEPSEEK_MODEL_ID` | DeepSeek 独立配置（默认 `deepseek-chat`） |
-| `MIMO_API_KEY` / `MIMO_BASE_URL` / `MIMO_MODEL_ID` | MiMo 独立配置（默认 `mimo-v2.5`） |
-| `JUDGE_NAME` / `JUDGE_PROVIDER` / `JUDGE_BASE_URL` / `JUDGE_API_KEY` / `JUDGE_MODEL_ID` | 独立裁判（可选，未配置时回退用主 Agent 模型） |
-| `JUDGE_CONTENT_WEIGHT` / `JUDGE_PERFORMANCE_WEIGHT` | 综合评分权重（内容分 × 前者 + 模型质量分 × 后者，默认 0.8 / 0.2）——综合评分**仅作展示**，胜方由内容四维均分决定（纯内容判定） |
-| `SERPAPI_API_KEY` / `TAVILY_API_KEY` | 联网搜索工具（可选） |
-| `QDRANT_URL` 等 | 向量数据库（可选，未配置时自动降级为内存库） |
-| `EMBED_MODEL_TYPE` / `EMBED_MODEL_NAME` | 嵌入模型（默认本地 sentence-transformers） |
-| `CONTEXT_MAX_CHARS` | 单 Agent 上下文字符硬上限，超出时丢弃最旧轮次（默认 8000） |
-| `CONTEXT_COMPRESS_THRESHOLD` | 触发 LLM 摘要压缩的字符阈值（默认 6000） |
-| `CONTEXT_COMPRESS_KEEP_RECENT` | 摘要压缩后保留的最近轮次条数（默认 8） |
-| `OPPONENT_SNIPPET_MAX_CHARS` / `OPPONENT_SUMMARY_MAX_CHARS` / `OPPONENT_ARGUMENT_SNIPPET_MAX_CHARS` | 辩论机制：第 2 轮对手发言原文截断上限（默认 500 字）、第 3 轮起对手发言 LLM 摘要上限（默认 200 字）、摘要轮额外保留的对手**关键论据句**上限（默认 160 字，§5.4） |
-| `MEMORY_SUMMARY_MAX_CHARS` | 记忆压缩：短期 → 情境的 LLM 聚合摘要上限（默认 200 字），摘要 usage 计入只读遥测 |
-| `FAIR_OUTPUT_RATIO` | 公平性 L1：输出上限 = 对手近 N 轮有效输出均值 × 该比例（默认 1.5） |
-| `FAIR_HARD_CHAR_CEILING` | 公平性 L1：单次发言硬性字符安全上限（默认 3000），超限事后截断 |
-| `FAIR_FLOOR_CHAR_LIMIT` / `FAIR_OPENING_CHAR_LIMIT` / `FAIR_REFERENCE_ROUNDS` | 公平性 L1：相对基准下限（默认 400）、立论/无参照时上限（默认 1200）、参照对手最近 N 轮有效输出（默认 2） |
-| `FAIR_THINK_RATIO_MAX` | 公平性 L2：思考/推理占比上限（默认 0.5），超过记 warning |
-| `FAIR_MAX_SEEN_DIFF` | 公平性 L3：PRO/CON 可见对手轮数允许的最大差值（默认 1） |
-| `CONVERGENCE_SIMILARITY` / `CONVERGENCE_ROUNDS` / `CONVERGENCE_PER_SPEAKER` | 收敛检测：语义余弦相似度阈值（默认 0.85）、连续相似轮数（默认 2）、按发言者逐人计算开关（默认 1 开启，§5.7） |
-| `CONVERGENCE_TEXT_SIMILARITY` | 收敛检测降级（P0-3）：嵌入不可用时文本相似度阈值（默认 0.6，difflib SequenceMatcher） |
-| `COST_INPUT_PER_1M` / `COST_OUTPUT_PER_1M` | 费用估算单价（P1-6，人民币 ¥/百万 token，默认 2.0 / 8.0；按供应商价格覆盖） |
-| `DISCUSSION_MODE` | 双模式服务端兜底：`debate`（辩论）/ `collaboration`（合作），默认 `debate`；前端 `/api/configure` / `/api/start` 可显式覆盖 |
-| `REFLECTION_ENABLED` | 合作模式反思与自我修正开关（§12.18，默认 1 开启；仅 `collaboration` 生效） |
-| `REFLECTION_MAX_PASSES` | 单个任务反思轮数上限（默认 2；每轮把上一轮修订版作新草稿继续自评，无修订即收敛提前终止；0 表示完全跳过反思） |
-| `FAIR_TEMPERATURE` / `FAIR_TOP_P` | 公平性 L5：辩论发言统一采样参数（默认 0.7 / 1.0） |
-| `FAIR_JUDGE_TEMPERATURE` / `FAIR_JUDGE_TOP_P` | 公平性 L5：辅助 LLM（裁判/摘要）统一采样参数（默认 0.3 / 1.0） |
-
-### 3. 启动
+## 测试与质量门禁
 
 ```bash
-python start.py
-# 浏览器打开 http://localhost:8000
-```
+# 全量快速回归（不需要服务器、不需要真实 LLM：ASGITransport + LLM 打桩）
+python -m pytest tests -q
+# → 实测 206 passed（约 33s）；tests/test_e2e.py 需真实服务器 + 真实 API，不进 CI
 
-> **默认仅绑定本地**：`start.py` 监听 `127.0.0.1`，不会被局域网 / 公网访问到（调试结束即关闭，避免长期挂载）。如需临时开放局域网访问：
->
-> ```bash
-> HOST=0.0.0.0 PORT=8000 python start.py
-> ```
+# 静态检查：0 问题
+python -m ruff check muti_llm_agent tests scripts
 
-> **无外网环境**：本地嵌入模型（sentence-transformers）若未缓存，启动时通过毫秒级缓存探测直接降级为确定性哈希向量，**不会卡住启动**；需要完整语义检索能力时请提前下载模型缓存：
->
-> ```bash
-> NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost \
-> HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 python start.py
-> ```
->
-> `NO_PROXY` 用于避免本地请求被系统代理拦截；未配置代理时可省略。即使缺少模型缓存，混合检索仍可基于关键词覆盖度与重要度正常排序。
-
-## 使用流程
-
-1. **设置 Agent**：选择 Agent 数量（2–6），逐个填写名称、角色、性格，并为每个 Agent 选择基础模型（默认取 `.env` 的 `LLM_*`（当前为 MiMo），可选 qwen / deepseek / mimo / 自定义）。
-2. **设置讨论**：填写讨论主题 / 任务，设置最大轮次；可选在"共享知识"中注入文本作为全体 Agent 的知识背景。
-3. **进入圆桌**：点击"进入圆桌并开始讨论"，观察圆桌席位上的 Agent 轮流流式发言（聊天气泡）、任务分派与回报。
-4. **随时控制**：可暂停 / 继续 / 结束讨论。
-5. **导出记录**：讨论完成或结束后，可导出 / 下载 Markdown 记录（自动保存于 `data/discussions/`，末尾附 `## 运行摘要` 统计：时长 / 轮次 / 收敛 / RAG 证据 / 任务 / 历史压缩 / Token 遥测 / 公平性）。
-6. **历史检索**：顶部"历史记录"面板按时间倒序展示全部历史讨论（题目 + 状态 + 轮次 + 人数），支持关键词搜索（题目 / trace_id）、点击查看完整 Markdown、一键下载；每场讨论完成或保存时自动写入记忆索引。
-
-## 运行测试
-
-快速单元测试（状态机 / 公平性 / 裁决，无需启动服务器）：
-
-```bash
-python -m unittest tests.test_ci_fast -v
-```
-
-HTTP 接口级测试（`httpx.ASGITransport` 直接驱动 FastAPI 应用，LLM 调用点打桩，无需服务器 / 无需真实模型；覆盖 configure → start → done → export → save_markdown → history 全链路与路径穿越防护）：
-
-```bash
-python -m unittest tests.test_api_flow -v
-```
-
-多会话隔离与新特性测试（DebateManager 会话注册表 / 会话元数据 / 中断恢复；费用估算 / 收敛降级 / 工具调用可视化 / 结构化结论 / **论据句抽取** / **任务-辩论分离** / **双模式合作（任务池 / 认领独占 / 全完成收尾）** / **反思与自我修正（多轮循环 / 收敛提前终止 / mid-loop 失败保留修订 / 修订后落库 / 开关与上限 / 解析失败降级 / L1 截断）**，均无需服务器与真实模型）：
-
-```bash
-python -m unittest tests.test_multi_session tests.test_features_v2 -v
-```
-
-全量快速回归（无需服务器 / 真实模型）共 **97 项用例**：
-
-```bash
-python -m unittest discover tests
-```
-
-质量基线评估（P0-2）：对一场导出的讨论 Markdown 打五维质量分，并可与基线对比发现回归：
-
-```bash
-python scripts/eval_baseline.py data/discussions/discussion_xxx.md          # 可读报告
-python scripts/eval_baseline.py data/discussions/discussion_xxx.md --json   # JSON 输出
-python scripts/eval_baseline.py data/discussions/discussion_xxx.md --make-baseline data/baseline.json  # 首跑生成基线
-python scripts/eval_baseline.py data/discussions/discussion_xxx.md --baseline data/baseline.json      # 回归则退出码 2
-```
-
-静态检查与类型检查（需先安装 `requirements-dev.txt`）：
-
-```bash
-python -m ruff check app tests scripts
+# 类型检查（整包 45 个文件，0 issue）
 python -m mypy
-python -m coverage run -m unittest discover tests   # 可选：测试覆盖率
+#   steering.py:234           List[Directive | None] vs List[Directive]
+#   orchestrator.py:252       缺 _opponent_prep 注解
+#   orchestrator.py:253       缺 _opponent_summary_cache 注解
+#   api/router_export.py:201  缺 meta 注解
 ```
 
-端到端集成测试会真实调用 LLM 发起一场讨论（3 Agent × 2 轮，全部使用 qwen，含独立裁判），并校验流式事件（`speech_start` / `speech_delta` / `speech_end` 配对、`log` 事件、`judgment` 等，`judgment` 需包含 `agent_scores` / `model_performance` / `composite_scores`）与 Markdown 导出：
+`scripts/api_smoke.py` 有**两种用法**（它连真实端口，和 `tests/` 的进程内测试互补）：
 
 ```bash
-# 终端 1：启动服务器
-python start.py
+# 1) 只跑部署形态冒烟：静态页、SSE 是否真在流、响应头、鉴权、接口连通性
+python scripts/api_smoke.py
+python scripts/api_smoke.py --base-url http://127.0.0.1:8123 --token xxx
 
-# 终端 2：运行测试
-python tests/test_e2e.py
+# 2) 额外真跑一场协同（会消耗模型额度，默认不跑）
+python scripts/api_smoke.py --live-run --recipe collab-3 --rounds 1
 ```
 
-## 深入学习
+退出码 `0` = 全通过、`1` = 有失败项，可直接接进部署脚本或 CI。
 
-模块职责、关键函数与数据流的完整梳理见 [`docs/CODE_LOGIC.md`](docs/CODE_LOGIC.md)。
+## 已知边界与后续可做
 
-P0 / P1 优化项已实施落地：
+诚实列出现在**做不到**的：
 
-- **A3 记忆检索升级为向量语义检索**：`memory.py` 混合召回（语义 50% + 关键词 30% + 重要度 20%），嵌入写入时缓存、旧数据按需回填。
-- **A4 结构化日志治理**：`logger.py` JSON 结构化日志 + `trace_id` 全链路追踪 + `{"type":"log"}` 实时前端推送 + Markdown 运行摘要。
-- **A8 任务协作模式流式输出**：任务分派 / 回报走流式通道，与普通发言一致的增量推送体验。
-- **A9 上下文压缩与长对话管理**：超阈值自动摘要压缩，保留最近原文，防止上下文溢出。
-- **UI / UX 升级**：简约大气的低饱和深色设计、聊天气泡式发言（并发流式独立气泡）、首字母文字头像（按立场配色）。
-- **历史记忆化**：`app/history.py` 将每场讨论题目与元信息持久化到 `data/discussions/index.json`，提供 `/api/history` 检索与一键查看 / 下载。
-- **安全加固**：`start.py` 默认绑定 `127.0.0.1`，关闭远端暴露；历史读取带路径穿越防护。
-- **裁判综合评分**：`orchestrator._compute_composite` 按「内容分（agent_scores 四维均值）× `JUDGE_CONTENT_WEIGHT` + 模型质量分（TTFT / 生成速率实测，`_score_ttft` / `_score_rate` 分档）× `JUDGE_PERFORMANCE_WEIGHT`」合成综合分，**仅作展示**；胜方由内容四维均分最高方决定（纯内容判定，并列 DRAW），模型质量分 / 综合分不参与胜负。裁判只看辩手发言（`_build_judge_debate_text` 剔除主持人），质量分只统计协作 Agent 的流式发言指标。
-- **P0-1 路径穿越修复**：`save_markdown` 文件名经 `Path(fname).name` 清洗（只保留 basename、强制 `.md`、空名回退时间戳），配合 `history.get_markdown` 的 `resolve()` + `relative_to()`，读写两侧均无法越出 `data/discussions/`。
-- **P0-2 REST 请求体 pydantic 校验**：`app/schemas.py` 为 `configure / start / ingest / save_markdown` 定义请求模型；类型 / 形状非法返回 `422`，业务语义校验保留在各端点内，维持前端依赖的 `{ok, error}` `400` 契约。
-- **P1-3 lifespan 落盘可靠性**：讨论完成自动保存失败不再静默吞掉，改为结构化日志（`lifespan.save_markdown`）+ 幂等重试（1, 2 次）。
-- **P1-4 接口级测试 + CI 静态检查**：`tests/test_api_flow.py`（`httpx.ASGITransport` + LLM 调用点打桩）覆盖 HTTP 全链路与安全用例；ruff / mypy 纳入 CI 质量门禁。
-- **P1-5 依赖与工程化配置**：新增 `pyproject.toml`（ruff / mypy / coverage）与 `requirements-dev.txt`，`requirements.txt` 全部依赖改为 `>=` 版本下限。
-- **辩论机制：对手定向反驳 + 输出约束 + 按轮强压缩**：`orchestrator._find_opponent`（`config.OPPONENT_STANCE` 立场映射，回退全局最近）→ `_prepare_opponent_context`（第 2 轮原文截断 / 第 3 轮起 `summarize_text` LLM 摘要 + 关键论据句抽取 `_extract_argument_sentences`，缓存 + 只读遥测记账）→ `_debate_prompt` 注入 + 全轮字数提示（公平性 L1 字符上限）；`_agent_turn` 超长截断兜底；`agent.history_rounds` 平行维护、`compress_history(keep_rounds=N)` 按轮强压缩（详见 `docs/CODE_LOGIC.md` §12.8）。
-- **任务与辩论回合分离（§5.8）**：协作 Agent 回合拆为 `_task_turn`（任务输出不回填 `round_arguments` / 记忆）与 `_debate_turn`（正常发言记录），主循环两阶段调用，消除任务输出对收敛 / RAG / 对手上下文的污染。
-- **P1-7 完整多会话重构**：`app/manager.py` `DebateManager` 按 `session_id` 管理独立 `Orchestrator` 实例；前端 `localStorage` 持久化 `session_id`；`data/sessions/{sid}.json` 元数据快照 + 启动时 `mark_interrupted()` 中断恢复横幅；所有 REST/WS 端点经 `_get_orch(session_id)` 路由（详见 `docs/CODE_LOGIC.md` §12.15）。
-- **P1-4 工具调用可视化**：`chat_stream` 新增 `tool_call_start`/`tool_call_args`，`_consume_stream` 桥接 `tool_starts` 去重，前端气泡显示"正在调用工具 X…"（详见 `docs/CODE_LOGIC.md` §12.4）。
-- **P0-1 结构化结论**：`_normalize_conclusion` 固定四段式 + 裁决段权威重写，`_final_summary` 发布 `conclusion` 事件，前端核心结论面板（详见 `docs/CODE_LOGIC.md` §12.13）。
-- **P0-3 收敛检测降级**：`is_fallback()` 时 `_check_convergence` 切换到 `_text_similarity`（difflib，阈值 `CONVERGENCE_TEXT_SIMILARITY`=0.6），保证离线哈希向量模式仍能收敛提前终止（详见 `docs/CODE_LOGIC.md` §12.10）。
-- **P1-6 费用估算展示（¥）**：`_estimate_cost_rmb` 只读遥测随 `speech_end`/`status_sync`/导出展示（详见 `docs/CODE_LOGIC.md` §12.16）。
-- **P1-5 配置模板**：前端 `localStorage` 模板保存 / 载入 / 删除。
-- **双模式（辩论 / 合作）**：`run_discussion` 按 `mode` 分派 `_run_debate_loop`（原 while 循环体原样搬入，行为逐字节不变）与 `_run_collab_loop`（主 Agent `delegate_task` 拆任务入池 → 子 Agent `claim_task` 认领 + `report_result` 回报 → 全 completed 提前收尾）；post-loop 按模式三分支（stopped / collaboration 走 `_collab_final_summary` 三段式 / debate 走 `_judge_round`）；`_agent_turn` 按 `mode` 注入 `delegate_task` / `claim_task` / `report_result` 专用工具并拦截，任务状态机 `pending → claimed → completed`；合作模式席位立场弱化（主位 HOST、其余 NEUTRAL）、无裁判（详见 `docs/CODE_LOGIC.md` §12.17）。
-- **P0-2 质量基线**：`scripts/eval_baseline.py` 五维评分 + 基线对比（详见 `docs/CODE_LOGIC.md` §21）。
-- **P2 分析与方案**：详见 [`P2优化方案.md`](P2优化方案.md)——平台化主干（A10 多实例 / A11 人工审核 / A12 知识库后台 / A13 模板与快照）+ 增补议题（裁判增强 / 日志落盘与检索 / 前端测试与 CI / 鉴权与网络安全 / 数据治理 / 完整会话恢复）。
+1. **会话是单进程内存态**。`Orchestrator` 活在 `DebateManager` 的字典里；进程重启只能把 `data/sessions/{sid}.json` 里 running/paused 的会话标记成 `interrupted`（前端显示中断横幅），**不能续跑**。要横向扩展得先把会话外部化，现在没有。
+2. **SSE 不支持断点续传**。只有 `?replay=1` 的**一次**回放（从 runlog 读最多 200 条），没有 `Last-Event-ID` 语义，断线期间丢的增量无法按序号补齐。
+3. **飞书只做了「事件回调 + 群机器人推送」**。没有卡片交互回调（按钮 / 表单点击不会回来），也没有线程级回复；入站消息触发的是「用默认配方开一场」，不能在飞书里选配方或纠偏（纠偏得走 `/api/steer` 或 DSH）。
+4. **续轮承接包是字符截断，不是语义压缩**。各段按 `FOLLOWUP_CARRYOVER_CHARS` 的比例硬切并标注「已截断」，长材料下会丢细节。
+5. **向量库默认内存后端**。`QDRANT_URL` 探测失败就降级 `in-memory`（启动时后台线程探测），**进程重启知识库即清空**；嵌入模型缺失时再降级为确定性哈希向量（无语义检索能力）。`GET /api/kb/stats` 的 `backend` 字段是当前真实后端。
+6. **纠偏的 `high` 优先级只在「轮内」生效**，不跨轮持续；想跨轮施压就重复下发，或用 `at_round` 指定起始轮。
+7. **飞书回调只做了 verification token 校验**，未实现签名（`X-Lark-Signature`）校验；把回调暴露到公网前请自行加网关白名单。
+8. **mypy 整包 0 issue**，但 `disallow_untyped_defs` 仍是关闭的（历史模块大量未注解）；`protocol.py` 的 `--strict` 门禁是 CI 里的独立命令。
 
-## 项目依赖
+后续可做（按「一个人用」的收益排序，均**尚未实现**）：会话状态外部化 + SSE 断点续传；承接包改成 LLM 摘要；飞书卡片回调（在 IM 里纠偏 / 续轮）；向量库后端显式化（不再靠探测）；逐步打开 `disallow_untyped_defs`。
 
-- **Web 框架**：`fastapi` + `uvicorn`
-- **LLM**：`openai`（OpenAI 兼容协议）
-- **向量库**：`qdrant-client`（可选，不可用时降级内存库）
-- **嵌入**：`sentence-transformers` + `numpy`（无缓存模型时自动降级哈希向量）
-- **其他**：`httpx`
-- **开发 / 质量工具**（`requirements-dev.txt`）：`ruff`（静态检查）、`mypy`（类型检查，当前覆盖 `app/protocol.py`）、`coverage`（测试覆盖率）
+## 迁移说明
 
-> 生产 / 运行依赖与开发依赖分离：`pip install -r requirements.txt` 即可运行；`pip install -r requirements-dev.txt` 额外安装静态检查与测试工具。`requirements.txt` 中的依赖均带 `>=` 版本下限，`pyproject.toml` 声明 `requires-python = ">=3.10"`。
+从 `mini_test`（包名 `app`）迁到本项目（`Muti_LLM_Agent`，包名 `muti_llm_agent`），做了四件事：目录 / 包名重命名、导入路径批量替换、`pyproject.toml` / `ci.yml` / `start.py` 跟随更新、把 `main.py` 拆成 7 个路由模块。行为差异、向后兼容点、**三个测试为什么改了 patch 目标**、旧文档哪些还有效，全部在 [docs/MIGRATION.md](docs/MIGRATION.md)。
+
+接口怎么调、SSE 帧长什么样、WS 有哪些事件类型，见 [docs/API.md](docs/API.md)。

@@ -19,33 +19,35 @@ jobs:
         with:
           node-version: '20'
 
-      # 仅安装快速测试所需的最小依赖（app 在无 sentence-transformers /
-      # Qdrant 时会自动降级为哈希向量 + 内存向量库，见 app/embeddings.py、
-      # app/vector_store.py）。完整 requirements.txt 会拉取 torch，不适用于 CI。
+      # 仅安装快速测试所需的最小依赖（包在无 sentence-transformers /
+      # Qdrant 时会自动降级为哈希向量 + 内存向量库，见 muti_llm_agent/embeddings.py、
+      # muti_llm_agent/vector_store.py）。完整 requirements.txt 会拉取 torch，不适用于 CI。
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
           pip install numpy pydantic openai fastapi httpx ruff mypy
 
       - name: Lint (ruff)
-        run: python -m ruff check app tests
+        run: python -m ruff check muti_llm_agent tests scripts
 
-      - name: Type check (mypy, app/protocol.py)
+      - name: Type check (mypy, 整包)
         run: python -m mypy
 
+      - name: Type check (mypy --strict, 协议层契约)
+        run: python -m mypy --strict --follow-imports=normal muti_llm_agent/protocol.py
+
       - name: Build check (Python byte-compile)
-        run: python -m compileall -q app
+        run: python -m compileall -q muti_llm_agent
 
       - name: Build check (JS syntax)
-        run: node --check app/static/app.js
+        run: |
+          node --check muti_llm_agent/static/app.js
+          node --check muti_llm_agent/static/studio.js
+          node --check muti_llm_agent/static/console.js
 
-      # 无需真实 LLM API 的确定性单元测试（暂停/继续/结束控制流 + 手动结束收尾）
-      - name: Run fast unit tests
-        run: python -m unittest tests.test_ci_fast -v
-
-      # 接口级集成测试：走 ASGITransport 驱动完整 HTTP 流程，LLM 调用点已替换为桩
-      - name: Run API flow tests
-        run: python -m unittest tests.test_api_flow -v
-
-      # tests/test_e2e.py 需要启动服务器 + 真实 LLM API，且单次调用 >90s，
-      # 不适合作为常规 CI 检查；如需可在此处手动触发。
+      # 全量快速回归：不需要服务器、不需要真实 LLM（ASGITransport + LLM 打桩），
+      # 覆盖状态机 / 公平性 / 裁决 / 多会话 / 新特性 / P0 修复 /
+      # 多模型协同（纠偏、续轮、复盘、接口调试、对外集成）等用例。
+      # tests/test_e2e.py 需要启动服务器 + 真实 LLM API（单次调用 >90s），不进 CI。
+      - name: Run fast test suite
+        run: python -m pytest tests -q

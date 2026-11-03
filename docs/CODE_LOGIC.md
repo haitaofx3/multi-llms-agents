@@ -2,7 +2,7 @@
 
 > 本文档系统梳理当前项目的全部代码逻辑，按"模块职责 → 关键函数 → 数据流"组织，便于理解与二次开发。
 > 内容对齐《多Agent辩论系统架构设计文档》（Supervisor 编排 + 立场辩手 + Judge 裁决 + RAG 核查 + 公平性治理 + 收敛检测 + 状态机 + 协议层）与当前实现。
-> **交叉引用约定**：`架构文档 §N` 指《多Agent辩论系统架构设计文档》；**裸 `§N.M`**（如 §1.3 / §3.4 / §5.4 / §5.8，与代码注释一致）指《问题整理与根因分析.md》中对应小节；本文档自身章节用 `§N` 标题，不含 `.M` 后缀。
+> **交叉引用约定**：`架构文档 §N` 指《多Agent辩论系统架构设计文档》；**裸 `§N.M`**（如 §1.3 / §3.4 / §5.4 / §5.8，与代码注释一致）指历史问题清单（对应条目已随修复落地，原始记录见 `docs/archive/`）；本文档自身章节用 `§N` 标题，不含 `.M` 后缀。
 
 ---
 
@@ -10,7 +10,7 @@
 
 一个支持多个 LLM Agent 围绕"圆桌"进行**辩论式多轮协作讨论**的 Web 应用。核心特征：
 
-- **多会话隔离**：`DebateManager`（`app/manager.py`）按 `session_id` 管理独立 `Orchestrator` 实例，不同浏览器客户端互不干扰；元数据落盘 `data/sessions/{sid}.json`，进程重启后遗留会话标记为 `interrupted` 并展示中断横幅。
+- **多会话隔离**：`DebateManager`（`muti_llm_agent/manager.py`）按 `session_id` 管理独立 `Orchestrator` 实例，不同浏览器客户端互不干扰；元数据落盘 `data/sessions/{sid}.json`，进程重启后遗留会话标记为 `interrupted` 并展示中断横幅。
 - 每个 Agent 拥有**独立的基础模型**（Qwen / DeepSeek / MiMo / 自定义，默认取 `.env` 的 `LLM_*`，当前为 MiMo）、**立场**（主持人 HOST / 正方 PRO / 反方 CON / 中立 NEUTRAL）、**记忆系统**（短期 / 长期 / 情境 + 遗忘）、**MCP 工具集**（知识检索 / 联网搜索 / 记忆回忆）。
 - 首个 Agent 为**辩论主持人（Supervisor 视角）**：分派任务、逐轮追问、最终汇总；辩论结束后由**裁判（Judge）**单次裁决，按内容四维（logic / evidence / rebuttal / clarity）对**每位辩手**独立评分，**胜方由内容四维均分决定（纯内容判定）**；系统实测的模型质量分（TTFT / 生成速率）与内容分合成综合评分（`composite_scores`）**仅作展示、不参与胜负**。最终报告为**结构化结论（四段式）**：核心结论 / 各方立场 / 裁判裁决 / 分歧与待办。
 - 辩论流程：第 1 轮**并行立论**（`asyncio.gather`），后续轮次**串行反驳/辩护**；达到终止条件（最大轮次 / 语义收敛 / 手动结束）后进入裁决与汇总。全局 Token 预算已移除，改为 **FairnessGovernor L1–L6** 公平性治理（以字符数 + 相对比例为度量），token 用量与**费用估算（¥）**仅作只读遥测。
@@ -30,28 +30,35 @@ mini_test/
 ├── requirements-dev.txt  开发 / 质量工具依赖（ruff / mypy / coverage）
 ├── pyproject.toml        工程化配置（ruff / mypy / coverage）
 ├── .env                  环境变量配置（不提交到版本库）
-├── app/                  核心应用包
+├── muti_llm_agent/                  核心应用包
 │   ├── config.py         环境变量与配置（Settings 单例、公平性/收敛/重试参数）
 │   ├── protocol.py       消息协议（TaskDispatch / ArgumentSubmit / Rebuttal / Judgment / StatusSync / EvidenceItem，pydantic 模型 + trace_id/uuid/毫秒时间戳）
 │   ├── schemas.py        REST 请求体 pydantic 模型（ConfigureRequest / StartRequest / IngestRequest / SaveMarkdownRequest）
 │   ├── llm.py            LLM 统一接入（OpenAI 兼容 + function calling + 流式 + usage 统计 + ThinkFilter）
 │   ├── embeddings.py     文本向量化（sentence-transformers 懒加载，失败降级哈希向量，后台预热）
 │   ├── vector_store.py   共享向量知识库（Qdrant 快速失败，降级内存库；懒初始化）
-│   ├── memory.py         每个 Agent 的记忆系统（三类记忆 + 转化 + 遗忘）
+│   ├── memory.py         每个 Agent 的记忆系统（三类记忆 + 转化 + 遗忘；落盘按会话隔离）
 │   ├── tools.py          每个 Agent 的 MCP 工具注册表 + 内置工具
 │   ├── rag.py            独立 RAG 事实核查服务（断言提取 / 带置信度检索 / 24h 缓存）
 │   ├── agent.py          Agent 定义（角色/性格/立场/模型/记忆/MCP/上下文构建）
 │   ├── fairness.py       公平性治理（FairnessGovernor L1–L6：输出上限/有效比例/输入对称/轮次对称/采样对齐/长度中性）
-│   ├── orchestrator.py   编排器（Supervisor：状态机、并行立论、收敛终止、Judge、任务回合/辩论回合分离、结构化结论）
-│   ├── manager.py        多会话管理器（DebateManager：session 注册表 + 元数据持久化 + 中断恢复；会话统一经 get_or_create 持有）
-│   ├── bgtasks.py        后台 asyncio 任务强引用集合（RUF006；main/orchestrator 统一复用 spawn()，防 GC 提前回收）
+│   ├── orchestrator.py   编排器（Supervisor：状态机、回合驱动、任务分派/回报、收敛终止；纯逻辑已下沉到下列模块）
+│   ├── events.py         事件总线（有界队列 512 + 背压：丢弃最旧事件、计数、按百告警）
+│   ├── prompts.py        提示词资产（DELEGATE/CLAIM/REPORT schema、四段式结论模板、反思 prompt/解析、主持人与合作指令）
+│   ├── textutil.py       文本与费用工具（shorten / text_similarity / extract_argument_sentences / estimate_cost_rmb）
+│   ├── scoring.py        裁决评分（score_ttft / score_rate / model_performance / compute_composite / judge_ruling_text）
+│   ├── conclusion.py     结构化结论（split_sections / normalize_conclusion / fallback_summary）
+│   ├── exporter.py       讨论记录 Markdown 渲染（render_markdown）
+│   ├── netguard.py       出站地址安全校验（拒绝回环/私网/链路本地/保留地址，防 SSRF）
+│   ├── manager.py        多会话管理器（DebateManager：session 注册表 + LRU 淘汰 + 元数据持久化 + 中断恢复）
+│   ├── bgtasks.py        后台任务强引用 + LLM 流式线程池（spawn / stream_pool / submit_stream）
 │   ├── history.py        历史讨论记忆索引（data/discussions/index.json + 检索 + Markdown 读取，防路径穿越）
 │   ├── file_parser.py    上传文件文本提取（txt/md/docx/xlsx/pdf/图片 OCR，懒加载依赖 + 大小/字符上限）
-│   ├── main.py           FastAPI 应用（REST + WebSocket + 静态服务，lifespan 自动落盘 + 重试 + 中断标记）
+│   ├── main.py           FastAPI 应用（REST + WebSocket + 静态服务 + 可选令牌鉴权 + lifespan 自动落盘/重试/中断标记）
 │   └── static/           前端 UI
 │       ├── index.html    页面骨架（配置区 + 讨论区 + 历史面板 + 核心结论面板 + 模板区）
 │       ├── style.css     设计变量 / 圆桌席位 / 聊天气泡 / 首字母头像 / 历史面板
-│       └── app.js        前端逻辑（配置、席位等分、WebSocket 事件、并发流式气泡、历史检索、模板、工具可视化、结论面板）
+│       └── muti_llm_agent.js        前端逻辑（配置、席位等分、WebSocket 事件、并发流式气泡、历史检索、模板、工具可视化、结论面板）
 ├── scripts/
 │   └── eval_baseline.py  质量基线评估脚本（五维评分 0-100 + 基线对比，P0-2）
 ├── tests/
@@ -59,9 +66,14 @@ mini_test/
 │   ├── test_ci_fast.py   快速单元测试（状态机/公平性/裁决，无需服务器）
 │   ├── test_api_flow.py  HTTP 接口级测试（ASGITransport + LLM 打桩，无需服务器/真实模型）
 │   ├── test_multi_session.py  多会话隔离测试（DebateManager / 会话元数据 / 中断恢复）
-│   └── test_features_v2.py    新特性测试（费用估算 / 收敛降级 / 工具可视化 / 结构化结论 / 论据句抽取 / 任务-辩论分离 / 双模式合作 / 反思与自我修正）
+│   ├── test_features_v2.py    新特性测试（费用估算 / 收敛降级 / 工具可视化 / 结构化结论 / 论据句抽取 / 任务-辩论分离 / 双模式合作 / 反思与自我修正）
+│   ├── test_eval_baseline.py  质量基线脚本测试（评分 / 回归退出码）
+│   ├── test_p0_fixes.py       P0 缺陷回归（向量确定性 / 并发闸门 / 运行态重置 / 记忆隔离 / 会话淘汰）
+│   └── test_p1_p2.py          P1·P2 改造回归（背压 / netguard / 评分 / 结论 / 鉴权 / 上传预检 / 工具循环 / 遗忘机制）
 ├── docs/
-│   └── CODE_LOGIC.md     本文档
+│   ├── README.md         文档索引（现行 / 参考 / 已归档）
+│   ├── CODE_LOGIC.md     本文档
+│   └── archive/          历史存档（早期运行分析与改造方案，已过期）
 ├── data/                 运行时数据（自动生成，不提交到版本库）
 │   ├── discussions/      自动保存的 Markdown 结果
 │   └── memories/         各 Agent 记忆持久化（json）
@@ -85,7 +97,7 @@ NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost \
 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 python start.py
 ```
 
-启动后 `start.py` 通过 uvicorn 加载 `app.main` 的 FastAPI 应用，**默认监听 `127.0.0.1:8000`**（仅本地访问，避免远端暴露 / 长期挂载；需要开放局域网时以 `HOST=0.0.0.0` 环境变量显式覆盖），自动挂载 `/static`、REST 接口与 WebSocket `/ws`。
+启动后 `start.py` 通过 uvicorn 加载 `muti_llm_agent.main` 的 FastAPI 应用，**默认监听 `127.0.0.1:8000`**（仅本地访问，避免远端暴露 / 长期挂载；需要开放局域网时以 `HOST=0.0.0.0` 环境变量显式覆盖），自动挂载 `/static`、REST 接口与 WebSocket `/ws`。
 
 ---
 
@@ -119,11 +131,11 @@ HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 python start.py
 | **辩论对手/输出约束** | `OPPONENT_SNIPPET_MAX_CHARS`（第 2 轮对手发言原文截断上限，默认 500 字）、`OPPONENT_SUMMARY_MAX_CHARS`（第 3 轮起对手发言 LLM 摘要上限，默认 200 字）、`OPPONENT_ARGUMENT_SNIPPET_MAX_CHARS`（摘要轮额外保留的对手**关键论据句**上限，默认 160 字，§5.4）；输出长度约束走公平性 L1 字符上限（见上） |
 | **记忆压缩** | `MEMORY_SUMMARY_MAX_CHARS`（短期 → 情境的 LLM 聚合摘要上限，默认 200 字） |
 
-> `PROJECT_ROOT = Path(__file__).resolve().parent.parent`（`app/` 的上一级）供其余模块定位项目根目录与资源目录。
+> `PROJECT_ROOT = Path(__file__).resolve().parent.parent`（`muti_llm_agent/` 的上一级）供其余模块定位项目根目录与资源目录。
 
 **模块级辅助（§1.4 / §3.4）**：
-- `resolve_provider(prefix, provider="", base_url="", api_key="", model_id="")`：**provider 规格统一合并入口**——显式字段为空时依次回退 `settings.{PREFIX}_PROVIDER/_BASE_URL/_API_KEY/_MODEL_ID`，返回过滤掉空值的 spec dict（全部为空返回空 dict，调用方据此判断「未配置」）。只做合并不解析预设，供应商预设解析仍由 `app.llm.resolve_model_config` 负责；`_build_judge` 以 `resolve_provider("JUDGE", ...)` 收敛裁判配置（§12.2）。
-- `OPPONENT_STANCE = {"PRO": "CON", "CON": "PRO"}`：立场对手映射，收敛到 `config.py` 模块级常量，由 `orchestrator._find_opponent` 与 `app/fairness.py` 共享，避免重复定义漂移（§3.4）。
+- `resolve_provider(prefix, provider="", base_url="", api_key="", model_id="")`：**provider 规格统一合并入口**——显式字段为空时依次回退 `settings.{PREFIX}_PROVIDER/_BASE_URL/_API_KEY/_MODEL_ID`，返回过滤掉空值的 spec dict（全部为空返回空 dict，调用方据此判断「未配置」）。只做合并不解析预设，供应商预设解析仍由 `muti_llm_agent.llm.resolve_model_config` 负责；`_build_judge` 以 `resolve_provider("JUDGE", ...)` 收敛裁判配置（§12.2）。
+- `OPPONENT_STANCE = {"PRO": "CON", "CON": "PRO"}`：立场对手映射，收敛到 `config.py` 模块级常量，由 `orchestrator._find_opponent` 与 `muti_llm_agent/fairness.py` 共享，避免重复定义漂移（§3.4）。
 
 ---
 
@@ -175,9 +187,9 @@ HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 python start.py
 
 ### 6.1 `embeddings.py`
 - `_load_model()` **懒加载** `sentence-transformers` 模型（全局单例，`local_files_only=True`），维度取自模型本身。
-- 加载失败（无网络/无依赖）时降级 `_fallback_embed()`：以 `hash(text)` 为随机种子生成**确定性**单位向量（维度取 `QDRANT_VECTOR_SIZE`），保证同一文本向量一致、项目离线可用。
+- 加载失败（无网络/无依赖）时降级 `_fallback_embed()`：以 `_fallback_seed(text)`（**blake2b 内容摘要**，`stable_digest_int()` 同源）为随机种子生成**确定性**单位向量（维度取 `QDRANT_VECTOR_SIZE`）。**不能用内置 `hash()`**：Python 3 对 str/bytes 的哈希默认被 `PYTHONHASHSEED` 随机化，同一文本跨进程会得到不同向量——而 `memory.json` 会持久化 embedding、Qdrant 用摘要值做 point id，种子漂移会让重启后的混合检索语义项退化为噪声，并在重新入库时重复堆积点。
 - `start_background_warmup()`：后台线程预热模型，不阻塞 ASGI 启动。
-- 对外接口：`embed(texts)`、`embed_query(text)`、`dim()`。
+- 对外接口：`embed(texts)`、`embed_query(text)`、`dim()`、`stable_digest_int(text, bytes)`。
 
 ### 6.2 `vector_store.py` — 共享向量库
 - 所有 Agent **共用同一个** `shared_vector_store` 单例，满足"访问同一向量数据库"。
@@ -191,7 +203,7 @@ HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 python start.py
 
 ## 7. 记忆系统 — `memory.py`
 
-每个 Agent 持有一个 `MemorySystem`（持久化到 `data/memories/<agent_id>/memory.json`），记忆分为三类：
+每个 Agent 持有一个 `MemorySystem`（持久化到 `data/memories/<session_id>/<agent_id>/memory.json`；`default` 会话沿用旧布局 `data/memories/<agent_id>/`，无需迁移历史数据），记忆分为三类：
 
 | 类别 | 字段 | 含义 |
 | --- | --- | --- |
@@ -374,6 +386,10 @@ Agent(agent_id, name, role, personality, model_config, is_main, forget_config, s
 - 存在未完成任务时附加"请先审视进展"提示。
 
 ### 12.6 讨论主循环 `run_discussion()`
+**并发闸门（P0）**：入口先判 `self.is_active`（`status ∈ {running, paused}` **或** `self._run_task` 尚未退出），成立则记 `run.reject` 警告并直接返回。只判 `status == "running"` 会漏掉 paused —— 暂停后再点「开始」会在同一编排器上并发跑两个主循环，同时推进 `round`、写同一份 `transcript` 与遥测，且 `end()` 无法一次收尾。`_run_task` 在 run 结束时（终态分支提前 + `finally` 兜底）置空，保证会话不会被永久判为"进行中"。`/api/start`（400）与 `/api/configure`（409）使用同一判定。
+
+**运行态重置（P0）**：入口调 `_reset_run_state()`（与 `configure()` 共用同一份清理逻辑），清空 `transcript` / `tasks` / `task_counter` / `shared_context` / 各 Agent 历史（`Agent.reset_history()`）/ 遥测 / 收敛与裁决状态，并重新生成 `trace_id`。不重新 configure 直接再跑一场（`status=done` → 再次 start）时，上一场的发言、任务表与上下文不再带入，导出 Markdown 也不会混入旧记录。
+
 **双模式分派（§12.17）**：`mode == "collaboration"` 时进入 `_run_collab_loop()`（合作循环，见 §12.17）；否则进入 `_run_debate_loop()`（下文的原辩论循环体，**行为与拆分前逐字节一致**）。两模式共用 `preparing → running` 启动、`stopped` 熔断分支与异常兜底；post-loop 按模式三分支：`stopped` → idle 收尾；`collaboration` → `_collab_final_summary()`（三段式汇总，无裁判）；否则 → `_judge_round()` + `_final_summary(judgment)`。
 
 辩论模式循环（`_run_debate_loop`）：
@@ -404,9 +420,9 @@ while round < max_rounds:
 
 **并行立论**（架构文档 §6.2）：第 1 轮协作 Agent 无相互依赖，用 `asyncio.gather(..., return_exceptions=True)` 并发 `_debate_turn`；流式事件带 `speaker`，前端按 speaker 独立气泡，天然支持并发流式。
 
-### 12.7 公平性治理 `FairnessGovernor`（`app/fairness.py`，替代旧 budget planner）
+### 12.7 公平性治理 `FairnessGovernor`（`muti_llm_agent/fairness.py`，替代旧 budget planner）
 
-旧的全局 Token 预算系统（`app/budget.py` + 三路自适应校准 + `budget_profile.json` 档案）已整体移除：不再按预算推算每轮 `effective_max_tokens`、不再有预算熔断。`FairnessGovernor` 每场讨论全新实例（`run_discussion` 中创建），以 **L1–L6 六层公平性**替代"成本预算"约束，全程只保证模型间公平、不干预辩论进程：
+旧的全局 Token 预算系统（`muti_llm_agent/budget.py` + 三路自适应校准 + `budget_profile.json` 档案）已整体移除：不再按预算推算每轮 `effective_max_tokens`、不再有预算熔断。`FairnessGovernor` 每场讨论全新实例（`run_discussion` 中创建），以 **L1–L6 六层公平性**替代"成本预算"约束，全程只保证模型间公平、不干预辩论进程：
 
 - **L1 输出字数上限（需求 5）**：`ceiling_for(stance, round, opponent_recent_chars)` 计算相对上限（`对手近N轮有效输出均值 × FAIR_OUTPUT_RATIO` 与硬上限 `FAIR_HARD_CHAR_CEILING` 取 min）；立论/无参照用 `opening_char_limit`。上限仅写入提示词（`_debate_prompt` 的 `【输出要求】`），超限由 `_agent_turn` 事后 `truncate_output` 头尾截断兜底（事件 `fairness.output_truncate`）；**不再把 `max_tokens` 下发给 API**。
 - **L2 有效回答占比**：剥离 `<think>` 推理后统计有效输出占比（`effective_ratio`），低于 `FAIR_THINK_RATIO_MAX` 阈值记告警。
@@ -426,7 +442,7 @@ while round < max_rounds:
 **`_debate_turn(collab)`（辩论回合，§5.8）**：立论/反驳发言，与任务回合完全分离；无论本轮回合是否处理过任务，辩手每轮都发言，保证严格交替。先 `await self._prepare_opponent_context(collab)` 准备对手上轮发言，再 `_debate_prompt(collab)` 构造立论/反驳 prompt（含对手引用 + 关键论据句 + 上一轮 RAG 证据注入 + 字数提示），`_agent_turn(..., mode="discussion", stream=True)`。
 
 **对手定向（需求 2/3）**：
-- `_find_opponent(collab)`：`OPPONENT_STANCE` 定义收敛于 `app.config`（§3.4，`orchestrator` 与 `fairness` 共享）。先在上一轮 `round_arguments[round-1]` 找对立场**最近发言人**（`reversed` 扫描）；上一轮无对立场发言者时回退 `latest_arguments` 全局最近对立场发言者；`NEUTRAL`/`HOST` 无固定对手返回 `None`。
+- `_find_opponent(collab)`：`OPPONENT_STANCE` 定义收敛于 `muti_llm_agent.config`（§3.4，`orchestrator` 与 `fairness` 共享）。先在上一轮 `round_arguments[round-1]` 找对立场**最近发言人**（`reversed` 扫描）；上一轮无对立场发言者时回退 `latest_arguments` 全局最近对立场发言者；`NEUTRAL`/`HOST` 无固定对手返回 `None`。
 - `_prepare_opponent_context(collab)`：第 1 轮不准备；**第 2 轮**取对手上轮发言原文截断到 `OPPONENT_SNIPPET_MAX_CHARS` 字；**第 3 轮起**调用 `summarize_text`（`llm.py`）压缩到 `OPPONENT_SUMMARY_MAX_CHARS` 字，按 `(对手名, 轮次)` 缓存进 `_opponent_summary_cache` 防同轮重复调用，usage 计入 `self.spent`（只读遥测），事件 `debate.opponent_summary`；第 3 轮起额外以 `_extract_argument_sentences(text, OPPONENT_ARGUMENT_SNIPPET_MAX_CHARS)` 抽取对手发言中的**关键论据句**写入 `_opponent_prep["arguments"]`（§5.4，弥补 LLM 摘要丢失具体论点的不足）；结果写入 `_opponent_prep`（每轮开始清空，`configure()` 重置）。
 - `_debate_prompt(collab)`：第 1 轮基于角色/性格立论（需求 1，PRO/CON 分立场措辞）；第 2 轮起优先注入 `_opponent_prep`（标注"发言"（第 2 轮原文）/ "摘要"（第 3 轮起）），摘要轮若含 `arguments` 则追加指令「对方发言中的关键论据句（请逐条回应，不要遗漏）」（§5.4）；`NEUTRAL`/无立场对手回退旧 `last_debate_speaker` 逻辑；**全轮**追加 `【输出要求】... {limit} 字以内 ...`（需求 5），`limit = self.governor.ceiling_for(stance, round, 对手近N轮有效输出均值)`（公平性 L1 相对上限，与硬上限取 min；仅作提示约束，超限由 `_agent_turn` 事后截断兜底，不再把 `max_tokens` 下发 API）；RAG 证据按调用者立场取桶注入（`_evidence_for_round(round-1, collab.stance)`，§12.11）。
 
@@ -466,17 +482,20 @@ while round < max_rounds:
 ### 12.14 状态同步 `_status_sync()`（架构文档 §3.5）
 发布 `status_sync` 事件：`trace_id / mode / phase / current_round / agent_states / spent_tokens / output_tokens / fairness / cost_rmb / elapsed_time_ms`。其中 `mode` 为当前讨论模式（双模式，§12.17）；`spent_tokens`（累计 token 用量）与 `output_tokens`（累计输出 token）为**只读遥测**，`cost_rmb` 为 **P1-6 费用估算（¥，`_estimate_cost_rmb`）**；`fairness` 为 `governor.report()`（L1–L6 各层状态），替代旧的 `budget_plan` 视图。
 
-### 12.15 多会话管理 — `app/manager.py`（P1-7）
+### 12.15 多会话管理 — `muti_llm_agent/manager.py`（P1-7）
 
 **背景（P5）**：原 `orchestrator = Orchestrator()` 模块级单例 + 全局 `EventBus` 不支持多客户端——两个浏览器同时打开会互相覆盖配置 / 状态 / 事件，一个客户端的 `pause/end` 会操作到另一客户的讨论。
 
 **`DebateManager`（全局单例 `manager`）**：
-- `get_or_create(session_id="default")`：按 `session_id` 取会话；不存在则惰性构造 `Orchestrator(session_id=...)`（惰性导入防循环依赖）。**会话实例统一由此路径持有**（§1.3 解耦：已删除模块级 `orchestrator` 单例与 `register()` 双入口，`main.py` / 测试 / 前端均走本方法）。**安全字符白名单** `_SAFE_SID = ^[A-Za-z0-9._-]+$`：非法 `session_id` 读写元数据时一律清洗回 `"default"`，防路径穿越；
+- `get_or_create(session_id="default")`：按 `session_id` 取会话；不存在则惰性构造 `Orchestrator(session_id=...)`（惰性导入防循环依赖）。**会话实例统一由此路径持有**（§1.3 解耦：已删除模块级 `orchestrator` 单例与 `register()` 双入口，`main.py` / 测试 / 前端均走本方法）。**安全标识清洗**统一走 `config.safe_path_component()`（`^[A-Za-z0-9._-]+$`，且拒绝 `.` / `..`）：非法 `session_id` 读写元数据、拼接记忆目录时一律回退 `"default"`，防路径穿越；
+- **容量治理（P0）**：注册表上限 `settings.MAX_SESSIONS`（默认 32）。`get_or_create` 在创建前调 `_evict_idle()`，按 LRU **序号**（自增计数器，不用 `time.monotonic()`，避免同刻创建导致的并列）淘汰最久未用的**空闲**会话；`is_active` 为真的会话（running / paused / run 任务未退出）永不淘汰，若全为活动会话则不腾（宁可不淘汰也不打断正在跑的讨论）。没有上限时任何客户端反复请求不同 `session_id` 都能无限新建 Orchestrator（每个持有 N 个 MemorySystem 与磁盘目录）；
 - `set_done_handler(handler)`：注册"讨论完成"回调（`main.py` 用于自动落盘 Markdown），每个会话完成时经 `notify_done(orch)` 触发。
 
 **元数据持久化（轻量快照，非发言明细）**：
 - `save_meta(orch)` → `data/sessions/{session_id}.json`：`{session_id, status, phase, topic, trace_id, round, max_rounds, spent_tokens, agents:[{name, role, stance, is_main, model_id}], judge, updated_at}`；
-- `load_meta(session_id)`：读取（不存在 / 损坏返回 `None`）；读写共用 `_meta_path()`（含白名单清洗）。
+- `load_meta(session_id)`：读取（不存在 / 损坏返回 `None`）；读写共用 `_meta_path()`（含标识清洗）。
+
+**只读端点不建会话（P0）**：`GET /api/status`、`GET /api/export` 走 `manager.get()`（不创建），未创建的 `session_id` 由 `main._idle_status_body()` 返回空闲快照（含 `fairness` 与中断元数据）；`pause/resume/end/save_markdown` 对未知会话返回 404。控制类端点的 `session_id` 既接受请求体也接受查询串（`_resolve_sid`，前端把 `sid` 放在 `?session_id=` 上）。
 
 **中断恢复**：
 - `mark_interrupted()`：**进程启动时**调用，把 `data/sessions/` 中遗留的 `status ∈ {running, paused}` 会话标记为 `interrupted`（`phase=idle` + `note="服务重启，讨论中断"`）——避免把本次运行中的会话误标记；
@@ -527,16 +546,16 @@ while round < max_rounds:
 **降级与事件**：
 - 任一反思调用异常 / 输出无法解析 → **保留当前最佳草稿照常落库** + warning 日志（`reflection.fail`），不阻塞任务完成；mid-loop 异常不丢弃此前已产生的修订，`passes_done>0` 时 meta 正常返回；**首轮即异常** `passes_done==0` → meta 返回 `None`；
 - `_collab_work_turn` 在发布 `task_result` 之后、仅当 `reflected is not None` 时发布 **`task_revised`** 事件：`{type, from, var, task_id, value, reflections, revised, timestamp}`（`reflections` = 实际完成的反思轮数）；前端仿 `task_result` 消费，展示「反思后已修订落库（第 N 轮）/ 反思后维持草稿（第 N 轮）」并同步 `state.tasks` 与 `state.ctx` 的值。
-- 配置：`REFLECTION_ENABLED` / `REFLECTION_MAX_PASSES`（`app/config.py` 经 `_int` 读取，`.env` 可覆盖，仅整数布尔语义）。
+- 配置：`REFLECTION_ENABLED` / `REFLECTION_MAX_PASSES`（`muti_llm_agent/config.py` 经 `_int` 读取，`.env` 可覆盖，仅整数布尔语义）。
 
 ---
 
-## 13. 后端 — `app/main.py`
+## 13. 后端 — `muti_llm_agent/main.py`
 
 FastAPI 应用，挂载 `/static`，提供 REST + WebSocket。
 
 ### 13.1 启动 `lifespan`
-用 `@asynccontextmanager` 注册（**替代已弃用的 `@app.on_event("startup")``**）。启动时：
+用 `@asynccontextmanager` 注册（**替代已弃用的 `@muti_llm_agent.on_event("startup")``**）。启动时：
 1. **中断标记**：调用 `manager.mark_interrupted()` 把上一进程遗留的 `running/paused` 会话标记为 `interrupted`（前端展示中断横幅）；
 2. **注册完成回调**：`manager.set_done_handler(_on_done)`，各会话讨论完成（`status=done`）→ 自动 `export_markdown()` 落盘 `data/discussions/` 并 `record_discussion()` 写入历史记忆索引。
 
@@ -561,16 +580,16 @@ FastAPI 应用，挂载 `/static`，提供 REST + WebSocket。
 | GET | `/api/history?q=` | 历史讨论列表（`items` 按时间倒序；`q` 非空时按题目 / trace_id 关键词过滤） |
 | GET | `/api/history/{filename}` | 查看某场历史讨论的完整 Markdown（`404` 表示记录不存在，含路径穿越防护） |
 
-> **请求体验证双轨契约（P0-2）**：`app/schemas.py` 只做**类型 / 形状**校验（`app/schemas.py:11`），非法请求体由 FastAPI 返回 `422` 并自动生成 OpenAPI 文档；业务语义校验（Agent 数量 1–6、讨论状态冲突、空文本等）保留在各端点内，维持前端依赖的既有 `{ok, error}` `400` 契约。
+> **请求体验证双轨契约（P0-2）**：`muti_llm_agent/schemas.py` 只做**类型 / 形状**校验（`muti_llm_agent/schemas.py:11`），非法请求体由 FastAPI 返回 `422` 并自动生成 OpenAPI 文档；业务语义校验（Agent 数量 1–6、讨论状态冲突、空文本等）保留在各端点内，维持前端依赖的既有 `{ok, error}` `400` 契约。
 
-> **`_safe_discussion_filename(fname)`（P0-1，`app/main.py:284`）**：`filename` 只保留 `Path(fname).name`（丢弃目录 / 绝对路径 / `..`），清洗后为空回退 `discussion_{_ts()}.md`，未以 `.md` 结尾则补后缀；与读取侧 `history.get_markdown` 的 `resolve()` + `relative_to()` 防护（§13.4）构成读写两侧的路径穿越防线。
+> **`_safe_discussion_filename(fname)`（P0-1，`muti_llm_agent/main.py:284`）**：`filename` 只保留 `Path(fname).name`（丢弃目录 / 绝对路径 / `..`），清洗后为空回退 `discussion_{_ts()}.md`，未以 `.md` 结尾则补后缀；与读取侧 `history.get_markdown` 的 `resolve()` + `relative_to()` 防护（§13.4）构成读写两侧的路径穿越防线。
 
 ### 13.3 WebSocket `/ws?session_id=`
 - 连接即推送当前 `status`（含 agents/topic/max_rounds/phase + **`spent_tokens` / `output_tokens` / `fairness` / `cost_rmb` / `elapsed_time_ms` / `session_id`**），便于前端初始化席位与状态面板；
 - 订阅 `event_bus`，把每个事件 `send_json` 给前端；
 - 断开/异常时在 `finally` 中退订，避免订阅队列泄漏。
 
-### 13.4 历史讨论记忆索引 — `app/history.py`
+### 13.4 历史讨论记忆索引 — `muti_llm_agent/history.py`
 把每场讨论的「题目 + 元信息」持久化到 `data/discussions/index.json`（按 filename 去重 upsert，头部插入，保留最近 200 条），作为历史讨论的记忆化保存，支撑后续检索：
 
 - `record_discussion(topic, trace_id, filename, status, phase, round_no, max_rounds, token_spent, agents)`：写入 / 更新一条索引（内部 `threading.Lock` 保证并发安全）；`token_spent` 来自只读遥测，仅作展示。
@@ -585,7 +604,7 @@ FastAPI 应用，挂载 `/static`，提供 REST + WebSocket。
 
 ---
 
-### 13.5 文件解析与共享知识注入 — `app/file_parser.py`
+### 13.5 文件解析与共享知识注入 — `muti_llm_agent/file_parser.py`
 为「共享知识库」提供**文件上传 → 文本提取 → 按段注入向量库**的前置处理，支持 `txt/md/csv/log`、`docx`（python-docx）、`xlsx`（openpyxl）、`pdf`（pypdf）、图片 OCR（RapidOCR）：
 
 - `parse_file(filename, data) -> (text, meta)`：按扩展名分派到各格式提取函数；全部第三方依赖**懒加载**，缺失时抛 `ParseError` 给出一行可读提示，不阻塞其它格式。
@@ -593,9 +612,9 @@ FastAPI 应用，挂载 `/static`，提供 REST + WebSocket。
 - `split_paragraphs(text)`：按行切分为待索引的知识块。
 - 入口：`POST /api/upload`（multipart）解析后调 `shared_vector_store.add()` 注入；前端「共享知识库」区提供文件选择 + 上传解析按钮，`/api/defaults` 暴露 `upload_exts` 支持格式表。
 
-### 13.6 REST 请求体模型 — `app/schemas.py`（P0-2）
+### 13.6 REST 请求体模型 — `muti_llm_agent/schemas.py`（P0-2）
 
-与 `app/protocol.py`（Agent 间通信协议）分离的 **REST 边界模型**，为四个写接口提供类型校验：
+与 `muti_llm_agent/protocol.py`（Agent 间通信协议）分离的 **REST 边界模型**，为四个写接口提供类型校验：
 
 | 模型 | 对应接口 | 关键字段 |
 | --- | --- | --- |
@@ -606,15 +625,15 @@ FastAPI 应用，挂载 `/static`，提供 REST + WebSocket。
 | `IngestRequest` | `POST /api/ingest` | `session_id`（可选）、`text`、`source`（默认"用户注入"） |
 | `SaveMarkdownRequest` | `POST /api/save_markdown` | `session_id`（可选）、`filename`（可省略，省略自动生成） |
 
-**设计约定**（`app/schemas.py:8`）：只做类型 / 形状校验，非法请求体由 FastAPI 返回 `422`；业务语义校验仍保留在各端点内，维持既有 `{ok, error}` `400` 契约。`main.py` 侧用 `payload.model_dump()` 转 dict 后交给 `orchestrator`。
+**设计约定**（`muti_llm_agent/schemas.py:8`）：只做类型 / 形状校验，非法请求体由 FastAPI 返回 `422`；业务语义校验仍保留在各端点内，维持既有 `{ok, error}` `400` 契约。`main.py` 侧用 `payload.model_dump()` 转 dict 后交给 `orchestrator`。
 
 ### 13.7 工程化配置与测试门禁（P1-4 / P1-5）
 
-- **`pyproject.toml`**：声明 `requires-python = ">=3.10"`；`[tool.ruff]` 启用 `E4/E7/E9/F/I/UP/RUF/B/S` 规则（`line-length=110`，忽略 `BLE001/S110/RUF001/002/003` 中文标点误报；`tests/*` per-file-ignores `S101/S310`）；`[tool.mypy]` strict 模式仅覆盖 `app/protocol.py`（全量开启为后续工作）；`[tool.coverage]` 以 `app/` 为源码、`branch=true`。
+- **`pyproject.toml`**：声明 `requires-python = ">=3.10"`；`[tool.ruff]` 启用 `E4/E7/E9/F/I/UP/RUF/B/S` 规则（`line-length=110`，忽略 `BLE001/S110/RUF001/002/003` 中文标点误报；`tests/*` per-file-ignores `S101/S310`）；`[tool.mypy]` strict 模式仅覆盖 `muti_llm_agent/protocol.py`（全量开启为后续工作）；`[tool.coverage]` 以 `muti_llm_agent/` 为源码、`branch=true`。
 - **`requirements-dev.txt`**：`-r requirements.txt` + `ruff>=0.5` / `mypy>=1.10` / `coverage>=7.0`，与运行依赖分离。
 - **接口级测试 `tests/test_api_flow.py`**：`httpx.AsyncClient(transport=ASGITransport(app))` 直接驱动 FastAPI 应用，monkeypatch `_judge_round / _final_summary / _consume_stream / _run_llm_retry` 四个 LLM 调用点实现确定性输出，**无需启动服务器、无需真实模型**。7 个用例：HTTP 全链路（configure→start→done→export→save_markdown→history）、`../../evil.md` 路径穿越被清洗为 `evil.md`、空请求体 save_markdown 回退默认文件名、空 Agent 列表保持 `400` 契约、configure 返回 fairness 报告、**status 携带 Token 遥测 + 公平性字段（`spent_tokens` / `output_tokens` / `fairness` 各层状态）**。运行：`python -m unittest tests.test_api_flow -v`。
 - **CI 门禁**（`.github/workflows/ci.yml`）：安装步骤含 `fastapi httpx ruff mypy`，在 fast 单测之后新增 `Lint (ruff)`、`Type check (mypy)`、`API flow tests` 三步。
-- **RUF006 后台任务强引用**：后台任务集合与 `spawn()` 抽取为独立模块 `app/bgtasks.py`（§2），`main.py` / `orchestrator.py` 统一 `from app.bgtasks import spawn as _spawn_task` 登记后台任务（完成回调自动 discard），消除两份重复实现，防止任务被 GC 提前回收。
+- **RUF006 后台任务强引用**：后台任务集合与 `spawn()` 抽取为独立模块 `muti_llm_agent/bgtasks.py`（§2），`main.py` / `orchestrator.py` 统一 `from muti_llm_agent.bgtasks import spawn as _spawn_task` 登记后台任务（完成回调自动 discard），消除两份重复实现，防止任务被 GC 提前回收。
 
 ---
 
@@ -635,7 +654,7 @@ FastAPI 应用，挂载 `/static`，提供 REST + WebSocket。
 - 历史面板 `.history-modal` / `.history-layout` / `.h-item`。
 - **状态面板（Token 统计 + 公平性事件）**：`.budget-bar` 样式保留但仅承载只读遥测（无预算总量/进度概念）；`.budget-sub` 虚线分隔「公平性事件」；`.budget-events`（max-height 96px 滚动）；`.budget-event`（12px 行）+ `.ev-tag`（10px 圆角小标签，`ev-warn` 金 / `ev-err` 红 / `ev-ok` 绿）。
 
-### 14.3 逻辑 `app.js`
+### 14.3 逻辑 `muti_llm_agent.js`
 - `init()`：拉取 `/api/defaults`、生成卡片、绑定事件、连接 WS；探测服务器是否存在可继续的讨论（`/api/status`）。
 - `generateAgentCards(n)`：按数量生成配置卡片，首个标记"主 Agent"且立场固定 HOST，其余按 PRO/CON 交替；立场下拉可选 HOST/PRO/CON/NEUTRAL。
 - `startDiscussion()`：组装 `agents`（含 `stance`）→ `/api/configure` → 渲染席位 → `/api/start`。
@@ -696,7 +715,7 @@ FastAPI 应用，挂载 `/static`，提供 REST + WebSocket。
 | `_create_task` 接收方不存在 | 忽略该任务并记日志（P15 修复） |
 | lifespan 自动落盘失败 | 结构化日志（`lifespan.save_markdown`）+ 幂等重试（1, 2 次），不再静默吞掉（P1-3） |
 | 后台任务被 GC 提前回收 | 模块级 `_background_tasks` set 持有强引用，`_spawn_task` 完成回调自动移除（RUF006） |
-| 非法 REST 请求体 | FastAPI 依据 `app/schemas.py` 返回 `422`；业务语义非法返回 `{ok, error}` `400`（P0-2） |
+| 非法 REST 请求体 | FastAPI 依据 `muti_llm_agent/schemas.py` 返回 `422`；业务语义非法返回 `{ok, error}` `400`（P0-2） |
 | `save_markdown` filename 含目录/绝对路径/`..` | `_safe_discussion_filename` 清洗为 basename + 强制 `.md`，无法越出讨论目录（P0-1） |
 
 ---
@@ -709,10 +728,10 @@ FastAPI 应用，挂载 `/static`，提供 REST + WebSocket。
 | Pro/Con 立场绑定、禁止倒戈（§2.2/2.3） | `agent._stance_declaration` + `configure` 立场分配 |
 | Judge Agent：多维度评分 + winner + 收敛标记（§2.4） | `orchestrator._judge_round` → `Judgment`（仅辩手发言评分；few-shot 示例池防照抄） |
 | Judge 全局得分后端计算 + 纯内容判定胜方 | `_compute_composite` 逐维均值算 `scores`（不依赖 LLM）；`agent_scores` 内容均分最高方为 winner（并列 DRAW）；模型质量分 / `composite_scores` 仅展示 |
-| RAG Agent：断言提取 + 检索 + 置信度 + 缓存（§2.5） | `app/rag.py`（`rag_service`，24h 缓存） |
-| 消息协议：TaskDispatch / ArgumentSubmit / Rebuttal / Judgment / StatusSync（§3） | `app/protocol.py`（pydantic + task_id UUID + token_cost + 毫秒时间戳） |
+| RAG Agent：断言提取 + 检索 + 置信度 + 缓存（§2.5） | `muti_llm_agent/rag.py`（`rag_service`，24h 缓存） |
+| 消息协议：TaskDispatch / ArgumentSubmit / Rebuttal / Judgment / StatusSync（§3） | `muti_llm_agent/protocol.py`（pydantic + task_id UUID + token_cost + 毫秒时间戳） |
 | 状态机：Idle→Preparing→Debating→Judging→Finished（§4.1） | `PHASES` + `self.phase`（异常熔断回 Idle） |
-| 多客户端隔离 / 会话路由（P5 → P1-7） | `app/manager.py` `DebateManager` 按 `session_id` 独立 `Orchestrator`；`data/sessions/{sid}.json` 元数据快照；重启后 `mark_interrupted()` 中断恢复横幅；前端 `localStorage` 持久化 `session_id` |
+| 多客户端隔离 / 会话路由（P5 → P1-7） | `muti_llm_agent/manager.py` `DebateManager` 按 `session_id` 独立 `Orchestrator`；`data/sessions/{sid}.json` 元数据快照；重启后 `mark_interrupted()` 中断恢复横幅；前端 `localStorage` 持久化 `session_id` |
 | 并行立论（§4.2/6.2） | 第 1 轮 `asyncio.gather` 并发 `_debate_turn` |
 | 终止条件：max_rounds + 收敛 + 人工（§4.3） | `run_discussion` 终止判断（收敛/轮次/手动 end；公平性治理下无预算熔断） |
 | 收敛检测：语义相似度 + 新证据增量（§4.4） | `_check_convergence`（embedding 余弦 + RAG 新证据判断；`CONVERGENCE_PER_SPEAKER` 按发言者逐人平均，§5.7） |
@@ -720,7 +739,7 @@ FastAPI 应用，挂载 `/static`，提供 REST + WebSocket。
 | 消息队列（§5.1） | 进程内 `EventBus`（单进程部署可接受，未采用 Redis） |
 | 共享黑板（§5.2） | 内存 `shared_context` + `transcript`（未持久化） |
 | 心跳与故障恢复（§5.3） | 未实现（`status_sync` 事件承担部分状态广播） |
-| 公平性治理（替代旧 Token 预算控制 §6.3） | `FairnessGovernor` L1–L6（`app/fairness.py`）：输出字数上限/有效回答占比/输入对称/轮次对称/采样对齐/长度中立裁判；`spent`/`output_tokens` 只读遥测；不再下发 `max_tokens` |
+| 公平性治理（替代旧 Token 预算控制 §6.3） | `FairnessGovernor` L1–L6（`muti_llm_agent/fairness.py`）：输出字数上限/有效回答占比/输入对称/轮次对称/采样对齐/长度中立裁判；`spent`/`output_tokens` 只读遥测；不再下发 `max_tokens` |
 | 对手定向反驳 + 输出字数约束 + 按轮强压缩 | `_find_opponent`（`config.OPPONENT_STANCE` 立场映射，回退全局最近）/ `_prepare_opponent_context`（第 2 轮原文截断、第 3 轮起 `summarize_text` 摘要 + 缓存 + **关键论据句 `_extract_argument_sentences`**）/ `_debate_prompt` 注入字数提示（`governor.ceiling_for`）与论据句逐条回应指令 / `_agent_turn` 超长截断兜底 / `compress_history(keep_rounds=N)` 按轮保留 |
 | 任务与辩论分离（§5.8） | `_task_turn`（只回填 `shared_context`，任务输出不进 `round_arguments`/记忆）/ `_debate_turn`（正常发言记录）；主循环两阶段调用 |
 | 缓存策略（§6.4） | RAG 检索 24h 缓存（`rag.py:_search_cached`） |
@@ -780,7 +799,7 @@ FastAPI 应用，挂载 `/static`，提供 REST + WebSocket。
 
 ## 20. 预算校准真实冒烟记录（2026-08-28，历史存档）
 
-> ⚠️ **历史存档**：本章记录旧的「全局 Token 预算 + 自适应校准」系统的真实冒烟验证（2026-08-28 执行）。该系统已于 **2026-08-31 整体移除**，由 `FairnessGovernor` L1–L6 公平性治理替代（见 §12.7）；`app/budget.py`、`data/budget_profile.json`、`_est_factor/_call_factor/_growth_ratio` 三路 EMA 及预算熔断均不复存在。本章保留仅作历史参考，其结论**不再适用于当前代码**。
+> ⚠️ **历史存档**：本章记录旧的「全局 Token 预算 + 自适应校准」系统的真实冒烟验证（2026-08-28 执行）。该系统已于 **2026-08-31 整体移除**，由 `FairnessGovernor` L1–L6 公平性治理替代（见 §12.7）；`muti_llm_agent/budget.py`、`data/budget_profile.json`、`_est_factor/_call_factor/_growth_ratio` 三路 EMA 及预算熔断均不复存在。本章保留仅作历史参考，其结论**不再适用于当前代码**。
 
 对自适应校准（`_est_factor` / `_call_factor`）做真实冒烟验证（临时脚本直连本机服务，非测试套件）。固定配置：3 个 Agent（主持=HOST + 正方=PRO + 反方=CON，全部 default=MiMo）、裁判同模型、`max_tokens=4096`。预算与轮次见各场：
 
@@ -801,7 +820,7 @@ FastAPI 应用，挂载 `/static`，提供 REST + WebSocket。
 **结论**：两路 EMA 校准对 2 轮短辩论有效（超支 42%→4.3%），但**规划器对"历史累积输入成本"建模不足**——轮次越多超支越差。
 
 **实现更新（同日志实现）**：上述缺口已通过三处补齐（§12.7）——
-1. **历史增长模型**：规划公式升级为 `prompt_cost(R) = R·P + g·P·R·(R−1)/2`（`app/budget.py`），g 为每轮历史增长比，由新增 `_growth_ratio` 环比 EMA 校准（α=0.2，钳制 [0.05, 2.0]，负增长钳为 0，跳过首轮）。
+1. **历史增长模型**：规划公式升级为 `prompt_cost(R) = R·P + g·P·R·(R−1)/2`（`muti_llm_agent/budget.py`），g 为每轮历史增长比，由新增 `_growth_ratio` 环比 EMA 校准（α=0.2，钳制 [0.05, 2.0]，负增长钳为 0，跳过首轮）。
 2. **保守先验 + 档案持久化**：`est_factor / call_factor / growth_ratio` 落盘 `data/budget_profile.json`，启动载入；无档案时用 `EST_FACTOR_INIT=2.0`（对照冒烟 #6 首轮 2.68× 实测，2.0 先验避免首轮 40% 预算被单轮烧掉），历史乐观档案钳制 ≥1.0。
 3. **预算不足自动削轮次**：规划超支且质量下限（`JUDGE_MIN_OUTPUT` / `SUMMARY_MIN_OUTPUT` = 512）仍无法覆盖全部轮次时，按 `feasible_rounds` 把 `max_rounds` 裁剪到可支撑范围（`BUDGET_AUTO_TRIM_ROUNDS=1`，事件 `budget.round_trim`）；阶段输出保底保证裁决/汇总 JSON 不再因 E 触底为空。
 
@@ -841,4 +860,81 @@ python scripts/eval_baseline.py data/discussions/discussion_xxx.md --baseline da
 
 ---
 
-*文档覆盖 `app/config / app/protocol / app/schemas / app/llm / app/embeddings / app/vector_store / app/memory / app/tools / app/rag / app/agent / app/orchestrator / app/manager / app/bgtasks / app/history / app/file_parser / app/main / app/static` 全部模块，可作为二次开发与维护的权威参考。*
+## 22. P1 / P2 加固说明（编排器拆包 · 背压 · 线程池 · 安全）
+
+### 22.1 模块分层：`orchestrator.py` 只留状态机与回合驱动
+
+拆包前 `orchestrator.py` 2306 行，同时承担状态机、prompt 文案、任务机、记忆管家、评分、渲染导出。现按职责拆为 6 个模块（编排器保留同名方法作为**薄委托**，既有测试与外部脚本的导入路径不变）：
+
+| 模块 | 内容 | 编排器内的对应方法 |
+| --- | --- | --- |
+| `muti_llm_agent/events.py` | `EventBus`（有界队列 + 背压） | `self.event_bus` |
+| `muti_llm_agent/prompts.py` | 工具 schema / `CONCLUSION_TEMPLATE` / `reflection_prompt` / `parse_reflection` / `main_directive` / `collab_*` | `_main_directive` / `_collab_main_directive` / `_collab_work_prompt` |
+| `muti_llm_agent/textutil.py` | `shorten` / `text_similarity` / `extract_argument_sentences` / `estimate_cost_rmb` | 模块级别名 `_shorten` / `_text_similarity` / `_extract_argument_sentences` / `_estimate_cost_rmb` |
+| `muti_llm_agent/scoring.py` | `score_ttft` / `score_rate` / `model_performance` / `compute_composite` / `judge_ruling_text` | `_score_ttft` / `_model_performance` / `_performance_text` / `_compute_composite` / `_judge_ruling_text` |
+| `muti_llm_agent/conclusion.py` | `split_sections` / `normalize_conclusion` / `fallback_summary` | `_split_sections` / `_normalize_conclusion` / `_fallback_summary` |
+| `muti_llm_agent/exporter.py` | `render_markdown(orch)` | `export_markdown` |
+
+`muti_llm_agent/netguard.py` 为新增安全模块（见 22.4）；`muti_llm_agent/bgtasks.py` 新增流式线程池（见 22.3）。
+
+### 22.2 事件总线背压（`muti_llm_agent/events.py`）
+
+`publish` 由讨论主循环每轮多次 `await`，绝不能因某个订阅者慢而阻塞：
+
+- 队列**有界**（`DEFAULT_QUEUE_MAXSIZE = 512`），投递全程 `put_nowait`；
+- 队列满 → 先 `get_nowait()` 丢弃**最旧**事件，再放入当前事件；丢弃累计到 `bus.dropped`；
+- 丢弃数每满 100 条落一次 `eventbus.backpressure` warning（防日志刷屏）；
+- `bus.stats()` → `{subscribers, maxsize, dropped}`，随 `GET /api/status` 的 `eventbus` 字段对外可见。
+
+丢事件只影响"过期增量"，终态由 `speech_end` / `status_sync` 兜底；换来的是主循环永不被 UI 拖住 + 积压可观测。
+
+### 22.3 LLM 流式线程池（`muti_llm_agent/bgtasks.py`）
+
+`_consume_stream` 早期每次调用 `threading.Thread(...).start()`：线程数无上限，且 `STREAM_TIMEOUT` 超时后线程仍阻塞在 SDK 里无法回收。现在：
+
+- `submit_stream(fn)` 提交到 `ThreadPoolExecutor`（容量 `LLM_STREAM_WORKERS`，默认 8，线程名 `llm-stream-*`），超额排队而非新建线程；
+- worker 每收到一个增量前检查 `cancelled` 事件；`finally` 里置位 → 超时后线程在下个增量处主动退出，把槽位还给池子；
+- 从 worker 线程投递事件走 `_emit`（`call_soon_threadsafe` + `RuntimeError` 兜底），事件循环已关闭时静默丢弃。
+
+### 22.4 出站地址安全（`muti_llm_agent/netguard.py`，防 SSRF）
+
+`/api/configure` 接受客户端自带的 `base_url` 且服务端会真的向它发请求，因此 `llm.resolve_model_config` 对**用户显式给出的** base_url 一律先过 `check_outbound_url`：
+
+- 只允许 `http` / `https`；拒绝空值与非 URL；
+- 主机是 IP 字面量或解析结果落在回环 / 私网 / 链路本地 / 保留 / 组播 / 未指定网段 → 拒绝（含 `169.254.169.254` 云元数据）；
+- `localhost` 等本机主机名 → 拒绝；
+- **单标签主机名**（无点号，如 `http://intranet`）→ 拒绝（依赖本地 search domain 是 SSRF 常见入口）；
+- 域名解析失败 → 放行 + `netguard.unresolved` warning（配置阶段端点可能离线，fail-closed 会让用户连配置都存不了）；
+- `.env` 的 `CUSTOM_BASE_URL_ALLOW_PRIVATE=1` 整体豁免（本地 Ollama / vLLM 场景）。
+
+> 已知限制：校验发生在**配置时**，运行期由 SDK 重新解析。DNS rebinding 仍可能绕过，生产需叠加网络层出站策略。
+
+### 22.5 可选令牌鉴权（`AUTH_TOKEN`）
+
+- `settings.AUTH_TOKEN` 非空时，`main.py` 的 `auth_middleware` 拦截所有非静态请求：`Authorization: Bearer <token>` 或 `?token=<token>`，用 `hmac.compare_digest` 常量时间比较，失败返回 `401 {"ok": false}`；
+- `/` 与 `/static/*` 保持公开（页面本身不含数据）；`/ws` 在 `accept()` 后校验，失败以关闭码 `4401` 断开，前端据此停止重连并提示用 `?token=` 打开；
+- 前端单点包装 `window.fetch` 注入 Authorization 头；页面从 `?token=` 读一次即写入 `localStorage`；
+- `/api/defaults` 暴露 `auth_required`（布尔）与 `stream_pool.max_workers`，便于运维确认部署状态。
+
+### 22.6 遗忘机制修复（mypy 扩容后发现）
+
+`MemorySystem` 同时存在属性 `self.forget`（dict，遗忘参数）与方法 `def forget(self)`：Python 中**实例属性会遮蔽同名方法**，于是 `memory.forget()` 实际在"调用一个 dict"抛 `TypeError`，而调用方 `Orchestrator._memory_housekeeping` 的 `except Exception: pass` 把它吞掉 —— 遗忘机制长期**静默失效**（短期记忆只涨不减）。
+
+修复：属性重命名为 `self.forget_config`（`memory.json` 内 JSON 键仍为 `"forget"`，向后兼容），`snapshot()` 返回其**拷贝**；新增 `tests/test_p1_p2.py::MemoryForgetRegressionTest` 锁定"`forget` 必须是可调用方法"与"过期条目会被清除"。该问题由 `mypy` 的 `[method-assign]` 检查在"整包类型门禁"上线后立刻暴露。
+
+### 22.7 其他收敛项
+
+| 项 | 处理 |
+| --- | --- |
+| 死配置 | 删除 `TAVILY_API_KEY`（仅有 SerpApi 实现）、`NEO4J_*`（从未使用）、`EMBED_MODEL_TYPE`/`EMBED_API_KEY`/`EMBED_BASE_URL`（无远端嵌入实现）；`QDRANT_DISTANCE` 真正接上 `Distance` 枚举映射 |
+| 分块一致性 | `/api/ingest` 与 `/api/upload` 统一走 `file_parser.split_paragraphs` |
+| 上传限流 | `/api/upload` 先查声明 size、再 `read(MAX_UPLOAD_BYTES + 1)`，超限返回 `413`（此前先整体读进内存再拒） |
+| 工具循环 | 硬编码 `range(5)` → `TOOL_LOOP_MAX`；跑满时记 `llm.tool_loop_limit` 并推 `agent_error`（此前静默截断） |
+| 前端命名 | `budget-panel`/`budgetEvents`/`BUDGET_EVENT_TEXT` → `fairness-*`；删除无引用的 `.budget-bar` 残留样式 |
+| 模板密钥 | 前端保存讨论模板时清空 `api_key`（localStorage 明文风险），载入后需重填 |
+| CI 门禁 | 由"两个测试文件"改为 `unittest discover tests` 全量；ruff 覆盖 `app tests scripts`；mypy 双门禁（整包 + `--strict` 协议层） |
+| 文档治理 | 两份过期方案移入 `docs/archive/` 并加归档声明；新增 `docs/README.md` 文档索引；修正对本仓库不存在文件的交叉引用 |
+
+---
+
+*文档覆盖 `muti_llm_agent/config / muti_llm_agent/protocol / muti_llm_agent/schemas / muti_llm_agent/llm / muti_llm_agent/embeddings / muti_llm_agent/vector_store / muti_llm_agent/memory / muti_llm_agent/tools / muti_llm_agent/rag / muti_llm_agent/agent / muti_llm_agent/fairness / muti_llm_agent/orchestrator / muti_llm_agent/events / muti_llm_agent/prompts / muti_llm_agent/textutil / muti_llm_agent/scoring / muti_llm_agent/conclusion / muti_llm_agent/exporter / muti_llm_agent/netguard / muti_llm_agent/manager / muti_llm_agent/bgtasks / muti_llm_agent/history / muti_llm_agent/file_parser / muti_llm_agent/main / muti_llm_agent/static` 全部模块，可作为二次开发与维护的权威参考。*

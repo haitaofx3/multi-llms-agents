@@ -273,7 +273,7 @@ Debating --> Idle: 异常熔断
 
 ### 6.3 公平性治理（替代 Token 预算控制）
 
-Token 数不是跨模型公平的度量单位（不同模型的量化方式与 embedding 向量维度不同），全局 `total_token` 预算机制已移除，`max_tokens` 不再下发给 API。改为 `app/fairness.py` 的 **FairnessGovernor** 六层治理，以「字符数 + 相对比例」作为跨模型公平的度量单位：
+Token 数不是跨模型公平的度量单位（不同模型的量化方式与 embedding 向量维度不同），全局 `total_token` 预算机制已移除，`max_tokens` 不再下发给 API。改为 `muti_llm_agent/fairness.py` 的 **FairnessGovernor** 六层治理，以「字符数 + 相对比例」作为跨模型公平的度量单位：
 
 - **L1 输出上限**：相对（参照对手近 N 轮有效输出均值 × `FAIR_OUTPUT_RATIO`，下限 `FAIR_FLOOR_CHAR_LIMIT`）× 比例与硬性字符安全上限（`FAIR_HARD_CHAR_CEILING` 默认 3000）取 min；超限后**事后截断**（保留头尾，不阻止生成，防止截断竞态）。
 - **L2 有效回答比例**：剥离 `<think>` 思考片段后统计有效回答占比，思考占比超 `FAIR_THINK_RATIO_MAX` 记 warning。
@@ -379,6 +379,6 @@ token 用量（累计 `spent_tokens` / 输出 `output_tokens`）仅作**只读�
 
 ### 9.6 接口安全与可靠性加固（P0 / P1 落地）
 
-- **REST 请求体 pydantic 校验（P0-2）**：`app/schemas.py` 为 `configure / start / ingest / save_markdown` 定义 `ConfigureRequest / StartRequest / IngestRequest / SaveMarkdownRequest` 模型。只做**类型 / 形状**校验，类型非法时 FastAPI 返回 `422` 并自动生成 OpenAPI 文档；业务语义校验（Agent 数量 1–6、讨论状态冲突、空文本等）仍保留在各端点内，维持前端依赖的既有 `{ok, error}` `400` 错误契约。
+- **REST 请求体 pydantic 校验（P0-2）**：`muti_llm_agent/schemas.py` 为 `configure / start / ingest / save_markdown` 定义 `ConfigureRequest / StartRequest / IngestRequest / SaveMarkdownRequest` 模型。只做**类型 / 形状**校验，类型非法时 FastAPI 返回 `422` 并自动生成 OpenAPI 文档；业务语义校验（Agent 数量 1–6、讨论状态冲突、空文本等）仍保留在各端点内，维持前端依赖的既有 `{ok, error}` `400` 错误契约。
 - **lifespan 落盘可靠性（P1-3）**：讨论完成自动保存 Markdown 的异常不再静默吞掉（原先 `except Exception: pass`），改为捕获后写结构化日志（`lifespan.save_markdown` 事件）并幂等重试一次（写入与索引均为 upsert，重复执行安全）。
 - **接口级测试覆盖（P1-4）**：`tests/test_api_flow.py` 使用 `httpx.AsyncClient` + `ASGITransport` 直接驱动 FastAPI 应用，monkeypatch `_consume_stream / _run_llm_retry / _judge_round / _final_summary` 四个 LLM 调用点实现确定性输出，**无需启动服务器、无需真实模型**即可覆盖 configure → start → done → export → save_markdown → history 全链路、路径穿越防护、空请求体默认文件名与既有 400 契约，可在 CI 中随单测一起运行。
