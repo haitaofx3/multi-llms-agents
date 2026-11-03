@@ -1,0 +1,23 @@
+# CI 与本地门禁所需的最小依赖（**不包含** torch 等重型可选依赖）
+#
+# 这个文件存在的唯一目的：让「CI 装了什么」成为仓库里可校验的事实，而不是
+# ci.yml 里的一行手写清单。历史上就因为那份清单漏了 `pytest` 与 `websockets`，
+# 导致 CI 在采集阶段直接崩，而本地永远复现不出来。
+#
+# 规则（由 tests/test_dependency_closure.py 强制）：
+#   1. 本文件必须覆盖所有**模块级导入**的第三方包；
+#   2. 只在函数体内延迟导入的可选依赖**不必**列入——它们缺失时按设计降级。
+#
+# 完整依赖见 requirements.txt；质量工具链见 requirements-dev.txt。
+numpy
+pydantic
+openai
+fastapi
+httpx
+uvicorn
+pytest
+websockets
+coverage
+# 以下是工具而非可导入模块，列在这里便于 CI 一条命令装齐
+ruff
+mypy

@@ -6,3 +6,14 @@ data/
 .ci_venv/
 # 本地跑服务时的 stdout 重定向（含结构化日志，属运行产物）
 server-*.log
+
+# 覆盖率产物（scripts/gate.py 每次运行都会生成 .coverage）
+.coverage
+.coverage.*
+htmlcov/
+
+# 工具缓存与临时探测目录
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.testtmp/

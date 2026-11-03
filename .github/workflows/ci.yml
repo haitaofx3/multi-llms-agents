@@ -6,7 +6,7 @@ on:
   pull_request:
 
 jobs:
-  build-and-test:
+  quality-gate:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -14,48 +14,25 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: pip
 
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
 
-      # 仅安装快速测试所需的最小依赖（包在无 sentence-transformers /
-      # Qdrant 时会自动降级为哈希向量 + 内存向量库，见 muti_llm_agent/embeddings.py、
-      # muti_llm_agent/vector_store.py）。完整 requirements.txt 会拉取 torch，不适用于 CI。
-      #
-      # 这份清单必须和测试真正 import 的东西对齐：
-      #   - pytest      ：下面跑的是 python -m pytest，runner 上并不保证预装；
-      #   - websockets  ：tests/test_e2e.py（手动脚本）导入它。该文件已被
-      #                   tests/conftest.py 的 collect_ignore 排除，但显式装上可以
-      #                   避免日后有人改回采集时又踩同一个坑。
-      # 其余可选依赖（docx / openpyxl / pypdf / rapidocr / PIL / sentence-transformers /
-      # qdrant-client）在代码里都是函数内延迟导入，缺失只影响对应功能，不影响测试。
-      - name: Install Python dependencies
+      # 依赖清单在 requirements-ci.txt，不在本文件里手写。
+      # 这样「CI 装了什么」就成了仓库里可被机器校验的事实：
+      # tests/test_dependency_closure.py 会强制它覆盖所有模块级第三方导入。
+      # （历史上就因为这份清单手写在 YAML 里、漏了 pytest / websockets，
+      #   导致 CI 在采集阶段直接崩，而本地永远复现不出来。）
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install numpy pydantic openai fastapi httpx ruff mypy pytest websockets
+          pip install -r requirements-ci.txt
 
-      - name: Lint (ruff)
-        run: python -m ruff check muti_llm_agent tests scripts
-
-      - name: Type check (mypy, 整包)
-        run: python -m mypy
-
-      - name: Type check (mypy --strict, 协议层契约)
-        run: python -m mypy --strict --follow-imports=normal muti_llm_agent/protocol.py
-
-      - name: Build check (Python byte-compile)
-        run: python -m compileall -q muti_llm_agent
-
-      - name: Build check (JS syntax)
-        run: |
-          node --check muti_llm_agent/static/app.js
-          node --check muti_llm_agent/static/studio.js
-          node --check muti_llm_agent/static/console.js
-
-      # 全量快速回归：不需要服务器、不需要真实 LLM（ASGITransport + LLM 打桩），
-      # 覆盖状态机 / 公平性 / 裁决 / 多会话 / 新特性 / P0 修复 /
-      # 多模型协同（纠偏、续轮、复盘、接口调试、对外集成）等用例。
-      # tests/test_e2e.py 需要启动服务器 + 真实 LLM API（单次调用 >90s），不进 CI。
-      - name: Run fast test suite
-        run: python -m pytest tests -q
+      # 门禁的唯一定义在 scripts/gate.py，本地与 CI 跑的是同一段代码：
+      #   ruff -> mypy 整包 -> mypy --strict(协议层) -> compileall
+      #   -> node --check ×3 -> pytest + 覆盖率下限
+      # 本地提交前可以用同一条命令自查：python scripts/gate.py
+      - name: Quality gate
+        run: python scripts/gate.py --ci

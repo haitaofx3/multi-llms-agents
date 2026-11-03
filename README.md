@@ -184,6 +184,9 @@ curl -s 'http://127.0.0.1:8000/api/iterations?session_id=demo'   # 迭代链 + �
 Muti_LLM_Agent/
 ├── start.py                    启动入口（uvicorn，默认 127.0.0.1:8000，关掉访问日志）
 ├── pyproject.toml              工程化配置（ruff / mypy / coverage）
+├── requirements.txt            运行依赖（含可选重型依赖）
+├── requirements-ci.txt         门禁/CI 的最小依赖清单（受 test_dependency_closure 校验）
+├── requirements-dev.txt        质量工具链（ruff / mypy / coverage）
 ├── .env                        本地密钥与开关（gitignore，不提交）
 ├── .env.example                配置模板：全部 93 个键 + 默认值，可提交
 ├── docs/
@@ -221,6 +224,7 @@ Muti_LLM_Agent/
 │   │   ├── studio.js+studio.css                  增量层：配方 / 纠偏 / 摘要 / 续轮面板
 │   │   └── console.html+console.js+console.css   接口控制台
 ├── scripts/
+│   ├── gate.py                 质量门禁唯一入口（本地与 CI 共用同一段代码）
 │   ├── api_smoke.py            对已运行服务做接口冒烟（两种用法见下）
 │   └── eval_baseline.py        讨论质量基线评测
 ├── tests/                      快速回归（ASGITransport + LLM 打桩，无需服务器/真实 API）
@@ -273,18 +277,32 @@ Muti_LLM_Agent/
 
 ## 测试与质量门禁
 
+**门禁只有一个入口**，CI 与本地跑的是同一段代码：
+
 ```bash
-# 全量快速回归（不需要服务器、不需要真实 LLM：ASGITransport + LLM 打桩）
-python -m pytest tests -q
-# → 退出码 0 即通过。用例数以 CI 实际输出为准，这里不写数字（写死必然漂移）。
-# tests/test_e2e.py 是手动跑的端到端脚本，已被 conftest 的 collect_ignore 排除。
-
-# 静态检查
-python -m ruff check muti_llm_agent tests scripts
-
-# 类型检查（整包；protocol.py 另有 --strict 契约门禁，见 ci.yml）
-python -m mypy
+python scripts/gate.py            # 全部门禁（提交前 / CI 用同一命令）
+python scripts/gate.py --fast     # 只跑静态检查（ruff + mypy + mypy --strict），秒级
+python scripts/gate.py --list     # 看步骤清单
 ```
+
+它会依次跑：`ruff` → `mypy`（整包）→ `mypy --strict`（协议层）→ `compileall` →
+`node --check`（3 个前端文件）→ `pytest` + 覆盖率下限。
+
+为什么非要收敛成一个入口：之前 CI 有 6 个独立 step、本地靠人记得分别敲，结果出现过
+两次同源事故——CI 的依赖清单漏了 `pytest`/`websockets` 导致采集期崩溃（本地因环境齐全
+永远复现不出），以及一次重构后本地漏跑 mypy 把类型错误提交上去。**CI 与本地共用一段代码，
+就不存在"两边不一致"这回事。**
+
+另有几条"结构性守门"用例（随 pytest 一起跑，不需要额外工具）：
+
+| 用例 | 守住什么 |
+| --- | --- |
+| [`tests/test_docs_consistency.py`](tests/test_docs_consistency.py) | 文档相对链接可解析、现行文档必须进索引、README 目录树条目真实存在、版本号单一来源 |
+| [`tests/test_dependency_closure.py`](tests/test_dependency_closure.py) | [`requirements-ci.txt`](requirements-ci.txt) 必须覆盖所有**模块级**第三方导入（延迟导入的可选依赖不受限） |
+| [`tests/test_gate_hygiene.py`](tests/test_gate_hygiene.py) | 测试模块不得在模块级共享管理器单例；手动脚本 `test_e2e.py` 必须留在采集范围外 |
+
+覆盖率下限写在 [`scripts/gate.py`](scripts/gate.py) 的 `COVERAGE_MIN`，它的作用是**防回退**，
+不是及格线——补测之后请把它上调。用例数以 CI 实际输出为准，本文不写死。
 
 `scripts/api_smoke.py` 有**两种用法**（它连真实端口，和 `tests/` 的进程内测试互补）：
 

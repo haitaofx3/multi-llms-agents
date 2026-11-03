@@ -40,7 +40,7 @@ from muti_llm_agent.conclusion import split_sections as _split_sections
 from muti_llm_agent.config import OPPONENT_STANCE, settings
 from muti_llm_agent.events import EventBus
 from muti_llm_agent.exporter import render_markdown
-from muti_llm_agent.fairness import FairnessGovernor
+from muti_llm_agent.fairness import FairnessGovernor, SamplingParams
 from muti_llm_agent.followup import (
     build_carryover,
     build_seed_block,
@@ -657,7 +657,7 @@ class Orchestrator:
                 tools = [*tools, CLAIM_SCHEMA]
 
         # 公平性 L5：辩论发言统一采样参数（temperature / top_p），非辩论模式用默认
-        samp = self.governor.sampling_params() if mode == "discussion" \
+        samp: SamplingParams = self.governor.sampling_params() if mode == "discussion" \
             else {"temperature": 0.7, "top_p": None}
 
         # 本回合的「LLM 往返 + 工具循环」交给 turn.run_agent_turn；

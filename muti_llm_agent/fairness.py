@@ -21,8 +21,22 @@ embedding 向量维度不同，token 数不是跨模型公平的度量单位，�
 """
 import re
 from dataclasses import dataclass, field
+from typing import TypedDict
 
 from muti_llm_agent.config import OPPONENT_STANCE, settings
+
+
+class SamplingParams(TypedDict):
+    """一次 LLM 调用的采样参数。
+
+    用 TypedDict 而不是裸 `dict`：`temperature` / `top_p` 会一路透传到
+    `turn.run_agent_turn`，裸 `dict` 让 mypy 只能推出 `Any`，等于让这道门禁失效
+    （曾经就因为这里没注解，重构后 mypy 报出的类型错误没人看见）。
+    """
+
+    temperature: float
+    top_p: float | None
+
 
 # <think> 片段正则（与 llm._strip_think 一致）
 _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
@@ -263,11 +277,11 @@ class FairnessGovernor:
 
     # ---- L5：采样参数对齐 --------------------------------------------------
 
-    def sampling_params(self) -> dict:
+    def sampling_params(self) -> SamplingParams:
         """辩论发言统一采样参数。"""
         return {"temperature": self.temperature, "top_p": self.top_p}
 
-    def judge_params(self) -> dict:
+    def judge_params(self) -> SamplingParams:
         """辅助 LLM（裁判 / 摘要）统一采样参数。"""
         return {"temperature": self.judge_temperature, "top_p": self.judge_top_p}
 
