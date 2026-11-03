@@ -24,9 +24,11 @@
 conda activate agent_env
 pip install -r requirements.txt          # 首次；质量工具另装 requirements-dev.txt
 
-# 2) 配置：项目根目录 .env（已存在，不要提交）
-#    最少要填 LLM_MODEL_ID / LLM_API_KEY / LLM_BASE_URL；
-#    想真正「多模型」，再把 QWEN_* / DEEPSEEK_* / MIMO_* 三组 Key 填上
+# 2) 配置（可选）：cp .env.example .env 后再改
+#    不建 .env 也能直接启动——所有键都有内置默认值（见 muti_llm_agent/config.py）。
+#    要真正跑起来，最少在 .env 里填 LLM_MODEL_ID / LLM_API_KEY / LLM_BASE_URL；
+#    想真正「多模型」，再把 QWEN_* / DEEPSEEK_* / MIMO_* 三组 Key 填上。
+#    .env 已被 gitignore（存真实密钥）；.env.example 是可提交的模板，二者键集合保持同步。
 
 # 3) 启动
 python start.py                          # 默认 http://127.0.0.1:8000
@@ -183,6 +185,7 @@ Muti_LLM_Agent/
 ├── start.py                    启动入口（uvicorn，默认 127.0.0.1:8000，关掉访问日志）
 ├── pyproject.toml              工程化配置（ruff / mypy / coverage）
 ├── .env                        本地密钥与开关（gitignore，不提交）
+├── .env.example                配置模板：全部 93 个键 + 默认值，可提交
 ├── docs/
 │   ├── API.md                  接口参考：49 个接口 + 横切约定 + SSE/WS 事件
 │   ├── MIGRATION.md            从 mini_test 迁到本项目的说明
@@ -227,9 +230,11 @@ Muti_LLM_Agent/
 
 ## 配置项
 
-**旧有键**（`LLM_*`、`QWEN_*`、`DEEPSEEK_*`、`MIMO_*`、`JUDGE_*`、`FAIR_*`、`CONVERGENCE_*`、`CONTEXT_*`、`REFLECTION_*`、`QDRANT_*`、`EMBED_*`、`AUTH_TOKEN`、`MAX_SESSIONS` 等）**不在这里重复**，含义与默认值见仓库 `.env` 文件里的分组注释与 `muti_llm_agent/config.py`。
+**全部键（93 个）与默认值的可复制模板在 [.env.example](.env.example)**——每一行都是注释态、与内置默认值等价，取消注释即生效。键的读取逻辑与兜底值的唯一事实来源是 [`muti_llm_agent/config.py`](muti_llm_agent/config.py)；`.env` 只放你的真实密钥与想覆盖的项，且已被 gitignore。
 
-下表是本次新增的那批键。⚠ 它们**没有**预置在仓库的 `.env` 模板里——所有键都由 `config.py` 的 `_get/_int/_float` 从 `.env` 读取并带默认值，想改就在 `.env` 里自己加一行（`键=值`），不加就用默认值。
+> 历史遗留提示：`NEO4J_*`（7 个）与 `EMBED_MODEL_TYPE` / `EMBED_API_KEY` / `EMBED_BASE_URL` 这三个 `EMBED_*` 键**当前代码不再读取**（嵌入只走本地 sentence-transformers）。若你的 `.env` 里还有，可以删掉，它们不会有任何作用。
+
+下表是「多模型协同试点」新增的那批键，其它键（`LLM_*`、`QWEN_*`、`JUDGE_*`、`FAIR_*`、`CONVERGENCE_*`、`CONTEXT_*` 等）见 `.env.example` 的分组注释。
 
 | 键 | 默认值 | 作用 |
 | --- | --- | --- |

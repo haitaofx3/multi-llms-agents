@@ -23,9 +23,18 @@ for k in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"):
 BASE = "http://127.0.0.1:8000"
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 EXPORT_PATH = PROJECT_ROOT / "data" / "discussions" / "e2e_export.md"
-sys.stdout.reconfigure(encoding="utf-8")
+# pytest 采集时 sys.stdout 已被换成捕获对象，不一定带 reconfigure，直接调会抛 AttributeError。
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
 
-import websockets  # noqa: E402 必须在代理清理后导入
+try:
+    import websockets  # 必须在代理清理之后再导入，否则会走系统代理
+except ModuleNotFoundError:  # pragma: no cover - 仅精简环境 / CI 会走到
+    # 本文件是「手动跑的端到端脚本」，没有任何 test_ 函数；正常 pytest 采集会被
+    # tests/conftest.py 的 collect_ignore 直接跳过。但万一被直接导入
+    # （pytest tests/test_e2e.py），缺 websockets 也不能炸掉导入——否则会变成
+    # "Interrupted: 1 error during collection"，连带中断整个测试会话。
+    websockets = None
 
 events = []
 ws_done = threading.Event()
@@ -196,4 +205,7 @@ def main():
 
 
 if __name__ == "__main__":
+    if websockets is None:
+        raise SystemExit(
+            "缺少 websockets：先 pip install websockets，再运行 python tests/test_e2e.py")
     main()

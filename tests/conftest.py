@@ -21,6 +21,13 @@ import pytest
 from muti_llm_agent import logger, runlog
 from muti_llm_agent.config import settings
 
+# test_e2e.py 是「手动跑的端到端脚本」，不是 pytest 用例：没有任何 test_ 函数，
+# 却会在导入时连真实服务器、`import websockets`，并改写 os.environ / sys.stdout。
+# 因为文件名匹配 test_*.py，pytest 会去导入它——一旦导入失败（典型情况：CI 没装
+# websockets），pytest 以 "Interrupted: 1 error during collection" 中断**整个**
+# 测试会话，而不是只跳过这一个文件。所以这里显式排除，让它彻底不参与采集。
+collect_ignore = ["test_e2e.py"]
+
 
 @pytest.fixture(scope="session", autouse=True)
 def _isolate_runtime_artifacts():
