@@ -45,7 +45,7 @@ def spawn_safe(coro) -> asyncio.Task | None:
     except RuntimeError:
         try:
             coro.close()
-        except Exception:
+        except Exception:  # noqa: S110 - 协程已确定不会被调度，close 失败无可上报的信息
             pass
         return None
 

@@ -27,6 +27,7 @@ from pathlib import Path
 import numpy as np
 
 from muti_llm_agent.config import safe_path_component
+from muti_llm_agent.logger import log
 
 DEFAULT_FORGET_CONFIG = {
     "short_capacity": 24,     # 短期记忆最大条数
@@ -103,8 +104,12 @@ class MemorySystem:
                 self._id = data.get("id_counter", 1)
                 if "forget" in data:
                     self.forget.update(data["forget"])
-            except Exception:
-                pass
+            except Exception as exc:
+                # 坏文件 / 半截写入：按空记忆继续，但必须留痕——否则现场表现是
+                # 「记忆莫名清空」，无从追查。
+                log("warning", "memory.load_failed",
+                    "记忆文件读取失败，按空记忆继续", path=str(self.file),
+                    error=str(exc))
 
     def _save(self):
         data = {

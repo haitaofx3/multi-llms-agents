@@ -38,7 +38,7 @@ import sys
 import threading
 import time
 from collections import deque
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from typing import Any
 
 # 强制 stdout/stderr 使用 UTF-8。
@@ -49,7 +49,8 @@ for _stream in (sys.stdout, sys.stderr):
     try:
         if hasattr(_stream, "reconfigure"):
             _stream.reconfigure(encoding="utf-8")
-    except Exception:
+    except Exception:  # noqa: S110 - 日志系统此刻正在初始化，还不能调用 log()
+        # 用回退编码继续跑即可。
         pass
 
 # ---------------- 追踪上下文（contextvars，协程安全） ----------------
@@ -115,7 +116,8 @@ def _log_path() -> Any:
         _file_state["path"] = LOGS_DIR / f"app-{day}.jsonl"
         try:
             LOGS_DIR.mkdir(parents=True, exist_ok=True)
-        except Exception:
+        except Exception:  # noqa: S110 - 调用 log() 会经 _write_file 递归回本函数
+            # 真实后果（日志落不了盘）由 _write_file 一次性报到 stderr，见下。
             pass
     return _file_state["path"]
 
@@ -129,9 +131,14 @@ def _write_file(line: str) -> None:
             path = _log_path()
             with open(path, "a", encoding="utf-8") as f:
                 f.write(line + "\n")
-    except Exception:
-        # 一次失败后本进程不再尝试，避免每条日志都抛一次异常拖慢主流程
+    except Exception as exc:
+        # 一次失败后本进程不再尝试，避免每条日志都抛一次异常拖慢主流程。
         _file_state["enabled"] = False
+        # 文件出口是整个可观测性里唯一「静默降级」的环节：一旦关掉，
+        # 用户只是发现 data/logs 不再增长。这里绕过 log()（会递归）直接写一次 stderr。
+        with suppress(Exception):
+            sys.stderr.write(
+                f"[logger] 诊断日志落盘已关闭（{exc}）；本次进程内只保留 stdout 与环形缓冲\n")
 
 
 # ---------------- 上下文管理 ----------------
@@ -180,8 +187,9 @@ def log_context(trace_id: str = "", session_id: str = "",
         for var, token in reversed(torches):
             try:
                 var.reset(token)
-            except Exception:
-                pass
+            except Exception as exc:  # pragma: no cover - 上下文令牌失效属内部不变量破坏
+                log("warning", "logger.reset_context_failed",
+                    "日志上下文复位失败，后续日志可能带错 trace_id", error=str(exc))
 
 
 # ---------------- 日志写入 ----------------

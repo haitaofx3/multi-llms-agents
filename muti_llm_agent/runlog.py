@@ -109,9 +109,10 @@ def _next_seq(path: Path) -> int:
                 return int(json.loads(line).get("seq", 0)) + 1
             except Exception:  # noqa: S112 - 末行损坏时继续向前找，属刻意降级
                 continue
-    except Exception:
-        pass
-    # 兜底：按行数粗估（重复 seq 不影响阅读顺序，只影响严格重放）
+    except Exception as exc:
+        # seq 续接失败不影响事件可读性，只影响严格重放顺序；留痕便于排查。
+        log("debug", "runlog.seq_scan_failed",
+            "运行事件文件 seq 扫描失败，回退为按行数估算", error=str(exc))
     try:
         return max(1, sum(1 for _ in open(path, "rb")))
     except Exception:
@@ -245,8 +246,10 @@ def stats() -> dict:
     for p in files:
         try:
             total += p.stat().st_size
-        except Exception:
-            pass
+        except Exception as exc:
+            # 单个文件 stat 失败（被删 / 权限）不该让整个统计失败，但要知道少算了谁。
+            log("debug", "runlog.stat_failed",
+                "运行事件文件大小统计失败，已跳过", path=str(p), error=str(exc))
     return {
         "enabled": enabled(),
         "runs": len(files),

@@ -61,7 +61,7 @@ def _resolve(host: str) -> list:
     try:
         return [ipaddress.ip_address(host)]
     except ValueError:
-        pass
+        pass  # 不是 IP 字面量就往下走域名校验，属控制流判定而非异常
     if "." not in host:
         raise UnsafeUrlError(
             f"Base URL 的主机「{host}」不是合法域名（缺少点号）。"

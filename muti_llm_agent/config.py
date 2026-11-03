@@ -281,11 +281,35 @@ DATA_DIR = PROJECT_ROOT / "data"
 LOGS_DIR = DATA_DIR / "logs"        # 诊断日志（logger.py）
 RUNS_DIR = DATA_DIR / "runs"        # 运行事件日志与摘要（runlog.py / summary.py）
 REVIEWS_DIR = DATA_DIR / "reviews"  # 复盘导出（review.py）
+
+# 目录创建失败必须记录下来，不能静默吞掉：「data/ 不可写但应用照常启动」是一种
+# 极难定位的故障——启动看上去正常，直到某次落盘 / 记忆 / 复盘才以别处的错误暴露。
+# 这里既不能直接 raise（本模块在导入期就被依赖，抛错会让整个应用起不来），
+# 也不能直接调 logger（logger 会反向导入本模块，此时 settings 尚未定义完）。
+# 所以只做收集，由 main.py 的 lifespan 在启动日志里统一报出；
+# 脚本类调用方可自行调用 warn_data_dir_errors()。
+DATA_DIR_ERRORS: list[dict] = []
 for _d in (DATA_DIR, LOGS_DIR, RUNS_DIR, REVIEWS_DIR):
     try:
         _d.mkdir(parents=True, exist_ok=True)
-    except Exception:  # pragma: no cover - 目录不可写时由使用方逐次降级
-        pass
+    except Exception as _exc:  # pragma: no cover - 目录不可写时由使用方逐次降级
+        DATA_DIR_ERRORS.append({"dir": str(_d), "error": str(_exc)})
+
+
+def warn_data_dir_errors() -> list[dict]:
+    """把「运行产物目录不可写」报进诊断日志，返回该清单（无错误时返回空表）。
+
+    延迟导入 logger：本模块被 logger 反向依赖，导入期不能形成环。
+    """
+    if not DATA_DIR_ERRORS:
+        return []
+    from muti_llm_agent.logger import log
+
+    log("error", "config.data_dir_unwritable",
+        f"有 {len(DATA_DIR_ERRORS)} 个运行产物目录不可写，"
+        "讨论落盘 / 运行事件日志 / 复盘导出 / 记忆持久化都会静默降级",
+        dirs=DATA_DIR_ERRORS)
+    return list(DATA_DIR_ERRORS)
 
 
 def webhook_urls() -> list[str]:

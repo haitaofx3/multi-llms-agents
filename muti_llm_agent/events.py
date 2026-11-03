@@ -46,6 +46,8 @@ class EventBus:
                 q.put_nowait(event)
                 continue
             except asyncio.QueueFull:
+                # 队列满属背压常态：丢弃数与上报由 self.dropped / _report_drop 负责，
+                # 逐条记录只会让日志本身成为刷屏源。
                 pass
             # 队列满：先腾掉最旧的一条（过期增量），再尝试放入当前事件
             try:
@@ -53,7 +55,7 @@ class EventBus:
                 self.dropped += 1
                 self._report_drop()
             except asyncio.QueueEmpty:
-                pass
+                pass  # 背压腾位逻辑的竞态，没有独立信息可记
             try:
                 q.put_nowait(event)
             except asyncio.QueueFull:

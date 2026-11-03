@@ -15,6 +15,7 @@ import re
 from openai import OpenAI
 
 from muti_llm_agent.config import settings
+from muti_llm_agent.logger import log
 from muti_llm_agent.netguard import check_outbound_url
 
 # 模型供应商预设
@@ -136,8 +137,10 @@ def _usage_from_response(resp) -> dict | None:
                 "completion_tokens": getattr(u, "completion_tokens", 0) or 0,
                 "total_tokens": getattr(u, "total_tokens", 0) or 0,
             }
-    except Exception:
-        pass
+    except Exception as exc:
+        # usage 缺失不致命（仅影响到费用/遥测），但静默会让人误以为「本来就没有 usage」
+        log("debug", "llm.usage_unavailable",
+            "响应里没有可用 usage 字段，token 遥测将按 0 计", error=str(exc))
     return None
 
 
@@ -444,6 +447,10 @@ async def summarize_text(model_config: dict, text: str, max_chars: int = 150) ->
         content = (result.get("content") or "").strip()
         if content:
             return content[:max_chars], result.get("usage") or {}
-    except Exception:
-        pass
+    except Exception as exc:
+        # 摘要失败会回退成硬截断，质量下降但主流程继续；必须留痕，否则无法解释
+        # 「为什么这段上下文被截得这么粗暴」。
+        log("warning", "llm.summarize_failed",
+            "摘要生成失败，回退为按字符截断", error=str(exc),
+            chars=len(text or ""), max_chars=max_chars)
     return _fallback_truncate(text, max_chars), None

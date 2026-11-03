@@ -38,7 +38,7 @@ from muti_llm_agent.api.deps import (
     unauthorized,
 )
 from muti_llm_agent.api.router_integration import notify_run_finished
-from muti_llm_agent.config import PROJECT_ROOT, settings
+from muti_llm_agent.config import PROJECT_ROOT, settings, warn_data_dir_errors
 from muti_llm_agent.history import record_discussion
 from muti_llm_agent.logger import log, set_log_context
 from muti_llm_agent.manager import manager
@@ -87,6 +87,9 @@ def _on_done(orch):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # 启动即检查运行产物目录：不可写时必须显式报出来。
+    # 否则现场是「应用看起来一切正常」，直到某次落盘才在别处以错误暴露。
+    warn_data_dir_errors()
     # 启动：把上一进程遗留的 running/paused 会话标记为 interrupted
     try:
         interrupted = manager.mark_interrupted()

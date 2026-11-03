@@ -16,6 +16,7 @@ import re
 import threading
 import time
 
+from muti_llm_agent.logger import log
 from muti_llm_agent.protocol import EvidenceItem
 from muti_llm_agent.vector_store import shared_vector_store
 
@@ -103,8 +104,9 @@ class RAGService:
             q = np.array(embed_query(hit.get("text", "")))
             v = np.array(embed_query(hit.get("text", "")))
             _ = q, v  # placeholder：完整打分由向量库返回，这里统一返回 0.8
-        except Exception:
-            pass
+        except Exception as exc:  # pragma: no cover - 占位实现，失败也统一返回 0.8
+            log("debug", "rag.score_fallback",
+                "证据置信度近似计算失败，回退默认值", error=str(exc))
         return 0.8
 
     # ---------------- 上下文注入 ----------------

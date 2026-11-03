@@ -91,8 +91,14 @@ async def ws_endpoint(websocket: WebSocket, session_id: str = "default", token: 
         while True:
             event = await q.get()
             await websocket.send_json(event)
-    except (WebSocketDisconnect, Exception):
+    except WebSocketDisconnect:
+        # 客户端正常断连不是故障（S110 只约束宽泛捕获，这里显式保留原因）
         pass
+    except Exception as exc:
+        # 原来的 catch-all 会把真正的编程错误也一起吞掉，这里区分开：
+        # 断连走上面分支，其余留一条 debug 便于排查推送链路。
+        _log("debug", "ws.push_failed", "WebSocket 推送中断",
+             session_id=orch.session_id, error=str(exc))
     finally:
         orch.event_bus.unsubscribe(q)
 

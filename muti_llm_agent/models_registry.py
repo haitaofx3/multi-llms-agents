@@ -22,6 +22,7 @@ import threading
 import time
 
 from muti_llm_agent.config import settings
+from muti_llm_agent.logger import log
 
 # 供应商 → 展示名（与 llm.PROVIDER_PRESETS 的键保持一致）
 PROVIDER_LABELS: dict[str, str] = {
@@ -81,8 +82,11 @@ def _ensure_loaded() -> None:
                     for k, v in data.items():
                         if isinstance(v, dict):
                             _FAILURES[str(k)] = v
-    except Exception:
-        pass
+    except Exception as exc:
+        # 模型健康度是跨重启的辅助信息，坏了按空处理即可；
+        # 但要留痕，否则「上次失败记录不见了」会被当成记录本身没写。
+        log("warning", "models.health_load_failed",
+            "模型失败记录读取失败，按空记录继续", error=str(exc))
 
 
 def _persist_failures() -> None:
@@ -95,8 +99,10 @@ def _persist_failures() -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=2),
                         encoding="utf-8")
-    except Exception:
-        pass
+    except Exception as exc:
+        # 写不进去只影响跨重启可见性，不值得打断主流程；留一条 debug 便于排查。
+        log("debug", "models.health_persist_failed",
+            "模型失败记录写盘失败（仅影响跨重启可见性）", error=str(exc))
 
 
 def record_failure(model_id: str, provider: str = "", error: str = "") -> None:

@@ -78,6 +78,7 @@ from muti_llm_agent.textutil import estimate_cost_rmb as _estimate_cost_rmb
 from muti_llm_agent.textutil import extract_argument_sentences as _extract_argument_sentences
 from muti_llm_agent.textutil import shorten as _shorten
 from muti_llm_agent.textutil import text_similarity as _text_similarity
+from muti_llm_agent.turn import run_agent_turn
 
 
 class Orchestrator:
@@ -335,16 +336,22 @@ class Orchestrator:
         try:
             from muti_llm_agent.manager import manager
             manager.save_meta(self)
-        except Exception:
-            pass  # 元数据持久化失败不影响辩论主流程
+        except Exception as exc:
+            # 以前这里完全静默：一旦 data/ 不可写，卡片中断横幅、进程重启后的
+            # interrupted 标记都会失效，现场表现却是「什么都没发生」。
+            self._log("元数据快照落盘失败（中断横幅与重启标记可能失效）",
+                      level="warning", event="meta.persist_failed")
+            self.errors.append({"where": "meta.persist", "error": str(exc)[:400]})
 
     def _notify_done(self):
         """通知全局 DebateManager「本会话讨论完成」（触发自动落盘等回调）。"""
         try:
             from muti_llm_agent.manager import manager
             manager.notify_done(self)
-        except Exception:
-            pass
+        except Exception as exc:
+            self._log("讨论完成回调派发失败（自动落盘 / 对外推送可能未触发）",
+                      level="warning", event="done.notify_failed")
+            self.errors.append({"where": "done.notify", "error": str(exc)[:400]})
 
     # ---------------- 控制 ----------------
     def pause(self):
@@ -489,6 +496,7 @@ class Orchestrator:
             try:
                 q.put_nowait(ev)
             except asyncio.QueueFull:
+                # 队列满即丢弃：仅影响本次发言的增量渲染，终稿由 final 事件兜底。
                 pass
 
         def _emit(ev: dict) -> None:
@@ -581,6 +589,39 @@ class Orchestrator:
             self.output_tokens += int(completion)
         return int(total) if total else 0
 
+    def _on_llm_result(self, agent: Agent, result: dict, metrics: dict | None) -> int:
+        """一次成功 LLM 调用的记账入口（由 turn 执行器回调）。
+
+        做三件事，彼此口径不同，不要再合并：
+          1. `llm_call_counts`：真实调用次数，含纯工具回合（没有 TTFT 也算一次）；
+          2. `agent_metrics`：只统计拿到 TTFT 的调用，供裁判算模型质量分；
+          3. token 遥测：累计到 self.spent / self.output_tokens（只读）。
+        """
+        self.llm_call_counts[agent.name] = self.llm_call_counts.get(agent.name, 0) + 1
+        if metrics and metrics.get("ttft_s") is not None:
+            acc = self.agent_metrics.setdefault(
+                agent.name, {"calls": 0, "ttft_sum": 0.0, "gen_sum": 0.0, "chars": 0})
+            acc["calls"] += 1
+            acc["ttft_sum"] += metrics["ttft_s"]
+            acc["gen_sum"] += metrics["gen_s"]
+            acc["chars"] += metrics["chars"]
+        return self._apply_usage(result)
+
+    def _record_model_failure(self, agent: Agent, error: Exception) -> None:
+        """按 model_id 记一次模型健康度失败（由 turn 执行器回调）。
+
+        花名册 / UI 据此直接看到「这个席位上次调用挂了、为什么」，不必翻日志；
+        记账本身失败也不能影响主流程，但必须留痕。
+        """
+        try:
+            from muti_llm_agent.models_registry import record_failure
+            record_failure(
+                agent.model_config.get("model_id", ""),
+                agent.model_config.get("provider", ""), str(error))
+        except Exception as exc:
+            self._log(f"模型健康度记录失败：{exc}", level="debug",
+                      event="models.record_failure_failed")
+
     async def _agent_turn(self, agent: Agent, user_msg: str, mode: str,
                           allow_delegate: bool = True, stream: bool = False):
         # ---- 中途注入纠偏（steering.py）----
@@ -615,174 +656,35 @@ class Orchestrator:
             if mode == "collab":
                 tools = [*tools, CLAIM_SCHEMA]
 
-        content = ""
-        delegate = []
-        report = None
-        claim = []
-        token_cost = 0
-        emitting = False  # 是否已开始向 UI 流式推送
-        result = None
         # 公平性 L5：辩论发言统一采样参数（temperature / top_p），非辩论模式用默认
         samp = self.governor.sampling_params() if mode == "discussion" \
             else {"temperature": 0.7, "top_p": None}
 
-        async def _emit_delta(delta: str):
-            nonlocal emitting
-            if not emitting:
-                emitting = True
-                await self.event_bus.publish({
-                    "type": "speech_start",
-                    "speaker": agent.name,
-                    "round": self.round,
-                    "is_main": agent.is_main,
-                })
-            await self.event_bus.publish({
-                "type": "speech_delta",
-                "speaker": agent.name,
-                "delta": delta,
-            })
-
-        # P1-4 工具调用可视化：流式中首次产出工具名 / 工具执行结束时推送到前端。
-        # tool_call_start 同样先补发 speech_start，保证气泡在纯工具回合（无文本）时也存在。
-        async def _emit_tool_start(name: str, index: int = 0):
-            nonlocal emitting
-            if not emitting:
-                emitting = True
-                await self.event_bus.publish({
-                    "type": "speech_start",
-                    "speaker": agent.name,
-                    "round": self.round,
-                    "is_main": agent.is_main,
-                })
-            await self.event_bus.publish({
-                "type": "tool_call_start",
-                "speaker": agent.name,
-                "round": self.round,
-                "is_main": agent.is_main,
-                "name": name,
-                "index": index,
-            })
-
-        async def _emit_tool_end(name: str, summary: str = ""):
-            await self.event_bus.publish({
-                "type": "tool_call_end",
-                "speaker": agent.name,
-                "round": self.round,
-                "name": name,
-                "summary": _shorten(summary, 120),
-            })
-
-        max_loops = max(1, int(settings.TOOL_LOOP_MAX))
-        for _loop_idx in range(max_loops):
-            try:
-                if stream:
-                    try:
-                        result = await self._consume_stream(
-                            messages, agent.model_config, tools, _emit_delta,
-                            on_tool_start=_emit_tool_start,
-                            temperature=samp["temperature"], top_p=samp["top_p"])
-                    except Exception as e:
-                        self._log(f"[LLM流式失败:{agent.name}] {e}，回退非流式",
-                                  level="warning", event="llm.stream_fallback")
-                        result = await self._run_llm_retry(
-                            messages, agent.model_config, tools,
-                            temperature=samp["temperature"], top_p=samp["top_p"])
-                else:
-                    result = await self._run_llm_retry(
-                        messages, agent.model_config, tools,
-                        temperature=samp["temperature"], top_p=samp["top_p"])
-            except Exception as e:
-                msg = f"[LLM错误:{agent.name}] {e}"
-                self._log(msg, level="error", event="llm.error")
-                self._record_error(f"llm:{agent.name}", e)
-                # 模型级健康度：把失败按 model_id 记账，花名册 / UI 能直接看到
-                # 「这个席位上次调用挂了、为什么」，不必翻日志。
-                try:
-                    from muti_llm_agent.models_registry import record_failure
-                    record_failure(
-                        agent.model_config.get("model_id", ""),
-                        agent.model_config.get("provider", ""), str(e))
-                except Exception:
-                    pass
-                # 把错误同步推送到前端（醒目的错误气泡），避免只在控制台可见
-                await self.event_bus.publish({
-                    "type": "agent_error",
-                    "agent": agent.name,
-                    "model_id": agent.model_config.get("model_id", ""),
-                    "error": str(e),
-                })
-                break
-
-            # LLM 调用次数统计：与 agent_metrics 分开记 —— 后者只统计「有文本产出、
-            # 拿到 TTFT」的调用（用于裁判的模型质量评分），纯工具调用回合没有 TTFT，
-            # 但仍是一次真实调用，复盘与费用分析需要看到它。
-            self.llm_call_counts[agent.name] = \
-                self.llm_call_counts.get(agent.name, 0) + 1
-
-            # 聚合流式性能实测（TTFT / 生成速率），供裁判模型质量评分使用
-            _m = result.pop("metrics", None)
-            if _m and _m.get("ttft_s") is not None:
-                acc = self.agent_metrics.setdefault(
-                    agent.name, {"calls": 0, "ttft_sum": 0.0, "gen_sum": 0.0, "chars": 0})
-                acc["calls"] += 1
-                acc["ttft_sum"] += _m["ttft_s"]
-                acc["gen_sum"] += _m["gen_s"]
-                acc["chars"] += _m["chars"]
-
-            token_cost += self._apply_usage(result)  # 只读遥测：累计真实 token 用量
-            content = result["content"] or content
-            raw_msg = result.get("assistant_message")
-            tcs = result["tool_calls"]
-
-            if not tcs:
-                break
-
-            # 把 assistant 消息（含 tool_calls）加入上下文，维持多轮工具调用
-            if raw_msg is not None:
-                messages.append(raw_msg)
-
-            # P1-4：流式中已展示过的工具索引（非流式/流式回退时为空 → 全部在执行前补发 start）
-            streamed = set(result.get("tool_starts") or [])
-            special = False
-            for i, tc in enumerate(tcs):
-                if i not in streamed:
-                    await _emit_tool_start(tc["name"], i)
-                if agent.is_main and tc["name"] == "delegate_task":
-                    delegate.append(tc["arguments"])
-                    special = True
-                    await _emit_tool_end(
-                        tc["name"],
-                        f"分派任务 → {tc['arguments'].get('recipient', '?')}")
-                elif (not agent.is_main) and tc["name"] == "report_result":
-                    report = tc["arguments"]
-                    special = True
-                    await _emit_tool_end(tc["name"], "回报任务结果")
-                elif (not agent.is_main) and tc["name"] == "claim_task":
-                    claim.append(tc["arguments"])
-                    special = True
-                    await _emit_tool_end(tc["name"], "认领任务")
-                else:
-                    tool_result = await asyncio.to_thread(
-                        agent.mcp.call, tc["name"], tc["arguments"])
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": tc["id"],
-                        "content": tool_result,
-                    })
-                    await _emit_tool_end(tc["name"], tool_result)
-            if special:
-                break
-            if not tcs:
-                break
-        else:
-            # for 循环跑满仍未 break：说明模型在持续调用普通工具（未产出终态）
-            self._log(f"[工具循环] {agent.name} 达到工具调用上限 {max_loops} 轮，"
-                      "按已有内容收尾", level="warning", event="llm.tool_loop_limit")
-            await self.event_bus.publish({
-                "type": "agent_error",
-                "agent": agent.name,
-                "error": f"工具调用超过 {max_loops} 轮上限，已按当前结果收尾",
-            })
+        # 本回合的「LLM 往返 + 工具循环」交给 turn.run_agent_turn；
+        # 编排器只保留纠偏注入、消息与工具装配、公平性截断、transcript 记账。
+        outcome = await run_agent_turn(
+            agent=agent,
+            messages=messages,
+            tools=tools,
+            round_no=self.round,
+            stream=stream,
+            temperature=samp["temperature"],
+            top_p=samp["top_p"],
+            max_loops=max(1, int(settings.TOOL_LOOP_MAX)),
+            publish=self.event_bus.publish,
+            log=self._log,
+            record_error=self._record_error,
+            record_model_failure=self._record_model_failure,
+            on_llm_result=self._on_llm_result,
+            stream_call=self._consume_stream,
+            sync_call=self._run_llm_retry,
+        )
+        content = outcome.content
+        delegate = outcome.delegate
+        report = outcome.report
+        claim = outcome.claim
+        token_cost = outcome.token_cost
+        emitting = outcome.emitted
 
         # 公平性 L1 兜底：discussion 模式下即使 LLM 输出超长也按公平性字符上限截断。
         # PRO/CON 用相对上限（对手近 N 轮有效输出均值 × 比例，与硬上限取 min）；
@@ -802,12 +704,10 @@ class Orchestrator:
                           level="warning", event="fairness.output_truncate")
             content = truncated_content
             # 记录输出统计（L1 相对参照基准 / L2 思考占比），仅统计本次最终输出
-            think = result.get("think_chars", 0) if result else 0
-            raw = result.get("raw_chars", len(content) + think) if result else len(content)
             self.governor.record_turn(
                 agent.stance, self.round,
-                visible_chars=max(0, raw - think),
-                think_chars=think,
+                visible_chars=max(0, outcome.raw_chars - outcome.think_chars),
+                think_chars=outcome.think_chars,
                 truncated=was_truncated)
 
         # 流式收尾：补发 speech_end（前端用完整文本替换），并记录 transcript。
@@ -1247,8 +1147,10 @@ class Orchestrator:
                 agents=[{"name": a.name, "role": a.role, "stance": a.stance,
                          "model_id": a.model_config.get("model_id", "")}
                         for a in self.agents])
-        except Exception:
-            pass
+        except Exception as exc:
+            # 没有 run 头部事件，复盘时间线会缺锚点（虽然仍能靠 seq 排）。
+            self._log(f"运行事件头部写入失败：{exc}", level="warning",
+                      event="runlog.header_failed")
         self._runlog("run_start", text=f"开始运行（第 {self.iteration_no} 轮迭代）",
                      topic=self.topic, mode=self.mode, max_rounds=self.max_rounds,
                      steering_pending=len(self.steering.pending()))
@@ -1348,8 +1250,9 @@ class Orchestrator:
         try:
             self.steering.end_round(self.round)
             self.followup_seed_active = ""
-        except Exception:
-            pass
+        except Exception as exc:
+            self._log(f"轮次收尾失败（纠偏队列可能残留待消费指令）：{exc}",
+                      level="warning", event="steering.end_round_failed")
         summary: dict = {}
         try:
             summary = self.summary()
@@ -1359,8 +1262,9 @@ class Orchestrator:
             try:
                 from muti_llm_agent.runlog import register_run
                 register_run(summary)
-            except Exception:
-                pass
+            except Exception as exc:
+                self._log(f"运行索引登记失败（/api/runs 列表会缺这一条）：{exc}",
+                          level="warning", event="runlog.register_failed")
             try:
                 self._runlog(
                     "run_end", text=f"运行结束：{summary.get('status')}",
@@ -1368,16 +1272,20 @@ class Orchestrator:
                     output_tokens=(summary.get("tokens") or {}).get("output", 0),
                     cost_rmb=summary.get("cost_rmb"),
                     errors=summary.get("error_count"))
-            except Exception:
-                pass
+            except Exception as exc:
+                self._log(f"运行结束事件写入失败：{exc}", level="debug",
+                          event="runlog.run_end_failed")
             try:
                 await self.event_bus.publish({"type": "run_summary", "summary": summary})
-            except Exception:
-                pass
+            except Exception as exc:
+                self._log(f"run_summary 事件广播失败（前端摘要面板不会刷新）：{exc}",
+                          level="warning", event="eventbus.run_summary_failed")
         try:
             self._persist_meta()
-        except Exception:
-            pass
+        except Exception as exc:
+            # _persist_meta 内部已自行上报，这里只补一条收尾路径的上下文。
+            self._log(f"收尾阶段元数据落盘失败：{exc}", level="debug",
+                      event="meta.persist_failed")
 
     # ---------------- 会话结束后的「补充材料续轮」（followup.py） ----------------
     def start_followup(self, materials=None, focus: str = "",
@@ -2048,8 +1956,11 @@ class Orchestrator:
                     completion = usage.get("completion_tokens") or 0
                     if completion:
                         self.output_tokens += int(completion)
-            except Exception:
-                pass
+            except Exception as exc:
+                # 记忆压缩失败只影响长对话的上下文预算，不该打断主循环；
+                # 但必须留痕，否则「为什么第 N 轮开始上下文突然变长」无从解释。
+                self._log(f"{a.name} 历史压缩失败：{exc}", level="debug",
+                          event="memory.compress_failed")
 
     def _memory_summarizer(self, agent: Agent):
         """构造「短期 → 情境」记忆的 LLM 摘要器（async 闭包），usage 计入预算。"""
