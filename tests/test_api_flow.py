@@ -21,11 +21,10 @@ import unittest
 import httpx
 
 from muti_llm_agent import main as main_module
-from muti_llm_agent.manager import manager
 from muti_llm_agent.protocol import Judgment
+from tests.conftest import FreshOrchestratorMixin
 
-# §1.3 解耦：会话实例统一由 DebateManager 注册表持有，不再导入模块级单例。
-orchestrator = manager.get_or_create("default")
+# 会话隔离：每个用例在 setUp 里装入全新的编排器（见 conftest.FreshOrchestratorMixin）。
 
 HOST_CFG = {"name": "主持", "role": "主持", "personality": "",
             "provider": "custom", "stance": "HOST",
@@ -43,19 +42,7 @@ def _fake_llm_result(content="发言"):
             "usage": {"total_tokens": 1}}
 
 
-def _restore_llm_fakes(orch):
-    """删除在 orchestrator 实例上注入的 LLM 假方法，回落到真实类方法。
-
-    asyncSetUp 会 monkeypatch 全局 orchestrator 的 LLM 调用点；若测试结束
-    后不还原，会污染后续执行的测试模块（例如 test_features_v2 看到的将是
-    残留的 fake _final_summary，而不是真实实现）。
-    """
-    for name in ("_judge_round", "_final_summary", "_consume_stream", "_run_llm_retry"):
-        if name in orch.__dict__:
-            delattr(orch, name)
-
-
-class ApiFlowTest(unittest.IsolatedAsyncioTestCase):
+class ApiFlowTest(FreshOrchestratorMixin, unittest.IsolatedAsyncioTestCase):
     """HTTP 接口全流程（无真实 LLM，CI 可用）。"""
 
     async def asyncSetUp(self):
@@ -75,15 +62,14 @@ class ApiFlowTest(unittest.IsolatedAsyncioTestCase):
                 await on_delta("发言")
             return _fake_llm_result()
 
-        orchestrator._judge_round = fake_judge
-        orchestrator._final_summary = fake_summary
-        orchestrator._consume_stream = fake_consume
-        orchestrator._run_llm_retry = lambda *a, **k: _fake_llm_result()
+        self.orch._judge_round = fake_judge
+        self.orch._final_summary = fake_summary
+        self.orch._consume_stream = fake_consume
+        self.orch._run_llm_retry = lambda *a, **k: _fake_llm_result()
 
     async def asyncTearDown(self):
-        orchestrator.end()
+        self.orch.end()
         # 还原 LLM 调用点，避免污染后续测试模块
-        _restore_llm_fakes(orchestrator)
         await self.client.aclose()
 
     async def _configure_and_run(self, agents, topic="测试主题", max_rounds=1):

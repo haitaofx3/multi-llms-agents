@@ -21,12 +21,11 @@ from typing import ClassVar
 from unittest.mock import patch
 
 from muti_llm_agent.config import settings
-from muti_llm_agent.manager import manager
 from muti_llm_agent.orchestrator import _estimate_cost_rmb, _extract_argument_sentences, _text_similarity
 from muti_llm_agent.protocol import Judgment
+from tests.conftest import FreshOrchestratorMixin
 
-# §1.3 解耦：会话实例统一由 DebateManager 注册表持有，不再导入模块级单例。
-orchestrator = manager.get_or_create("default")
+# 会话隔离：每个用例在 setUp 里装入全新的编排器（见 conftest.FreshOrchestratorMixin）。
 
 HOST_CFG = {"name": "主持", "role": "主持", "personality": "",
             "provider": "default", "stance": "HOST"}
@@ -62,12 +61,12 @@ class CostEstimateTest(unittest.TestCase):
         self.assertEqual(_estimate_cost_rmb(-100, -50), 0.0)
 
 
-class StatusAndSpeechCostTest(unittest.IsolatedAsyncioTestCase):
+class StatusAndSpeechCostTest(FreshOrchestratorMixin, unittest.IsolatedAsyncioTestCase):
     """cost_rmb 出现在 _status_sync 与 speech_end 事件中。"""
 
     async def _configure(self):
-        orchestrator.configure([HOST_CFG, PRO_CFG], topic="成本遥测", max_rounds=3)
-        q = orchestrator.event_bus.subscribe()
+        self.orch.configure([HOST_CFG, PRO_CFG], topic="成本遥测", max_rounds=3)
+        q = self.orch.event_bus.subscribe()
         await self._drain(q)
         return q
 
@@ -81,9 +80,9 @@ class StatusAndSpeechCostTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_status_sync_carries_cost_rmb(self):
         await self._configure()
-        orchestrator.spent = 800
-        orchestrator.output_tokens = 200
-        s = orchestrator._status_sync()
+        self.orch.spent = 800
+        self.orch.output_tokens = 200
+        s = self.orch._status_sync()
         self.assertIn("cost_rmb", s)
         self.assertAlmostEqual(s["cost_rmb"], _estimate_cost_rmb(800, 200))
         # 只读遥测：不因成本估算产生任何预算/约束字段
@@ -91,7 +90,7 @@ class StatusAndSpeechCostTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_speech_end_carries_cost_rmb(self):
         q = await self._configure()
-        orch = orchestrator
+        orch = self.orch
         orch.round = 1
 
         async def fake_consume(messages, model_config, tools=None, on_delta=None,
@@ -119,16 +118,16 @@ class StatusAndSpeechCostTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(orch.output_tokens, 40)
         self.assertAlmostEqual(ev["cost_rmb"],
                                _estimate_cost_rmb(orch.spent, orch.output_tokens))
-        orchestrator.event_bus.unsubscribe(q)
+        self.orch.event_bus.unsubscribe(q)
 
 
-class ConvergenceFallbackTest(unittest.IsolatedAsyncioTestCase):
+class ConvergenceFallbackTest(FreshOrchestratorMixin, unittest.IsolatedAsyncioTestCase):
     """P0-3 收敛检测：嵌入不可用时降级为字符级文本相似度。"""
 
     async def _configure(self):
-        orchestrator.configure([HOST_CFG, PRO_CFG, CON_CFG],
+        self.orch.configure([HOST_CFG, PRO_CFG, CON_CFG],
                                topic="收敛测试", max_rounds=8)
-        q = orchestrator.event_bus.subscribe()
+        q = self.orch.event_bus.subscribe()
         await self._drain(q)
         return q
 
@@ -150,7 +149,7 @@ class ConvergenceFallbackTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_fallback_mode_switches_to_text_similarity(self):
         await self._configure()
-        orch = orchestrator
+        orch = self.orch
         orch.round = 2
         orch.round_arguments[1] = {"正方": "应该赋予机器人权利"}
         orch.round_arguments[2] = {"反方": "应该赋予机器人权利"}
@@ -163,7 +162,7 @@ class ConvergenceFallbackTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_convergence_triggers_after_consecutive_rounds(self):
         await self._configure()
-        orch = orchestrator
+        orch = self.orch
         orch.convergence_mode = "text-similarity"
         orch.convergence_streak = 1
         orch.round = 3
@@ -177,7 +176,7 @@ class ConvergenceFallbackTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_new_evidence_resets_streak(self):
         await self._configure()
-        orch = orchestrator
+        orch = self.orch
         orch.convergence_mode = "text-similarity"
         orch.convergence_streak = 1
         orch.round = 2
@@ -191,12 +190,12 @@ class ConvergenceFallbackTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(orch.convergence_streak, 0)
 
 
-class ToolCallEventTest(unittest.IsolatedAsyncioTestCase):
+class ToolCallEventTest(FreshOrchestratorMixin, unittest.IsolatedAsyncioTestCase):
     """P1-4 工具调用可视化：start 去重 / 回退补发 / 纯工具回合气泡。"""
 
     async def _configure(self):
-        orchestrator.configure([HOST_CFG, PRO_CFG], topic="工具可视化", max_rounds=3)
-        q = orchestrator.event_bus.subscribe()
+        self.orch.configure([HOST_CFG, PRO_CFG], topic="工具可视化", max_rounds=3)
+        q = self.orch.event_bus.subscribe()
         await self._drain(q)
         return q
 
@@ -236,7 +235,7 @@ class ToolCallEventTest(unittest.IsolatedAsyncioTestCase):
         """流式中已发 tool_call_start（tool_starts 含索引）→ 不重复补发；
         纯工具回合（无文本）同样产出 speech_start 与 speech_end。"""
         q = await self._configure()
-        orch = orchestrator
+        orch = self.orch
         orch.round = 1
 
         async def fake_consume(messages, model_config, tools=None, on_delta=None,
@@ -266,12 +265,12 @@ class ToolCallEventTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("speech_start", [e["type"] for e in events])
         self.assertIn("speech_end", [e["type"] for e in events])
         self.assertEqual(out["content"], "")
-        orchestrator.event_bus.unsubscribe(q)
+        self.orch.event_bus.unsubscribe(q)
 
     async def test_stream_fallback_emits_missing_tool_start(self):
         """流式失败回退非流式（结果无 tool_starts）→ 补发 tool_call_start。"""
         q = await self._configure()
-        orch = orchestrator
+        orch = self.orch
         orch.round = 1
 
         async def boom(*args, **kwargs):
@@ -290,16 +289,16 @@ class ToolCallEventTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(starts), 1)
         self.assertEqual(starts[0]["name"], "delegate_task")
         self.assertEqual(len(ends), 1)
-        orchestrator.event_bus.unsubscribe(q)
+        self.orch.event_bus.unsubscribe(q)
 
 
-class StructuredConclusionTest(unittest.IsolatedAsyncioTestCase):
+class StructuredConclusionTest(FreshOrchestratorMixin, unittest.IsolatedAsyncioTestCase):
     """P0-1 结构化结论：四段式最终报告 + conclusion 事件。"""
 
     async def _configure(self):
-        orchestrator.configure([HOST_CFG, PRO_CFG, CON_CFG],
+        self.orch.configure([HOST_CFG, PRO_CFG, CON_CFG],
                                topic="结论测试", max_rounds=2)
-        q = orchestrator.event_bus.subscribe()
+        q = self.orch.event_bus.subscribe()
         await self._drain(q)
         return q
 
@@ -319,12 +318,12 @@ class StructuredConclusionTest(unittest.IsolatedAsyncioTestCase):
 
     def test_normalize_conclusion_four_sections_with_fallback(self):
         """空文本 → 四段式结构完整，裁判裁决与核心结论由确定性数据回填。"""
-        report = orchestrator._normalize_conclusion("", self._judgment())
+        report = self.orch._normalize_conclusion("", self._judgment())
         self.assertEqual(len(re.findall(r"^## ", report, re.M)), 4)
         for title in ("核心结论", "各方立场与论点摘要", "裁判裁决", "分歧与待办"):
             self.assertIn(f"## {title}", report)
         # 结构化数据已写入 self.conclusion
-        c = orchestrator.conclusion
+        c = self.orch.conclusion
         self.assertIsNotNone(c)
         self.assertIn("正方论证更完整", c["core"])
         self.assertIn("胜方：PRO", c["judge_ruling"])
@@ -336,7 +335,7 @@ class StructuredConclusionTest(unittest.IsolatedAsyncioTestCase):
                 "## 各方立场与论点摘要\n\n模型立场\n\n"
                 "## 裁判裁决\n\n（模型转述——应被权威数据覆盖）\n\n"
                 "## 分歧与待办\n\n待解决：成本")
-        report = orchestrator._normalize_conclusion(text, self._judgment())
+        report = self.orch._normalize_conclusion(text, self._judgment())
         self.assertIn("模型总结", report)
         self.assertIn("模型立场", report)
         self.assertIn("待解决：成本", report)
@@ -344,14 +343,14 @@ class StructuredConclusionTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("模型转述", report)
         self.assertIn("胜方：PRO", report)
         self.assertIn("正方论证更完整", report)
-        c = orchestrator.conclusion
+        c = self.orch.conclusion
         self.assertEqual(c["core"], "模型总结")
         self.assertIn("胜方：PRO", c["judge_ruling"])
 
     def test_normalize_conclusion_missing_sections_filled(self):
         """模型遗漏段落 → 用确定性数据回填，保证结构完整。"""
         text = "## 核心结论\n\n只有结论"
-        report = orchestrator._normalize_conclusion(text, self._judgment())
+        report = self.orch._normalize_conclusion(text, self._judgment())
         self.assertIn("只有结论", report)
         self.assertIn("## 各方立场与论点摘要", report)
         self.assertIn("## 裁判裁决", report)
@@ -359,7 +358,7 @@ class StructuredConclusionTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_final_summary_publishes_conclusion_event(self):
         q = await self._configure()
-        orch = orchestrator
+        orch = self.orch
 
         async def fake_agent_turn(agent, user_msg, mode, allow_delegate=True, stream=False):
             return {"content": "## 核心结论\n\n事件结论\n\n"
@@ -386,7 +385,7 @@ class StructuredConclusionTest(unittest.IsolatedAsyncioTestCase):
             self.assertIn("胜方：PRO", ev["judge_ruling"])
         finally:
             orch._agent_turn = orig_agent_turn
-        orchestrator.event_bus.unsubscribe(q)
+        self.orch.event_bus.unsubscribe(q)
 
 
 class ArgumentSnippetTest(unittest.TestCase):
@@ -419,7 +418,7 @@ class ArgumentSnippetTest(unittest.TestCase):
         self.assertTrue(out)
 
 
-class TaskDebateSeparationTest(unittest.IsolatedAsyncioTestCase):
+class TaskDebateSeparationTest(FreshOrchestratorMixin, unittest.IsolatedAsyncioTestCase):
     """§5.8 任务回合与辩论回合分离：
     - _task_turn 处理任务但不污染 round_arguments；
     - _debate_turn 才记录辩论发言；
@@ -427,9 +426,9 @@ class TaskDebateSeparationTest(unittest.IsolatedAsyncioTestCase):
     """
 
     async def _configure(self):
-        orchestrator.configure([HOST_CFG, PRO_CFG, CON_CFG],
+        self.orch.configure([HOST_CFG, PRO_CFG, CON_CFG],
                                topic="任务辩论分离", max_rounds=3)
-        q = orchestrator.event_bus.subscribe()
+        q = self.orch.event_bus.subscribe()
         while True:
             try:
                 await asyncio.wait_for(q.get(), timeout=0.1)
@@ -437,9 +436,8 @@ class TaskDebateSeparationTest(unittest.IsolatedAsyncioTestCase):
                 break
         return q
 
-    @staticmethod
-    def _collab(stance):
-        for c in orchestrator.collaborators:
+    def _collab(self, stance):
+        for c in self.orch.collaborators:
             if c.stance == stance:
                 return c
         raise AssertionError(f"无 {stance} 立场协作辩手")
@@ -447,7 +445,7 @@ class TaskDebateSeparationTest(unittest.IsolatedAsyncioTestCase):
     async def test_task_turn_does_not_pollute_round_arguments(self):
         await self._configure()
         pro = self._collab("PRO")
-        orch = orchestrator
+        orch = self.orch
         orch.round = 2
         orch.tasks.clear()
         orch.round_arguments.clear()
@@ -477,7 +475,7 @@ class TaskDebateSeparationTest(unittest.IsolatedAsyncioTestCase):
     async def test_debate_turn_records_speech(self):
         await self._configure()
         pro = self._collab("PRO")
-        orch = orchestrator
+        orch = self.orch
         orch.round = 2
         orch.tasks.clear()
         orch.round_arguments.clear()
@@ -501,7 +499,7 @@ class TaskDebateSeparationTest(unittest.IsolatedAsyncioTestCase):
         import muti_llm_agent.orchestrator as orch_mod
         pro = self._collab("PRO")
         con = self._collab("CON")
-        orch = orchestrator
+        orch = self.orch
         orch.round = 3
         orch.round_arguments[2] = {con.name: (
             "第一，历史数据表明技术变革未减少总就业。"
@@ -522,10 +520,10 @@ class TaskDebateSeparationTest(unittest.IsolatedAsyncioTestCase):
         # §5.4：摘要轮额外保留关键论据句
         self.assertIn("第一", prep.get("arguments", ""))
         self.assertIn("第二", prep.get("arguments", ""))
-        orchestrator.event_bus.unsubscribe(q)
+        self.orch.event_bus.unsubscribe(q)
 
 
-class CollaborationModeTest(unittest.IsolatedAsyncioTestCase):
+class CollaborationModeTest(FreshOrchestratorMixin, unittest.IsolatedAsyncioTestCase):
     """双模式之合作模式（collaboration）：
     - configure 模式透传、席位立场弱化（NEUTRAL）、无裁判；
     - 任务池（recipient 留空 → pending）+ 主动认领（claim_task 独占）；
@@ -542,6 +540,7 @@ class CollaborationModeTest(unittest.IsolatedAsyncioTestCase):
     ]
 
     def setUp(self):
+        super().setUp()
         # 存量用例不涉及反思（§12.18）：关闭开关，避免回报后触发额外 LLM 调用
         # 打断「工作回合 mode==collab」的断言（反思调用 mode==collaboration）。
         self._reflect_patch = patch.object(settings, "REFLECTION_ENABLED", False)
@@ -549,12 +548,13 @@ class CollaborationModeTest(unittest.IsolatedAsyncioTestCase):
 
     def tearDown(self):
         self._reflect_patch.stop()
+        super().tearDown()
 
     async def _configure(self, cfgs=None, max_rounds=3, topic="合作模式测试"):
-        orchestrator.configure(cfgs or self.NO_STANCE_CFG,
+        self.orch.configure(cfgs or self.NO_STANCE_CFG,
                                topic=topic, max_rounds=max_rounds,
                                mode="collaboration")
-        q = orchestrator.event_bus.subscribe()
+        q = self.orch.event_bus.subscribe()
         while True:
             try:
                 await asyncio.wait_for(q.get(), timeout=0.1)
@@ -562,16 +562,15 @@ class CollaborationModeTest(unittest.IsolatedAsyncioTestCase):
                 break
         return q
 
-    @staticmethod
-    def _collab(name):
-        for c in orchestrator.collaborators:
+    def _collab(self, name):
+        for c in self.orch.collaborators:
             if c.name == name:
                 return c
         raise AssertionError(f"无 {name} 协作 Agent")
 
     async def test_configure_sets_collaboration_mode(self):
         await self._configure()
-        orch = orchestrator
+        orch = self.orch
         self.assertEqual(orch.mode, "collaboration")
         # 主位 HOST，其余席位一律 NEUTRAL（合作模式弱化立场）
         self.assertEqual(orch.main.stance, "HOST")
@@ -584,7 +583,7 @@ class CollaborationModeTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_create_task_pending_without_recipient(self):
         await self._configure([HOST_CFG, PRO_CFG, CON_CFG])
-        orch = orchestrator
+        orch = self.orch
         orch.tasks.clear()
         orch.shared_context.clear()
         orch.task_counter = 0
@@ -605,7 +604,7 @@ class CollaborationModeTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_claim_is_exclusive(self):
         await self._configure([HOST_CFG, PRO_CFG, CON_CFG])
-        orch = orchestrator
+        orch = self.orch
         orch.tasks.clear()
         orch.task_counter = 0
         t = orch._create_task({
@@ -626,7 +625,7 @@ class CollaborationModeTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_claim_and_report_in_same_turn(self):
         await self._configure([HOST_CFG, PRO_CFG, CON_CFG])
-        orch = orchestrator
+        orch = self.orch
         orch.tasks.clear()
         orch.shared_context.clear()
         orch.task_counter = 0
@@ -658,7 +657,7 @@ class CollaborationModeTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_all_tasks_complete_ends_loop_skip_judge(self):
         await self._configure([HOST_CFG, PRO_CFG], max_rounds=5, topic="全完成收尾")
-        orch = orchestrator
+        orch = self.orch
         orch.tasks.clear()
         orch.task_counter = 0
         orig = orch._agent_turn
@@ -703,7 +702,7 @@ class CollaborationModeTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_tool_injection_per_mode(self):
         await self._configure([HOST_CFG, PRO_CFG, CON_CFG])
-        orch = orchestrator
+        orch = self.orch
         seen_tools = []
 
         async def fake_consume(messages, model_config, tools=None, on_delta=None,
@@ -731,7 +730,7 @@ class CollaborationModeTest(unittest.IsolatedAsyncioTestCase):
             orch._consume_stream = orig
 
 
-class ReflectionTest(unittest.IsolatedAsyncioTestCase):
+class ReflectionTest(FreshOrchestratorMixin, unittest.IsolatedAsyncioTestCase):
     """合作模式子 Agent 反思与自我修正（§12.18）：
     - 回报前对照期望效果自评修订，修订版才落库，并发布 task_revised 事件；
     - 至多 N 轮反思循环（每轮以上一轮修订版作新草稿），无修订/无变化即收敛提前终止；
@@ -745,9 +744,9 @@ class ReflectionTest(unittest.IsolatedAsyncioTestCase):
     ]
 
     async def _configure(self, max_rounds=3, topic="反思测试"):
-        orchestrator.configure(self.CFG, topic=topic, max_rounds=max_rounds,
+        self.orch.configure(self.CFG, topic=topic, max_rounds=max_rounds,
                                mode="collaboration")
-        q = orchestrator.event_bus.subscribe()
+        q = self.orch.event_bus.subscribe()
         while True:
             try:
                 await asyncio.wait_for(q.get(), timeout=0.1)
@@ -755,9 +754,8 @@ class ReflectionTest(unittest.IsolatedAsyncioTestCase):
                 break
         return q
 
-    @staticmethod
-    def _collab(name):
-        for c in orchestrator.collaborators:
+    def _collab(self, name):
+        for c in self.orch.collaborators:
             if c.name == name:
                 return c
         raise AssertionError(f"无 {name} 协作 Agent")
@@ -774,7 +772,7 @@ class ReflectionTest(unittest.IsolatedAsyncioTestCase):
 
     def _new_task(self):
         """清空任务池并创建一条待认领任务，返回 (orch, task, agent)。"""
-        orch = orchestrator
+        orch = self.orch
         orch.tasks.clear()
         orch.shared_context.clear()
         orch.task_counter = 0
@@ -820,7 +818,7 @@ class ReflectionTest(unittest.IsolatedAsyncioTestCase):
 
             orch._agent_turn = fake_agent_turn
             try:
-                q = orchestrator.event_bus.subscribe()
+                q = self.orch.event_bus.subscribe()
                 await orch._collab_work_turn(pro)
                 events = await self._drain(q)
             finally:
@@ -910,7 +908,7 @@ class ReflectionTest(unittest.IsolatedAsyncioTestCase):
 
         orch._agent_turn = fake_agent_turn
         try:
-            q = orchestrator.event_bus.subscribe()
+            q = self.orch.event_bus.subscribe()
             await orch._collab_work_turn(pro)
             events = await self._drain(q)
         finally:
@@ -941,7 +939,7 @@ class ReflectionTest(unittest.IsolatedAsyncioTestCase):
 
         orch._agent_turn = fake_agent_turn
         try:
-            q = orchestrator.event_bus.subscribe()
+            q = self.orch.event_bus.subscribe()
             await orch._collab_work_turn(pro)  # 不应向上抛异常
             events = await self._drain(q)
         finally:
@@ -956,8 +954,8 @@ class ReflectionTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_reflection_revision_truncated_to_ceiling(self):
         # 注意：必须在 configure() 之后、对实际运行的 orch.governor 打 patch——
-        # start() 每次都会重置为全新 FairnessGovernor（orchestrator.py:1191），
-        # 提前 patch 模块级 orchestrator.governor 会被覆盖。
+        # start() 每次都会重置为全新 FairnessGovernor（self.orch.py:1191），
+        # 提前 patch 模块级 self.orch.governor 会被覆盖。
         with patch.object(settings, "REFLECTION_MAX_PASSES", 1):  # 单次反思语义
             await self._configure()
             orch, t, pro = self._new_task()
@@ -1020,7 +1018,7 @@ class ReflectionTest(unittest.IsolatedAsyncioTestCase):
 
             orch._agent_turn = fake_agent_turn
             try:
-                q = orchestrator.event_bus.subscribe()
+                q = self.orch.event_bus.subscribe()
                 await orch._collab_work_turn(pro)
                 events = await self._drain(q)
             finally:
@@ -1063,7 +1061,7 @@ class ReflectionTest(unittest.IsolatedAsyncioTestCase):
 
             orch._agent_turn = fake_agent_turn
             try:
-                q = orchestrator.event_bus.subscribe()
+                q = self.orch.event_bus.subscribe()
                 await orch._collab_work_turn(pro)
                 events = await self._drain(q)
             finally:
@@ -1106,7 +1104,7 @@ class ReflectionTest(unittest.IsolatedAsyncioTestCase):
 
             orch._agent_turn = fake_agent_turn
             try:
-                q = orchestrator.event_bus.subscribe()
+                q = self.orch.event_bus.subscribe()
                 await orch._collab_work_turn(pro)  # 不应向上抛异常
                 events = await self._drain(q)
             finally:

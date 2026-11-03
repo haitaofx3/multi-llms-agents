@@ -43,7 +43,7 @@
 - **日志**：从 print / 手工拼串升级为 JSON 行结构化日志，三条出口（stdout、`data/logs/app-YYYYMMDD.jsonl`、进程内环形缓冲），并支持 `trace_id` / `session_id` / `run_id` 上下文。响应头新增 `X-Trace-Id` 与 `X-Elapsed-Ms`。
 - **鉴权**：`AUTH_TOKEN` 保留，另加**独立的** `DSH_SHARED_SECRET`（只作用于 `/api/integrations/dsh/*`）。
 - **配置**：旧键全部保留（`LLM_*` / `QWEN_*` / `DEEPSEEK_*` / `MIMO_*` / `JUDGE_*` / `FAIR_*` / `CONVERGENCE_*` / `REFLECTION_*` / `QDRANT_*` / `EMBED_*` / `AUTH_TOKEN` / `MAX_SESSIONS` …）；新增一批键（`PERSONAL_MODE` / `OWNER_NAME` / `WORKSPACE_NAME` / `DEFAULT_RECIPE` / `MAX_ITERATIONS` / `LOG_*` / `RUNLOG_*` / `STEERING_*` / `FOLLOWUP_*` / `SSE_*` / `FEISHU_*` / `WEBHOOK_*` / `DSH_*` / `DEV_API_*`），默认值全部写在 `muti_llm_agent/config.py`，含义见 [README 的配置表](../README.md#配置项)。
-- **测试规模**：157 → **206** 个用例（新增 `tests/test_multi_llm_collab.py` 覆盖六项新能力）。
+- **测试规模**：迁移时 157 → 206 个用例（新增 `tests/test_multi_llm_collab.py` 覆盖六项新能力）。此后用例继续增加，**具体数量以 CI 输出为准，本文不再跟踪**。
 
 ## 3. 三个测试为什么改了 patch 目标（别误判为回归）
 
@@ -69,17 +69,17 @@
 | [多Agent辩论系统架构设计文档.md](../多Agent辩论系统架构设计文档.md) | 参考 | 架构目标态（Supervisor / 辩手 / Judge / RAG），与实现基本对应；不含本次新增的协同/集成层。 |
 | [P2优化方案.md](../P2优化方案.md) | 参考 | 平台化演进方案（多实例 / 人工审核 / 知识库 / 模板），属"想做但没做"，别当现状读。 |
 | [三方Agent框架对比与迁移利弊分析.md](../三方Agent框架对比与迁移利弊分析.md) | 参考 | 决策记录（自研 vs 三方框架），解释为什么继续自研。 |
-| [docs/DELIVERY_READINESS.md](DELIVERY_READINESS.md) | 部分过时 | 框架仍可用，但基线数字是迁移前的（"157 用例全绿、ruff 与 mypy 双门禁通过"）。现状：**206 用例通过、ruff 全绿、mypy 有 4 处未过**。 |
+| [docs/archive/DELIVERY_READINESS_评估快照.md](archive/DELIVERY_READINESS_评估快照.md) | **已过期（已归档）** | 它是某一时点的自评快照，其中的基线数字（"157 用例""编排器 1870 行""无 /healthz""日志不落盘"）此后全部改变。现行状态一律以 README + CI 为准。 |
 | [docs/archive/](archive/) | **已过时** | 历史决策记录，仅作追溯，不要按它改代码。 |
 | [README.md](../README.md) / [docs/API.md](API.md) / 本文 | **现行** | 本次重写的三份。 |
 
-> 注意：`docs/README.md`（文档索引）**没有**同步加上本文件与 `API.md` 两行——按本次「只改三份 markdown」的约束没动它，谁顺手谁补。
+> 注：本文件与 `API.md` 已经登记进 `docs/README.md` 的索引；早前那句"索引没同步"的说明已失效，此处更新以免误导。
 
 ## 5. 迁移自查清单（换机器 / 重跑迁移时照这个走）
 
 1. `rg -n "\bapp\." --glob '*.py'`（或 PowerShell：`Select-String -Path **\*.py -Pattern '\bapp\.'`）→ 应只剩第三方 import，不应出现 `app.main` / `app.orchestrator`。
 2. `rg -n 'patch\("app\.' tests` → 应为空（字符串形式的 patch 目标不报语法错，最容易漏）。
 3. `python -c "from muti_llm_agent.main import app; print(len(app.routes))"` → 能导入即说明包名替换彻底。
-4. `python -m pytest tests -q` → 206 passed。
+4. `python -m pytest tests -q` → 退出码 0（用例数以实际输出为准）。
 5. `curl -s http://127.0.0.1:8000/api/dev/endpoints | python -c "import sys,json;print(json.load(sys.stdin)['count'])"` → 49。
 6. `python -m ruff check muti_llm_agent tests scripts` → 0 问题（mypy 现状见第 4 节）。

@@ -11,7 +11,7 @@
 | 定位 | 单模型扮多角色的**圆桌辩论演示** | 单用户个人级的**真实多模型协同工作台** |
 | 模型 | 一个模型扮演正方 / 反方 / 主持人 / 裁判 | 不同供应商的模型各干擅长的活（也可切回辩论模式） |
 | 运行期干预 | 只能暂停 / 继续 / 结束 | 中途注入纠偏指令；结束后补材料续轮 |
-| 接口 | 15 个（14 HTTP + 1 WebSocket），全部挤在 `main.py` | 49 个，按 7 个模块拆到 `api/router_*.py` |
+| 接口 | 15 个（14 HTTP + 1 WebSocket），全部挤在 `main.py` | 按 7 个模块拆到 `api/router_*.py`（清单由 `GET /api/dev/endpoints` 导出） |
 | 可观测性 | `trace_id` + 散落的 print 日志 | 结构化 JSON 日志（三条出口）+ 运行事件日志 + 运行摘要 + 复盘导出 |
 | 对外集成 | 无 | 飞书入站 / 出站、DSH 工具调用、通用 webhook、SSE |
 
@@ -101,7 +101,7 @@ curl -s 'http://127.0.0.1:8000/api/stream?session_id=default&replay=1'
 
 **怎么用**：
 
-- `GET /api/dev/endpoints`：49 个接口按模块分组导出，带请求 JSON Schema 与示例请求体（控制台据此自动生成表单）。
+- `GET /api/dev/endpoints`：全部接口按模块分组导出，带请求 JSON Schema 与示例请求体（控制台据此自动生成表单）。
 - `GET /api/dev/modules`：模块导航（每模块接口数与路径清单）。
 - `POST /api/dev/invoke`：通用调用器 `{method,path,query,body,headers,timeout_ms}`，走 `httpx.ASGITransport` 的**进程内真实 ASGI 链路**——中间件、鉴权、依赖注入全生效，所以「控制台调通 = 外部调通」。
 - `POST /api/dev/smoke`：一键跑 10 个只读接口（不消耗额度、不改状态、不需要先配置席位），返回逐项耗时与 `passed/failed`。
@@ -187,10 +187,11 @@ Muti_LLM_Agent/
 ├── .env                        本地密钥与开关（gitignore，不提交）
 ├── .env.example                配置模板：全部 93 个键 + 默认值，可提交
 ├── docs/
-│   ├── API.md                  接口参考：49 个接口 + 横切约定 + SSE/WS 事件
+│   ├── README.md               文档索引（哪份是现行、哪份只是参考）
+│   ├── API.md                  接口参考：横切约定 + SSE/WS 事件（接口清单以 /api/dev/endpoints 为准）
 │   ├── MIGRATION.md            从 mini_test 迁到本项目的说明
 │   ├── CODE_LOGIC.md           代码逻辑详解（迁移前的辩论主体逻辑，仍可参考）
-│   └── DELIVERY_READINESS.md   可交付性评估
+│   └── archive/                历史存档：过期评估与旧方案（不维护）
 ├── muti_llm_agent/             核心包（旧项目的 app/）
 │   ├── main.py                 FastAPI 装配：静态目录、中间件、页面、lifespan、完成回调
 │   ├── api/                    路由层（一个模块一件事）
@@ -222,11 +223,11 @@ Muti_LLM_Agent/
 ├── scripts/
 │   ├── api_smoke.py            对已运行服务做接口冒烟（两种用法见下）
 │   └── eval_baseline.py        讨论质量基线评测
-├── tests/                      9 个测试文件、206 个用例（ASGITransport + LLM 打桩）
+├── tests/                      快速回归（ASGITransport + LLM 打桩，无需服务器/真实 API）
 └── data/                       运行期产物（gitignore）：discussions / runs / reviews / logs / sessions / memories
 ```
 
-**前端为什么是「叠加」而不是重写**：`static/app.js` 是既有的圆桌 UI（1134 行）。`static/studio.js`（529 行）用 IIFE 包住新代码，**包装全局 `handleEvent`** 来追加处理 `directive` / `run_summary` / `iteration` 三类事件，并复用 `getSessionId()` / `generateAgentCards()` / `addMsg()` 等既有函数——旧界面一个 DOM id 都没动，新面板是外挂上去的。
+**前端为什么是「叠加」而不是重写**：`static/app.js` 是既有的圆桌 UI。`static/studio.js` 用 IIFE 包住新代码，**包装全局 `handleEvent`** 来追加处理 `directive` / `run_summary` / `iteration` 三类事件，并复用 `getSessionId()` / `generateAgentCards()` / `addMsg()` 等既有函数——旧界面一个 DOM id 都没动，新面板是外挂上去的。
 
 ## 配置项
 
@@ -275,17 +276,14 @@ Muti_LLM_Agent/
 ```bash
 # 全量快速回归（不需要服务器、不需要真实 LLM：ASGITransport + LLM 打桩）
 python -m pytest tests -q
-# → 实测 206 passed（约 33s）；tests/test_e2e.py 需真实服务器 + 真实 API，不进 CI
+# → 退出码 0 即通过。用例数以 CI 实际输出为准，这里不写数字（写死必然漂移）。
+# tests/test_e2e.py 是手动跑的端到端脚本，已被 conftest 的 collect_ignore 排除。
 
-# 静态检查：0 问题
+# 静态检查
 python -m ruff check muti_llm_agent tests scripts
 
-# 类型检查（整包 45 个文件，0 issue）
+# 类型检查（整包；protocol.py 另有 --strict 契约门禁，见 ci.yml）
 python -m mypy
-#   steering.py:234           List[Directive | None] vs List[Directive]
-#   orchestrator.py:252       缺 _opponent_prep 注解
-#   orchestrator.py:253       缺 _opponent_summary_cache 注解
-#   api/router_export.py:201  缺 meta 注解
 ```
 
 `scripts/api_smoke.py` 有**两种用法**（它连真实端口，和 `tests/` 的进程内测试互补）：

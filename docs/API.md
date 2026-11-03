@@ -1,6 +1,6 @@
 # 接口参考（API）
 
-> **本文档的核对方式**：49 个接口清单直接取自运行中实例的 `GET /api/dev/endpoints`（`http://127.0.0.1:8123`，返回 `count=49`，7 个模块），并与 `muti_llm_agent/api/router_*.py` 的源码逐条对照过方法、路径、参数与返回字段。若两者不一致，**以代码为准**，并请顺手修本文档。
+> **本文档的核对方式**：接口清单直接取自运行中实例的 `GET /api/dev/endpoints`（7 个模块分组），并与 `muti_llm_agent/api/router_*.py` 的源码逐条对照过方法、路径、参数与返回字段。若两者不一致，**以代码为准**，并请顺手修本文档。接口总数会随迭代变化，本文不写死数量——需要数字时直接看该端点返回的 `count` 字段。
 >
 > 在线版：`/docs`（Swagger UI，含每个请求体的 JSON Schema）；机器可读版：`GET /api/dev/endpoints`。
 

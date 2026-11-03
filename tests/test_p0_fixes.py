@@ -477,9 +477,19 @@ class ControlEndpointSessionRoutingTest(unittest.IsolatedAsyncioTestCase):
         ended = await self.client.post(f"/api/end?session_id={self.sid}")
         self.assertEqual(ended.status_code, 200, ended.text)
         self.assertEqual(self.orch.status, "stopped")
-        # 未误伤默认会话
-        default = manager.get("default")
-        self.assertNotEqual(getattr(default, "status", None), "stopped")
+        # 未误伤默认会话：这里必须**显式**先造一个 default 会话再断言，
+        # 否则 manager.get("default") 为 None 时 getattr(None, ...) 恒不等于 "stopped"，
+        # 这条断言会退化成永远通过的空断言（曾经就是这样）。
+        from tests.conftest import drop_session, install_default_orchestrator
+        default = install_default_orchestrator()
+        try:
+            default.status = "running"
+            again = await self.client.post(f"/api/end?session_id={self.sid}")
+            self.assertEqual(again.status_code, 200, again.text)
+            self.assertEqual(default.status, "running", "end 误伤了默认会话")
+        finally:
+            default.status = "done"
+            drop_session("default")
 
     async def test_save_markdown_follows_query_session_id(self):
         await self.client.post("/api/configure", json={
